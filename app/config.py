@@ -75,10 +75,20 @@ def load_cfg() -> dict:
 
 
 def save_cfg(cfg: dict) -> None:
-    """保存配置。写盘前先补全，下次打开设置就能看到实际生效的地址。"""
+    """保存配置。写盘前先补全，下次打开设置就能看到实际生效的地址。
+
+    原子写 + 收紧权限：避免写到一半崩溃留下坏 JSON；密钥文件不该被同机
+    其他用户随意读取（Windows 上 chmod 效果有限，但至少不影响正常使用）。
+    """
     cfg = normalize(cfg)
     CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), "utf-8")
+    tmp = CONFIG.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), "utf-8")
+    os.replace(tmp, CONFIG)
+    try:
+        os.chmod(CONFIG, 0o600)
+    except Exception:
+        pass
 
 
 def is_ready(cfg: dict) -> bool:

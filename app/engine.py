@@ -9,18 +9,23 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
+from pathlib import Path
 from typing import Any, Callable
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
 import shapely
+from pyproj import Transformer
 from shapely import make_valid
 from shapely.geometry import box
+
+ROOT = Path(__file__).resolve().parent.parent
 
 # 图层配色：印刷感的低饱和一套，和暖白底界面相处不打架，同时保持可分辨。
 # 第一色是界面强调色（陶土橙），新建图层会顺着往下取。
@@ -35,18 +40,62 @@ UNIT_TO_M = {"m": 1.0, "米": 1.0, "km": 1000.0, "公里": 1000.0, "千米": 100
 
 
 # --------------------------------------------------------------------------- 图层
-@dataclass
+@dataclass(init=False)
 class Layer:
+    """一个图层。
+
+    `gdf` 是懒加载属性：大图层可以只把 GeoPackage/Parquet 缓存在磁盘上，
+    内存里只留元信息。UI 的 `meta()` 用缓存，不会因为图层被换出而重新读盘。
+    """
     id: str
     name: str
-    gdf: Any                       # GeoDataFrame（保持其原始 CRS）
-    color: str = "#2f6fed"
-    source: str = ""
-    parent: str = ""
-    op: str = ""
-    created_at: float = field(default_factory=time.time)
+    color: str
+    source: str
+    parent: str
+    op: str
+    created_at: float
+    _gdf: Any = field(default=None, repr=False)
+    cache_path: str | None = field(default=None, repr=False)
     _invalid: int | None = field(default=None, repr=False)
     _meta: dict | None = field(default=None, repr=False, compare=False)
+    _last_used: float = field(default_factory=time.time, repr=False, compare=False)
+
+    def __init__(self, id: str, name: str, gdf=None, color: str = "#2f6fed",
+                 source: str = "", parent: str = "", op: str = "",
+                 created_at: float | None = None, _gdf=None, cache_path: str | None = None):
+        self.id = id
+        self.name = name
+        self._gdf = _gdf if _gdf is not None else gdf
+        self.color = color
+        self.source = source
+        self.parent = parent
+        self.op = op
+        self.created_at = created_at if created_at is not None else time.time()
+        self.cache_path = cache_path
+        self._invalid = None
+        self._meta = None
+        self._last_used = time.time()
+
+    @property
+    def gdf(self):
+        if self._gdf is None:
+            if not self.cache_path:
+                raise ValueError(f"图层「{self.name}」的数据已被释放且没有磁盘缓存。")
+            path = Path(self.cache_path)
+            if path.suffix.lower() == ".parquet":
+                self._gdf = gpd.read_parquet(path)
+            else:
+                self._gdf = gpd.read_file(path)
+        self._last_used = time.time()
+        return self._gdf
+
+    @gdf.setter
+    def gdf(self, value) -> None:
+        self._gdf = value
+        self.cache_path = None
+        self._meta = None
+        self._invalid = None
+        self._last_used = time.time()
 
     def invalid_count(self) -> int | None:
         """无效几何数量：只算一次并缓存，超大图层跳过（逐个校验太慢）。"""
@@ -74,14 +123,8 @@ class Layer:
     def meta(self, with_invalid: bool = False) -> dict:
         """图层元信息（结果缓存，几何不变量只算一次）。
 
-        `total_bounds` 和 `geom_type` 在几十万要素上各要几十毫秒，
-        而图层列表刷新一次就要对每个图层取一遍 —— 不缓存的话，
-        一次载入多个图层会白卡好几秒（实测 3.4 秒）。
-        图层对象一旦创建，几何不再变化，所以可以安全缓存。
-
-        `with_invalid=False`（默认）不触发几何校验 —— 校验几万个复杂多边形
-        要几百毫秒，放在界面刷新路径上会卡住；只有算子执行时
-        （后台线程）才需要。
+        缓存是磁盘换出的前提：换出后 UI 仍然能拿到 count/bounds/fields，
+        不需要把数据重新读回内存。
         """
         if self._meta is None:
             b = self.gdf.total_bounds if len(self.gdf) else [0, 0, 0, 0]
@@ -102,18 +145,36 @@ class Layer:
             }
         d = dict(self._meta)
         if with_invalid:
-            d["invalid"] = self.invalid_count() if len(self.gdf) else 0
+            d["invalid"] = self.invalid_count() if d.get("count") else 0
         else:
             d["invalid"] = None
         return d
 
 
 class Store:
-    """内存图层仓库（单机单会话）。"""
+    """图层仓库（单机单会话），支持按内存预算把大图层换出到磁盘。"""
 
-    def __init__(self) -> None:
+    def __init__(self, cache_dir: str | Path | None = None,
+                 memory_budget_mb: int | None = None) -> None:
         self.layers: dict[str, Layer] = {}
         self._n = 0
+        env_dir = os.environ.get("GIS_AGENT_CACHE_DIR")
+        self.cache_dir = Path(cache_dir or env_dir or (ROOT / "data" / "cache"))
+        self.memory_budget_mb = float(memory_budget_mb if memory_budget_mb is not None
+                                      else os.environ.get("GIS_AGENT_MEMORY_MB", "2048"))
+        self.cache_min_features = int(os.environ.get("GIS_AGENT_CACHE_MIN_FEATURES", "20000"))
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            # 清掉一周前的孤儿缓存（上次异常退出可能留下）
+            cutoff = time.time() - 7 * 86400
+            for p in self.cache_dir.glob("L*.*"):
+                try:
+                    if p.is_file() and p.stat().st_mtime < cutoff:
+                        p.unlink()
+                except Exception:
+                    pass
+        except Exception:
+            self.cache_dir = None  # type: ignore[assignment]
 
     def add(self, gdf: gpd.GeoDataFrame, name: str, **kw) -> Layer:
         lid = "L" + uuid.uuid4().hex[:8]
@@ -128,7 +189,88 @@ class Store:
             name = f"{base}_{k}"
         lay = Layer(id=lid, name=name, gdf=gdf, color=kw.pop("color", color), **kw)
         self.layers[lid] = lay
+        # 先把 meta 算好：换出后 UI 仍然只读缓存，不会重新读盘
+        try:
+            lay.meta()
+        except Exception:
+            pass
+        self._trim_memory(keep={lid})
         return lay
+
+    def _memory_mb(self, deep: bool = True) -> float:
+        total = 0
+        for lay in self.layers.values():
+            if lay._gdf is not None:
+                try:
+                    total += int(lay._gdf.memory_usage(deep=deep).sum())
+                except Exception:
+                    pass
+        return total / 1e6
+
+    def _spill(self, lay: Layer) -> bool:
+        """把图层写到磁盘并释放内存；失败时保持原样，不影响本次运算。"""
+        if self.cache_dir is None or len(lay.gdf) < self.cache_min_features:
+            return False
+        # 有 pyarrow 就用 GeoParquet，否则退回 GPKG（两者都能被 Layer.gdf 懒加载）
+        try:
+            import importlib.util
+            use_parquet = importlib.util.find_spec("pyarrow") is not None
+        except Exception:
+            use_parquet = False
+        path = Path(self.cache_dir) / (f"{lay.id}.parquet" if use_parquet else f"{lay.id}.gpkg")
+        try:
+            if use_parquet:
+                tmp = path.with_suffix(".tmp.parquet")
+                lay.gdf.to_parquet(tmp, index=False)
+            else:
+                tmp = path.with_suffix(".tmp.gpkg")
+                lay.gdf.to_file(tmp, driver="GPKG", layer="layer")
+            os.replace(tmp, path)
+            lay.cache_path = str(path)
+            lay._gdf = None
+            return True
+        except Exception:
+            return False
+
+    def _trim_memory(self, keep: set[str] | None = None) -> None:
+        if self.memory_budget_mb <= 0 or len(self.layers) <= 1:
+            return
+        keep = keep or set()
+        if self._memory_mb() <= self.memory_budget_mb:
+            return
+        # LRU：最近被 gdf 属性访问过的排在后面；不动刚产出的图层
+        candidates = sorted(
+            (l for l in self.layers.values() if l.id not in keep and l._gdf is not None),
+            key=lambda l: l._last_used)
+        for lay in candidates:
+            if self._memory_mb() <= self.memory_budget_mb:
+                break
+            self._spill(lay)
+
+    def remove(self, lid: str) -> None:
+        lay = self.layers.pop(lid, None)
+        if lay is not None and lay.cache_path:
+            try:
+                Path(lay.cache_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+        self._trim_memory()
+
+    def clear(self) -> None:
+        for lay in list(self.layers.values()):
+            if lay.cache_path:
+                try:
+                    Path(lay.cache_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+        self.layers.clear()
+        self._n = 0
+
+    def cache_stats(self) -> dict:
+        return {"layers": len(self.layers),
+                "memory_mb": round(self._memory_mb(deep=False), 1),
+                "budget_mb": self.memory_budget_mb,
+                "spilled": sum(1 for l in self.layers.values() if l._gdf is None)}
 
     def get(self, ref: str | None) -> Layer | None:
         if not ref:
@@ -156,8 +298,20 @@ class Store:
 
 # --------------------------------------------------------------------------- 工具函数
 def _ensure_crs(gdf: gpd.GeoDataFrame) -> tuple[gpd.GeoDataFrame, list[str]]:
+    """缺 CRS 时做一次安全检查，再按 4326 处理。
+
+    这里不再无条件 `set_crs(4326)`：Shapefile 缺 .prj 很常见，如果坐标其实是
+    投影米制（例如 500000, 3300000），按经纬度算面积/距离会得到完全错误的结果。
+    坐标明显超出经纬度范围时直接拒绝，让用户去指定 CRS，而不是静默算错。
+    """
     warns = []
     if gdf.crs is None:
+        b = gdf.total_bounds if len(gdf) else [0, 0, 0, 0]
+        if len(gdf) and not (-180 <= b[0] <= 180 and -180 <= b[2] <= 180
+                             and -90 <= b[1] <= 90 and -90 <= b[3] <= 90):
+            raise ValueError(
+                "数据缺少坐标系定义，且坐标超出经纬度范围（可能是投影坐标）。"
+                "请先在导入时指定正确 CRS，再做距离/面积运算，避免算错。")
         warns.append("数据无坐标系信息，按 WGS84 (EPSG:4326) 处理，请核实。")
         gdf = gdf.set_crs(4326)
     return gdf, warns
@@ -175,13 +329,60 @@ def _fix_geom(gdf: gpd.GeoDataFrame) -> tuple[gpd.GeoDataFrame, int]:
     return gdf, n
 
 
+def prepare_layer(gdf: gpd.GeoDataFrame) -> tuple[gpd.GeoDataFrame, list[str]]:
+    """所有算子入口统一做的准备：CRS 校验 + 无效几何修复 + 空几何清理。"""
+    g, warns = _ensure_crs(gdf)
+    g, n = _fix_geom(g)
+    if n:
+        warns.append(f"已修复 {n} 个无效几何。")
+    try:
+        empty = int(g.geometry.isna().sum() + g.geometry.is_empty.sum())
+        if empty:
+            g = g[~(g.geometry.isna() | g.geometry.is_empty)]
+            warns.append(f"已清理 {empty} 个空几何。")
+    except Exception:
+        pass
+    return g, warns
+
+
+def _lonlat_bounds(gdf: gpd.GeoDataFrame) -> tuple[float, float, float, float]:
+    """只转 4 个角点求经纬度包围盒，避免每次距离/面积都 to_crs 整个图层。"""
+    if not len(gdf):
+        return -180.0, -90.0, 180.0, 90.0
+    b = gdf.total_bounds
+    crs = gdf.crs
+    try:
+        if crs is None:
+            return float(b[0]), float(b[1]), float(b[2]), float(b[3])
+        if crs.is_geographic and crs.to_epsg() in (4326, 4490):
+            return float(b[0]), float(b[1]), float(b[2]), float(b[3])
+        t = Transformer.from_crs(crs, 4326, always_xy=True)
+        xs, ys = t.transform([b[0], b[2], b[0], b[2]], [b[1], b[1], b[3], b[3]])
+        return min(xs), min(ys), max(xs), max(ys)
+    except Exception:
+        bb = gdf.to_crs(4326).total_bounds
+        return float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])
+
+
+def _lonlat_center(gdf: gpd.GeoDataFrame) -> tuple[float, float]:
+    b = _lonlat_bounds(gdf)
+    return (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+
+
 def metric_crs(gdf: gpd.GeoDataFrame) -> tuple[str, list[str]]:
-    """返回适合做距离/面积计算的投影坐标系。"""
+    """返回适合做距离/面积计算的米制投影坐标系。"""
     warns: list[str] = []
     crs = gdf.crs
     if crs is not None and not crs.is_geographic:
-        return crs.to_string(), warns
-    b = gdf.to_crs(4326).total_bounds if len(gdf) else [0, 0, 0, 0]
+        # 投影坐标也可能是英尺：不能直接把 distance 当米
+        try:
+            factor = float(crs.axis_info[0].unit_conversion_factor)
+        except Exception:
+            factor = 1.0
+        if abs(factor - 1.0) < 1e-9:
+            return crs.to_string(), warns
+        warns.append(f"当前投影单位为 {factor:g} 米/坐标单位，已改用米制投影计算。")
+    b = _lonlat_bounds(gdf)
     lon, lat = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
     if not (-180 <= lon <= 180 and -85 <= lat <= 85):
         lon, lat = 104.0, 35.0
@@ -252,17 +453,19 @@ def op_describe(store: Store, layer: str | None = None) -> Result:
     if g.crs is None:
         warns.append("图层缺少坐标系定义。")
     area = length = None
-    if len(g):
+    if len(g) and g.crs is not None:
         mc, w = metric_crs(g)
         warns += w[:1]
-        p = g.to_crs(mc)
         try:
+            p = g.to_crs(mc)
             if "Polygon" in info["geomType"]:
                 area = float(p.area.sum())
             if "Line" in info["geomType"]:
                 length = float(p.length.sum())
         except Exception:
-            pass
+            warns.append("面积/长度计算失败，已跳过。")
+    elif len(g):
+        warns.append("坐标系未定义，已跳过面积/长度计算；请先指定 CRS 后再做定量分析。")
     data = {"meta": info, "area_m2": area, "length_m": length}
     msg = (f"图层「{lay.name}」：{info['count']} 个要素，几何类型 {info['geomType']}，"
            f"坐标系 {info['crs']}，字段 {len(info['fields'])} 个（{'、'.join(info['fields'][:8])}"
@@ -285,8 +488,8 @@ def _buffer(store: Store, layer, distance=500, unit="m", quad_segs=16, dissolve=
     if d is None:
         raise ValueError("缓冲距离必须是数字。")
     d_m = d * UNIT_TO_M.get(str(unit).lower(), 1.0)
-    if d_m == 0:
-        raise ValueError("缓冲距离不能为 0。")
+    if d_m <= 0:
+        raise ValueError("缓冲距离必须大于 0。")
     mc, w = metric_crs(g)
     warns += w
     p = g.to_crs(mc)
@@ -305,6 +508,8 @@ def _buffer(store: Store, layer, distance=500, unit="m", quad_segs=16, dissolve=
 
 def _clip(store: Store, layer, mask, name=None) -> Result:
     lay, mk = store.resolve(layer), store.resolve(mask)
+    if "Polygon" not in mk.geom_type:
+        raise ValueError(f"裁剪面「{mk.name}」不是面图层（{mk.geom_type}），无法裁剪。")
     g, w0 = _ensure_crs(lay.gdf)
     m, w1 = _ensure_crs(mk.gdf)
     g, n1 = _fix_geom(g)
@@ -323,40 +528,40 @@ def _clip(store: Store, layer, mask, name=None) -> Result:
 
 def _intersect(store: Store, layer, other, name=None) -> Result:
     a, b = store.resolve(layer), store.resolve(other)
-    ga, _ = _ensure_crs(a.gdf)
-    gb, _ = _ensure_crs(b.gdf)
+    ga, w1 = prepare_layer(a.gdf)
+    gb, w2 = prepare_layer(b.gdf)
     gb = gb.to_crs(ga.crs)
     out = gpd.overlay(ga, gb, how="intersection", keep_geom_type=False)
     nl = store.add(out, name or f"{a.name}_∩_{b.name}", source=a.id, op="intersect")
-    return Result(True, f"「{a.name}」与「{b.name}」求交：得到 {len(out)} 个要素。", nl, [],
+    return Result(True, f"「{a.name}」与「{b.name}」求交：得到 {len(out)} 个要素。", nl, w1 + w2,
                   {"features_out": len(out)})
 
 
 def _union(store: Store, layer, other, name=None) -> Result:
     a, b = store.resolve(layer), store.resolve(other)
-    ga, _ = _ensure_crs(a.gdf)
-    gb, _ = _ensure_crs(b.gdf)
+    ga, w1 = prepare_layer(a.gdf)
+    gb, w2 = prepare_layer(b.gdf)
     gb = gb.to_crs(ga.crs)
     out = gpd.overlay(ga, gb, how="union", keep_geom_type=False)
     nl = store.add(out, name or f"{a.name}_∪_{b.name}", source=a.id, op="union")
-    return Result(True, f"「{a.name}」与「{b.name}」合并叠加：得到 {len(out)} 个要素。", nl, [],
+    return Result(True, f"「{a.name}」与「{b.name}」合并叠加：得到 {len(out)} 个要素。", nl, w1 + w2,
                   {"features_out": len(out)})
 
 
 def _erase(store: Store, layer, mask, name=None) -> Result:
     a, b = store.resolve(layer), store.resolve(mask)
-    ga, _ = _ensure_crs(a.gdf)
-    gb, _ = _ensure_crs(b.gdf)
+    ga, w1 = prepare_layer(a.gdf)
+    gb, w2 = prepare_layer(b.gdf)
     gb = gb.to_crs(ga.crs)
     out = gpd.overlay(ga, gb, how="difference", keep_geom_type=False)
     nl = store.add(out, name or f"{a.name}_擦除_{b.name}", source=a.id, op="erase")
-    return Result(True, f"从「{a.name}」中擦除「{b.name}」范围：要素 {len(ga)} → {len(out)}。", nl, [],
+    return Result(True, f"从「{a.name}」中擦除「{b.name}」范围：要素 {len(ga)} → {len(out)}。", nl, w1 + w2,
                   {"features_in": len(ga), "features_out": len(out)})
 
 
 def _dissolve(store: Store, layer, by=None, agg=None, name=None) -> Result:
     lay = store.resolve(layer)
-    g, w = _ensure_crs(lay.gdf)
+    g, w = prepare_layer(lay.gdf)
     by_cols = []
     if by:
         if isinstance(by, str):
@@ -369,8 +574,12 @@ def _dissolve(store: Store, layer, by=None, agg=None, name=None) -> Result:
     aggmap = None
     if agg and isinstance(agg, dict):
         aggmap = {k: v for k, v in agg.items() if k in g.columns}
+        missing = [k for k in agg if k not in g.columns]
+        if missing:
+            w.append(f"聚合字段不存在，已忽略：{'、'.join(map(str, missing))}")
     if by_cols:
-        out = g.dissolve(by=by_cols, aggfunc=aggmap or "first", as_index=False)
+        # dropna=False：真实数据里分组字段常有空值，默认会把它们整组丢掉
+        out = g.dissolve(by=by_cols, aggfunc=aggmap or "first", as_index=False, dropna=False)
         msg = f"按「{'、'.join(by_cols)}」融合「{lay.name}」：要素 {len(g)} → {len(out)}。"
     else:
         u = g.geometry.union_all()
@@ -396,7 +605,7 @@ def _reproject(store: Store, layer, epsg, name=None) -> Result:
 
 def _simplify(store: Store, layer, tolerance=10, unit="m", name=None) -> Result:
     lay = store.resolve(layer)
-    g, w = _ensure_crs(lay.gdf)
+    g, w = prepare_layer(lay.gdf)
     mc, wm = metric_crs(g)
     tol = (_num(tolerance) or 0) * UNIT_TO_M.get(str(unit).lower(), 1.0)
     if tol <= 0:
@@ -411,7 +620,6 @@ def _simplify(store: Store, layer, tolerance=10, unit="m", name=None) -> Result:
     return Result(True, f"按 {_fmt(tol,' m')} 容差简化「{lay.name}」，节点 {n_in} → {n_out}（减少 {red*100:.1f}%）。",
                   nl, w + wm[:1],
                   {"tolerance_m": tol, "node_reduction_pct": round(red * 100, 2)})
-
 
 def _node_count(gdf: gpd.GeoDataFrame) -> int:
     try:
@@ -431,7 +639,7 @@ def _min_rect(store: Store, layer, mode="rotated", name=None) -> Result:
     方便接着算「周长 / 外接矩形周长」这类指标。
     """
     lay = store.resolve(layer)
-    g, w = _ensure_crs(lay.gdf)
+    g, w = prepare_layer(lay.gdf)
     if len(g) == 0:
         raise ValueError("图层没有要素。")
     is_poly = "Polygon" in lay.geom_type or "MultiPolygon" in lay.geom_type
@@ -462,7 +670,6 @@ def _min_rect(store: Store, layer, mode="rotated", name=None) -> Result:
     return Result(True, f"为「{lay.name}」生成 {len(out)} 个{kind}（含长宽/面积字段）。",
                   nl, w + wm[:1], {"features_out": len(out), "mode": m})
 
-
 def _shape_metrics(store: Store, layer, name=None) -> Result:
     """形状指标：面积、周长、最小外接矩形周长、以及「周长 / 外接矩形周长」比值。
 
@@ -470,7 +677,7 @@ def _shape_metrics(store: Store, layer, name=None) -> Result:
     这些量在**投影坐标系**下算，单位是米，避免 4326 下算长度没有意义。
     """
     lay = store.resolve(layer)
-    g, w = _ensure_crs(lay.gdf)
+    g, w = prepare_layer(lay.gdf)
     if len(g) == 0:
         raise ValueError("图层没有要素。")
     mc, wm = metric_crs(g)
@@ -502,25 +709,28 @@ def _shape_metrics(store: Store, layer, name=None) -> Result:
     nl = store.add(out, name or f"{lay.name}_形状指标", source=lay.id, op="shape_metrics")
     return Result(True, msg, nl, w + wm[:1], {"features_out": len(out)})
 
-
 def _centroid(store: Store, layer, name=None) -> Result:
     lay = store.resolve(layer)
-    g, w = _ensure_crs(lay.gdf)
+    g, w = prepare_layer(lay.gdf)
     out = g.copy()
     out[out.geometry.name] = g.geometry.representative_point()
     out["_src_area_m2"] = None
     mc, _ = metric_crs(g)
     try:
-        out["_src_area_m2"] = g.to_crs(mc).area.round(2)
+        # 用 .values 而不是按索引对齐：sjoin/overlay 后索引可能重复
+        out["_src_area_m2"] = g.to_crs(mc).area.round(2).values
     except Exception:
         pass
-    nl = store.add(out, name or f"{lay.name}_质心", source=lay.id, op="centroid")
-    return Result(True, f"生成「{lay.name}」的要素中心点，共 {len(out)} 个点。", nl, w, {"features_out": len(out)})
+    nl = store.add(out, name or f"{lay.name}_代表点", source=lay.id, op="centroid")
+    return Result(True, f"生成「{lay.name}」的要素代表点，共 {len(out)} 个点。", nl, w,
+                  {"features_out": len(out)})
 
 
 def _convex_hull(store: Store, layer, name=None) -> Result:
     lay = store.resolve(layer)
-    g, w = _ensure_crs(lay.gdf)
+    g, w = prepare_layer(lay.gdf)
+    if len(g) == 0:
+        raise ValueError("图层没有要素，无法生成凸包。")
     hull = g.geometry.union_all().convex_hull
     out = gpd.GeoDataFrame({"source": [lay.name]}, geometry=[hull], crs=g.crs)
     nl = store.add(out, name or f"{lay.name}_凸包", source=lay.id, op="convex_hull")
@@ -529,7 +739,9 @@ def _convex_hull(store: Store, layer, name=None) -> Result:
 
 def _voronoi(store: Store, layer, name=None) -> Result:
     lay = store.resolve(layer)
-    g, w = _ensure_crs(lay.gdf)
+    g, w = prepare_layer(lay.gdf)
+    if "Point" not in lay.geom_type:
+        raise ValueError(f"泰森多边形需要点图层，「{lay.name}」是 {lay.geom_type}。")
     mc, wm = metric_crs(g)
     p = g.to_crs(mc)
     pts = p[p.geometry.geom_type.isin(["Point", "MultiPoint"])]
@@ -566,13 +778,14 @@ def _grid(store: Store, layer, cell=1000, unit="m", name=None) -> Result:
     rows = np.arange(ymin, ymax + cell_m, cell_m)
     if len(cols) * len(rows) > 250000:
         raise ValueError(f"网格数量过大（{len(cols)*len(rows)}），请增大网格尺寸。")
-    from shapely.geometry import Polygon
-    polys, ids = [], []
-    for i in range(len(cols) - 1):
-        for j in range(len(rows) - 1):
-            polys.append(Polygon([(cols[i], rows[j]), (cols[i + 1], rows[j]),
-                                  (cols[i + 1], rows[j + 1]), (cols[i], rows[j + 1])]))
-            ids.append(f"{i}_{j}")
+    xs, ys = cols[:-1], rows[:-1]
+    if not len(xs) or not len(ys):
+        raise ValueError("图层范围小于一个网格，请减小网格尺寸。")
+    # 向量化生成，避免 25 万个 Polygon 的 Python 双重循环
+    gx = np.repeat(xs, len(ys))
+    gy = np.tile(ys, len(xs))
+    polys = shapely.box(gx, gy, gx + cell_m, gy + cell_m)
+    ids = [f"{i}_{j}" for i in range(len(xs)) for j in range(len(ys))]
     out = gpd.GeoDataFrame({"cell_id": ids}, geometry=polys, crs=mc).to_crs(g.crs)
     nl = store.add(out, name or f"{lay.name}_网格{int(cell_m)}m", source=lay.id, op="grid")
     return Result(True, f"按 {_fmt(cell_m,' m')} 生成渔网，共 {len(out)} 个单元。", nl, w + wm[:1],
@@ -580,50 +793,110 @@ def _grid(store: Store, layer, cell=1000, unit="m", name=None) -> Result:
 
 
 def _sjoin(store: Store, layer, other, how="inner", predicate="intersects", name=None) -> Result:
+    valid_pred = {"intersects", "contains", "within", "overlaps", "touches", "crosses",
+                  "covers", "covered_by"}
+    if predicate not in valid_pred:
+        raise ValueError(f"不支持的空间关系「{predicate}」，可用：{'、'.join(sorted(valid_pred))}")
+    if how not in ("inner", "left", "right"):
+        raise ValueError("how 只能是 inner / left / right")
     a, b = store.resolve(layer), store.resolve(other)
-    ga, _ = _ensure_crs(a.gdf)
-    gb, _ = _ensure_crs(b.gdf)
+    ga, w1 = prepare_layer(a.gdf)
+    gb, w2 = prepare_layer(b.gdf)
     gb = gb.to_crs(ga.crs)
     for df in (ga, gb):
         if df.index.name in ("index_right", "index_left"):
             df.index.name = None
-    gb = gb.drop(columns=[c for c in gb.columns if c in ga.columns and c != gb.geometry.name], errors="ignore")
-    out = gpd.sjoin(ga, gb, how=("inner" if how in ("inner", "left", "right") else "inner"),
-                    predicate=predicate).drop(columns=["index_right"], errors="ignore")
+    # 不再丢弃右图层的同名字段：交给 sjoin 的 lsuffix/rsuffix 保留双方属性
+    out = gpd.sjoin(ga, gb, how=how, predicate=predicate,
+                    lsuffix="left", rsuffix="right").drop(columns=["index_right", "index_left"],
+                                                          errors="ignore")
     nl = store.add(out, name or f"{a.name}_空间连接", source=a.id, op="sjoin")
-    return Result(True, f"「{a.name}」按 {predicate} 关联「{b.name}」：{len(ga)} → {len(out)} 个要素。", nl, [],
+    return Result(True, f"「{a.name}」按 {predicate} 关联「{b.name}」：{len(ga)} → {len(out)} 个要素。",
+                  nl, w1 + w2,
                   {"features_in": len(ga), "features_out": len(out), "predicate": predicate})
+
+
+def _k_nearest_rows(pa: gpd.GeoDataFrame, pb: gpd.GeoDataFrame, kk: int) -> gpd.GeoDataFrame:
+    """前 k 个最近邻（k=1 用 sjoin_nearest；k>1 用 STRtree + dwithin 半径扩展）。"""
+    if len(pb) == 0:
+        raise ValueError("目标图层没有要素，无法做最近邻分析。")
+    if kk <= 1:
+        out = gpd.sjoin_nearest(pa, pb, how="left", distance_col="distance_m")
+        out = out.drop(columns=["index_right"], errors="ignore")
+        return out[~out.index.duplicated(keep="first")]
+
+    geoms = pa.geometry.values
+    rgeoms = pb.geometry.values
+    n = len(geoms)
+    tree = shapely.STRtree(rgeoms)
+    # 先求每个左要素的最近距离，作为半径起点
+    try:
+        _, dist = tree.query_nearest(geoms, all_matches=False, return_distance=True)
+        dist = np.asarray(dist, dtype=float).reshape(-1)
+        if dist.size != n:
+            raise ValueError("nearest shape mismatch")
+    except Exception:
+        # 极端情况下退回安全但慢的路径：逐要素求最近距离
+        dist = np.array([shapely.distance(g, pb.geometry.union_all()) for g in geoms], dtype=float)
+
+    radii = np.where(np.isfinite(dist), np.maximum(dist * 2.0, 1.0), 1.0)
+    lidx = np.array([], dtype=np.intp)
+    ridx = np.array([], dtype=np.intp)
+    for _ in range(6):
+        pairs = tree.query(geoms, predicate="dwithin", distance=radii)
+        if len(pairs[0]) == 0:
+            lidx = ridx = np.array([], dtype=np.intp)
+            break
+        lidx, ridx = pairs
+        counts = np.bincount(lidx, minlength=n)
+        if np.all(counts >= kk):
+            break
+        need = counts < kk
+        radii[need] = np.maximum(radii[need] * 5.0, 1.0)
+
+    left = pa.reset_index(drop=True).copy()
+    left["_lid"] = np.arange(n)
+    if len(lidx):
+        d = shapely.distance(geoms[lidx], rgeoms[ridx])
+        cand = pd.DataFrame({"lid": lidx, "rid": ridx, "dist": d})
+        cand = cand.sort_values(["lid", "dist"], kind="stable").groupby("lid", as_index=False).head(kk)
+    else:
+        cand = pd.DataFrame(columns=["lid", "rid", "dist"])
+    merged = left.merge(cand, left_on="_lid", right_on="lid", how="left")
+    merged = merged.drop(columns=["lid", "_lid"])
+    right = pb.reset_index(drop=True)
+    for col in right.columns:
+        if col == right.geometry.name:
+            continue
+        name = col if (col not in merged.columns and col != "distance_m") else f"{col}_right"
+        merged[name] = merged["rid"].map(right[col])
+    merged = merged.rename(columns={"dist": "distance_m"}).drop(columns=["rid"], errors="ignore")
+    return gpd.GeoDataFrame(merged, geometry=pa.geometry.name, crs=pa.crs)
 
 
 def _nearest(store: Store, layer, other, k=1, unit="m", name=None) -> Result:
     a, b = store.resolve(layer), store.resolve(other)
-    ga, _ = _ensure_crs(a.gdf)
-    gb, _ = _ensure_crs(b.gdf)
+    ga, w1 = prepare_layer(a.gdf)
+    gb, w2 = prepare_layer(b.gdf)
     gb = gb.to_crs(ga.crs)
     mc, wm = metric_crs(ga)
     pa, pb = ga.to_crs(mc), gb.to_crs(mc)
-    kk = max(1, int(k or 1))
-    out = None
-    if kk > 1:
-        try:
-            out = gpd.sjoin(pa, pb, how="left", predicate="nearest", k=kk, distance="distance_m")
-        except Exception:
-            out = None
-    if out is None:
-        out = gpd.sjoin_nearest(pa, pb, how="left", distance_col="distance_m")
-    out = out.drop(columns=["index_right"], errors="ignore")
-    out = out[~out.index.duplicated(keep="first")]
+    kk = max(1, min(int(k or 1), 50))
+    out = _k_nearest_rows(pa, pb, kk)
     out = out.to_crs(ga.crs)
     nl = store.add(out, name or f"{a.name}_最近邻", source=a.id, op="nearest")
     d = out["distance_m"] if "distance_m" in out else pd.Series(dtype=float)
-    msg = f"为「{a.name}」查找「{b.name}」中最近要素（k={k}），平均距离 {_fmt(d.mean() if len(d) else 0,' m')}。"
-    return Result(True, msg, nl, wm[:1], {"features_out": len(out),
-                                          "mean_distance_m": float(d.mean()) if len(d) else None})
+    msg = (f"为「{a.name}」查找「{b.name}」中最近 {kk} 个要素，"
+           f"平均距离 {_fmt(float(d.mean()) if len(d) and d.notna().any() else 0,' m')}。")
+    return Result(True, msg, nl, w1 + w2 + wm[:1],
+                  {"features_out": len(out),
+                   "mean_distance_m": float(d.mean()) if len(d) and d.notna().any() else None,
+                   "k": kk})
 
 
 def _filter(store: Store, layer, expression, name=None) -> Result:
     lay = store.resolve(layer)
-    g, w = _ensure_crs(lay.gdf)
+    g, w = prepare_layer(lay.gdf)
     expr = _normalize_expr(expression)
     expr = _coerce_text_literals(g, expr)
     try:
@@ -638,12 +911,12 @@ def _filter(store: Store, layer, expression, name=None) -> Result:
     return Result(True, msg, nl, w,
                   {"features_in": len(g), "features_out": len(out), "expression": expression})
 
-
 def _normalize_expr(expr: str) -> str:
     t = str(expr).strip().replace("＞", ">").replace("＜", "<").replace("＝", "=")
     t = t.replace("≠", "!=").replace("＆", " and ").replace("｜", " or ")
     t = t.replace("大于等于", ">=").replace("小于等于", "<=").replace("大于", ">").replace("小于", "<")
-    t = t.replace("并且", " and ").replace("或者", " or ").replace("且", " and ")
+    t = t.replace("不等于", "!=").replace("并且", " and ").replace("或者", " or ")
+    t = t.replace("而且", " and ").replace("或", " or ").replace("且", " and ")
     return t
 
 
@@ -676,7 +949,7 @@ def _coerce_text_literals(gdf, expr: str) -> str:
 
 def _field_calc(store: Store, layer, field, expression, name=None) -> Result:
     lay = store.resolve(layer)
-    g, w = _ensure_crs(lay.gdf)
+    g, w = prepare_layer(lay.gdf)
     if not field:
         raise ValueError("请指定新字段名。")
     out = g.copy()
@@ -701,15 +974,18 @@ def _field_calc(store: Store, layer, field, expression, name=None) -> Result:
     nl = store.add(out, name or f"{lay.name}_计算", source=lay.id, op="field_calc")
     return Result(True, f"在「{lay.name}」新增字段「{field}」，按 {expression} 计算完成。", nl, w, {})
 
-
 def _area_stats(store: Store, layer, group_by=None, name=None) -> Result:
     lay = store.resolve(layer)
-    g, w = _ensure_crs(lay.gdf)
+    g, w = prepare_layer(lay.gdf)
     mc, wm = metric_crs(g)
     p = g.to_crs(mc)
     is_line = "Line" in lay.geom_type
+    if "Point" in lay.geom_type:
+        w.append("点图层没有面积/长度，统计结果会接近 0；如需计数请用「数据体检」或属性分组统计。")
     val = p.length if is_line else p.area
     label = "长度" if is_line else "面积"
+    unit_label = "km" if is_line else "km²"
+    div = 1000.0 if is_line else 1e6
     tmp = p.copy()
     tmp["_v"] = val
     key = None
@@ -722,27 +998,22 @@ def _area_stats(store: Store, layer, group_by=None, name=None) -> Result:
         agg = tmp.groupby(key, dropna=False)["_v"].agg(["sum", "count"]).reset_index()
         agg = agg.sort_values("sum", ascending=False)
         total = float(agg["sum"].sum())
-        top = "、".join(f"{r[key]} {r['sum']/1e6:.3f}km²" for _, r in agg.head(5).iterrows())
-        msg = (f"按「{key}」统计{label}：共 {len(agg)} 类，合计 {total/1e6:.4f} km²。"
+        top = "、".join(f"{r[key]} {r['sum']/div:.3f}{unit_label}" for _, r in agg.head(5).iterrows())
+        msg = (f"按「{key}」统计{label}：共 {len(agg)} 类，合计 {total/div:.4f} {unit_label}。"
                f"前几位：{top}。")
-        agg = agg.rename(columns={"sum": f"{label}(km²)" if not is_line else "长度(km)",
-                                  "count": "要素数"})
-        div = 1e6 if not is_line else 1000.0
-        agg[f"{label}(km²)" if not is_line else "长度(km)"] = (
-            agg[f"{label}(km²)" if not is_line else "长度(km)"] / div).round(3)
+        agg = agg.rename(columns={"sum": f"{label}({unit_label})", "count": "要素数"})
+        agg[f"{label}({unit_label})"] = (agg[f"{label}({unit_label})"] / div).round(3)
     else:
         total = float(tmp["_v"].sum())
-        msg = f"「{lay.name}」共 {len(g)} 个要素，总{label} {total/1e6:.4f} km²" if not is_line else \
-              f"「{lay.name}」共 {len(g)} 个要素，总长度 {total/1000:.3f} km"
+        msg = (f"「{lay.name}」共 {len(g)} 个要素，总{label} {total/div:.4f} {unit_label}。")
         agg = pd.DataFrame({"范围": [lay.name],
-                            f"{label}(km²)" if not is_line else "长度(km)": [round(total / (1e6 if not is_line else 1000.0), 3)],
+                            f"{label}({unit_label})": [round(total / div, 3)],
                             "要素数": [len(g)]})
     table = {
         "columns": [str(c) for c in agg.columns],
         "rows": [[_clean(v) for v in row] for row in agg.head(50).itertuples(index=False)],
     }
     return Result(True, msg, None, w + wm[:1], {"table": table, "total": total, "unit": "m" if is_line else "m2"})
-
 
 def _clean(v):
     if isinstance(v, (np.integer,)):
@@ -763,34 +1034,40 @@ def _merge(store: Store, layers, name=None) -> Result:
         objs = list(store.layers.values())
     else:
         objs = [store.resolve(x) for x in layers]
-    base = objs[0].gdf
+    if not objs:
+        raise ValueError("没有可合并的图层。")
+    base, warns = prepare_layer(objs[0].gdf)
     parts = []
     for o in objs:
-        g = o.gdf if o.gdf.crs is None else o.gdf.to_crs(base.crs)
+        g, _ = prepare_layer(o.gdf)
+        if base.crs is not None and g.crs is not None:
+            g = g.to_crs(base.crs)
         g = g.copy()
         g["_source"] = o.name
-        for c in g.columns:
-            if c != g.geometry.name:
-                g[c] = g[c].astype(object)
+        # 不再把所有列 astype(object)：会丢掉数值 dtype，后续统计/字段计算变慢甚至出错
         parts.append(g)
-    out = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), crs=base.crs)
+    out = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True, sort=False), crs=base.crs)
     nl = store.add(out, name or "合并图层", source=",".join(o.id for o in objs), op="merge")
     return Result(True, f"合并 {len(objs)} 个图层（{'、'.join(o.name for o in objs)}），共 {len(out)} 个要素。",
-                  nl, [], {"features_out": len(out)})
+                  nl, warns, {"features_out": len(out)})
 
 
 def _dedupe(store: Store, layer, by_geometry=True, subset=None, name=None) -> Result:
     lay = store.resolve(layer)
-    g, w = _ensure_crs(lay.gdf)
+    g, w = prepare_layer(lay.gdf)
+    # 只要用户给了 subset，就按字段判重；之前默认 True 会让 subset 被静默忽略
+    if subset:
+        by_geometry = False
     before = len(g)
     if by_geometry:
-        key = g.geometry.apply(lambda x: x.wkb_hex if x is not None else None)
-        out = g[~key.duplicated()]
+        # 向量化 WKB，避免 50 万要素级别时逐要素 Python 调用
+        keys = pd.Series(shapely.to_wkb(g.geometry.values, hex=True))
+        out = g[~keys.duplicated().values]
     else:
         cols = ([s.strip() for s in subset.replace("，", ",").split(",")] if isinstance(subset, str) else subset) or []
         cols = [c for c in cols if c in g.columns]
         if not cols:
-            raise ValueError("请提供用于判重的字段（subset）。")
+            raise ValueError("请提供用于判重的字段（subset），且字段必须存在于图层中。")
         out = g.drop_duplicates(subset=cols)
     removed = before - len(out)
     if not removed:
@@ -800,11 +1077,31 @@ def _dedupe(store: Store, layer, by_geometry=True, subset=None, name=None) -> Re
                   {"removed": removed})
 
 
-def _bbox_select(store: Store, layer, xmin, ymin, xmax, ymax, name=None) -> Result:
+def _bbox_select(store: Store, layer, bbox=None, xmin=None, ymin=None, xmax=None, ymax=None,
+                 name=None) -> Result:
+    """按经纬度范围框选。
+
+    对外的契约是 `bbox="x0,y0,x1,y1"`；同时兼容直接传四个数字，
+    避免旧调用方/大模型传 `bbox=` 时直接 TypeError。
+    """
     lay = store.resolve(layer)
-    g, w = _ensure_crs(lay.gdf)
-    b = box(float(xmin), float(ymin), float(xmax), float(ymax))
-    if g.crs is not None and not g.crs.is_geographic:
+    g, w = prepare_layer(lay.gdf)
+    if bbox is not None:
+        parts = [p.strip() for p in str(bbox).replace("，", ",").split(",") if p.strip()]
+        if len(parts) != 4:
+            raise ValueError("bbox 需要 4 个数字：x0,y0,x1,y1（经纬度）")
+        try:
+            xmin, ymin, xmax, ymax = (float(p) for p in parts)
+        except ValueError:
+            raise ValueError("bbox 的 4 个值都必须是数字，例如 104.0,30.5,104.1,30.6")
+    if None in (xmin, ymin, xmax, ymax):
+        raise ValueError("请提供经纬度范围 bbox=x0,y0,x1,y1")
+    x0, x1 = sorted((float(xmin), float(xmax)))
+    y0, y1 = sorted((float(ymin), float(ymax)))
+    if not (-180 <= x0 <= 180 and -180 <= x1 <= 180 and -90 <= y0 <= 90 and -90 <= y1 <= 90):
+        raise ValueError("bbox 必须是经纬度（经度 -180~180，纬度 -90~90）。")
+    b = box(x0, y0, x1, y1)
+    if g.crs is not None and g.crs.to_epsg() != 4326:
         b = gpd.GeoSeries([b], crs=4326).to_crs(g.crs).iloc[0]
     out = g[g.geometry.intersects(b)]
     nl = store.add(out, name or f"{lay.name}_框选", source=lay.id, op="bbox")
@@ -860,8 +1157,10 @@ def make_custom_operator(spec: dict) -> Callable:
             if isinstance(v, str):
                 other = store.get(v)
                 if other is not None:
-                    args[key] = other.gdf
-        gdf, w = _ensure_crs(lay.gdf)
+                    # 传副本：自定义算子可能原地改 gdf，不能污染 store 里的原图层
+                    args[key] = other.gdf.copy()
+        # 同样传副本，守住「原始图层只读」的不变量
+        gdf, w = _ensure_crs(lay.gdf.copy())
         out, msg = custom_ops.run_op(spec, gdf, args)
         title = spec.get("title") or spec.get("name")
         if out is None:

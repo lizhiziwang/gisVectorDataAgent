@@ -384,8 +384,9 @@ class OperatorDialog(QDialog):
             "border:1px solid #24344d;padding:8px;}")
         root.addWidget(self.editor, 1)
 
-        note = QLabel("代码会在沙箱里运行：禁止 import / while / 文件与网络访问。"
-                      "保存后它就和内置算子一样，能在对话里被规划调用。")
+        note = QLabel("代码会经过 AST 白名单检查（禁止 import / while / 文件读写 / "
+                      "read_pickle 等危险方法），并在受限命名空间里运行；"
+                      "但这不是操作系统级沙箱，请只保存你信任的代码。")
         note.setWordWrap(True)
         note.setObjectName("tiny")
         root.addWidget(note)

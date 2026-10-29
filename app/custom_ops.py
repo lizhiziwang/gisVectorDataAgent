@@ -39,6 +39,14 @@ _BANNED_NODES = (ast.Import, ast.ImportFrom, ast.While, ast.ClassDef,
 _BANNED_NAMES = {"open", "exec", "eval", "compile", "__import__", "input", "breakpoint",
                  "exit", "quit", "globals", "locals", "vars", "dir", "help", "type",
                  "getattr", "setattr", "delattr", "memoryview", "super", "object"}
+# 只靠“禁 import/open”不够：pd.read_pickle 这类模块方法本身就能执行代码/读写文件
+_BANNED_ATTRS = {
+    "read_pickle", "read_csv", "read_table", "read_json", "read_parquet", "read_feather",
+    "read_sql", "read_sql_query", "read_sql_table", "read_excel", "read_html", "read_xml",
+    "read_file", "read_dataframe", "to_file", "to_csv", "to_pickle", "to_parquet",
+    "to_json", "to_excel", "to_sql", "load", "loads", "save", "savez", "savez_compressed",
+    "system", "popen", "spawn", "urlopen", "urlretrieve", "socket", "connect",
+}
 
 
 class OperatorError(ValueError):
@@ -69,6 +77,8 @@ def check_code(code: str) -> None:
             raise OperatorError(f"不允许使用 {what}。")
         if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
             raise OperatorError(f"不允许访问 `{node.attr}` 这类内部属性。")
+        if isinstance(node, ast.Attribute) and node.attr in _BANNED_ATTRS:
+            raise OperatorError(f"不允许调用 `{node.attr}`（文件/网络/序列化访问）。")
         if isinstance(node, ast.Name):
             if node.id in _BANNED_NAMES:
                 raise OperatorError(f"不允许使用 `{node.id}`。")
@@ -189,12 +199,19 @@ def install(spec: dict) -> dict:
 
     这样自定义算子和内置算子完全等价：规则引擎点得到、大模型看得到、
     算子库按钮里也有它。返回补全后的 spec。
+
+    **不允许覆盖内置算子**：一个叫 buffer 的生成物会劫持所有缓冲请求。
     """
     from .agent import register_tool_spec
     from .engine import OPERATIONS, make_custom_operator
 
     spec = dict(spec)
     spec["name"] = _safe_name(spec.get("name") or spec.get("title"))
+    from .tool_registry import REGISTRY
+    existing = REGISTRY.get(spec["name"])
+    if spec["name"] in OPERATIONS and (existing is None or existing.group != "我的算子"):
+        raise OperatorError(
+            f"算子名「{spec['name']}」与内置算子冲突，请换一个名字（例如 custom_{spec['name']}）。")
     OPERATIONS[spec["name"]] = make_custom_operator(spec)
     register_tool_spec(spec["name"], spec.get("title") or spec["name"],
                        spec.get("desc") or "自定义算子",
@@ -214,11 +231,21 @@ def install_all() -> list[dict]:
 
 
 def remove(name: str) -> bool:
+    """删除算子文件，并把它从运行时的三张表里注销。"""
+    ok = False
     f = OPS_DIR / f"{name}.json"
     if f.exists():
         try:
             f.unlink()
-            return True
+            ok = True
         except Exception:
             return False
-    return False
+    try:
+        from .agent import TOOL_LABEL, TOOL_SPECS
+        from .engine import OPERATIONS
+        OPERATIONS.pop(name, None)
+        TOOL_LABEL.pop(name, None)
+        TOOL_SPECS[:] = [s for s in TOOL_SPECS if s.get("name") != name]
+    except Exception:
+        pass
+    return ok

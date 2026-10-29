@@ -22,8 +22,9 @@ gis-agent/
 │
 ├── app/                     与界面无关的「引擎层」：数据、算子、规划、IO
 │   ├── engine.py            Store（图层仓库）+ Layer + 25 个算子的真实实现 + Result
-│   ├── agent.py             两级规划器（规则 / 大模型）+ 计划执行器 run_plan + 算子签名表
-│   ├── custom_ops.py        自定义算子：AST 白名单校验、受限沙箱、落盘与装载
+│   ├── agent.py             两级规划器（规则 / 大模型）+ Agent 闭环 + 计划预检 + 算子签名表
+│   ├── tool_registry.py     算子契约单一事实源：参数 schema / 模板 / 分组 / 校验
+│   ├── custom_ops.py        自定义算子：AST 白名单校验、受限执行、落盘与装载
 │   ├── io_utils.py          读写矢量数据：编码择优、zip 解压、导出 4 种格式
 │   ├── samples.py           生成 4 个示例图层（成都某片区）
 │   ├── config.py            模型设置（Base URL / Key / Model）的规范化与解释
@@ -84,6 +85,9 @@ Layer(id, name, gdf, color, op, source, parent)   # 一个图层 = 一份 GeoDat
 Store.layers: dict[str, Layer]                    # 有序字典，顺序即渲染顺序
 Result(ok, message, layer=None, warnings=[], data={})   # 每个算子的返回
 ```
+
+`Layer.gdf` 是懒加载属性：大图层可被 `Store` 按内存预算换出到 `data/cache/`，
+内存里只保留 `meta`（count/bounds/fields）；下次访问时从 GeoParquet/GPKG 读回。
 
 三条硬约束（改动时别破坏）：
 
@@ -148,7 +152,7 @@ GUI 线程                    Worker(QThread)              常驻渲染线程
 事件循环 / 绘制             解析数据、跑算子             画各图层到 QImage
   │                            │                            │
   ├─ 10ms 一片地构建路径        ├─ gpd.read_file            ├─ 队列只留最新一帧
-  ├─ 合成图层图                ├─ run_plan                  ├─ epoch 不符直接丢弃
+  ├─ 合成图层图                ├─ run_agent                 ├─ epoch 不符直接丢弃
   └─ paintEvent 画帧           └─ 结果回主线程              └─ 每层画完先回传
 ```
 
@@ -166,6 +170,7 @@ GUI 线程                    Worker(QThread)              常驻渲染线程
 | 帧缓存 `_frame` | 场景签名 + 视图 | 平移/缩放时直接贴旧帧（缩放的位图变换在 `paintEvent` 里做） |
 | 图层图像 `_img_cache` | `(scale, tx, ty, w, h, dpr, 图层几何版本, 颜色, op, 线宽档位)` | 切显隐、调顺序几乎零成本 |
 | 渲染集 `_RenderSet` | 矩形 + 容差 | 来回缩放不重建几何 |
+| 磁盘图层缓存 | 图层 id（`data/cache/<id>.parquet` 或 `.gpkg`） | 大图层换出内存后仍可懒加载；`meta` 不读盘 |
 
 注意图层缓存的键用**图层自己的** `rev`：别的图层重建不该把这张图废掉。
 
@@ -193,22 +198,27 @@ Qt 光栅引擎对**整数宽度 1** 的画笔有一条快速路径；`> 1` 会�
    ├─► 闲聊判定 chit_chat()          —— 问候/道谢/问能力，直接回人话
    ├─► 生成算子 wants_new_operator()  —— 「写一个算子：…」走代码生成
    └─► 规划
-        ├─ 有大模型：llm_plan()  — 图层清单+字段+算子签名 → JSON 计划
-        │     · 提示词里写死 {tool, desc, args}
+        ├─ 有大模型：llm_plan()  — 图层清单+字段+算子 schema → JSON 计划
+        │     · 提示词里写死 {tool, desc, args}，数据区声明为不可信输入
         │     · 返回后 normalize_plan() 归一（兼容 op/params、别名、参数摊平）
-        │     · JSON 解析失败或 finish_reason=length 各重试一次
-        │     · 仍失败 → 回退规则引擎，并静默 2 分钟（避免每条都卡）
+        │     · JSON 解析失败/被截断/429/5xx 会重试或提高 max_tokens
+        │     · 仍失败 → 回退规则引擎，并静默 60 秒（避免每条都卡）
         └─ 无大模型：规则引擎 — 拆句（然后/再/；）→ 图层名模糊匹配 → 单位数字抽取
                                                     → 上一步输出自动串给下一步
    │
    ▼
-run_plan(): 逐步执行，产出步骤卡片数据
+validate_plan(): app/tool_registry.py 的 schema 校验（类型/枚举/必填/图层/几何类型）
+   │  不通过 → 0 副作用拒绝，或让模型修复
+   ▼
+run_agent(): 逐步执行，产出步骤卡片数据
    · `$prev` 表示上一步产出；上一步没建层则沿用它的输入图层（链条不断）
-   · 任一步抛异常 → 中止后续，前面已完成的保留
+   · 任一步失败 → 把失败步骤+错误+当前 schema 回灌给模型，最多修 2 次
+   · 图层/字段不明确 → clarify，前端渲染可点选项
    · 每步记录 elapsed / message / warnings / data（小表）/ 新图层 meta
+   · 全部结束后 note_result() 记住最近工具/参数/结果层，供下一轮指代
 ```
 
-规划器**永远不直接改数据**，只产出「计划」这一数据结构；执行、建层、撤销登记都在 `run_plan` 之后由主窗口完成。
+规划器**永远不直接改数据**，只产出「计划」这一数据结构；执行、建层、撤销登记都在 `run_agent` 之后由主窗口完成。
 这样规则引擎和大模型走的是同一条执行路径，行为可对比、可测试。
 
 ---
@@ -218,12 +228,13 @@ run_plan(): 逐步执行，产出步骤卡片数据
 - 签名统一：`op(store, layer, **args) -> Result`，第一个参数是 `Store`（便于跨图层操作）；
 - **CRS 策略**：距离/面积运算前把几何投到 **CGCS2000 3 度带**（按数据中心经度选带，EPSG:4534–4554），
   境外退回 UTM；结果字段统一带 `_m` / `_m2` 后缀；
-- **几何有效性**：入口处 `make_valid` 并计数（>5 万要素的图层跳过逐个校验）；
+- **几何有效性**：入口处 `make_valid` 并计数（>2 万要素的图层跳过逐个校验）；
 - **文本型 ID**：Shapefile 的 `osm_id` 是字符串，表达式里写数字会自动补引号，
   否则 `osm_id == 4814005` 会静默筛出 0 条；
-- **自定义算子**：`custom_ops.py` 先用 AST 白名单拦截 `import / while / exec / __dunder__`，
-  再在受限 `eval` 环境里跑；先拿前 200 个要素试跑，确认后才落盘到 `data/operators/`，
+- **自定义算子**：`custom_ops.py` 先用 AST 白名单拦截 `import / while / exec / read_pickle / to_file` 等，
+  再在受限命名空间里跑；先拿前 200 个要素试跑，确认后才落盘到 `data/operators/`，
   重启自动装回，与内置算子同权（工具表、提示词、算子库三处同步可见）。
+  **这不是 OS 级沙箱**，只应运行可信代码；算子名不能覆盖内置算子，执行时传原图层副本以守住「只读」。
 
 ---
 
@@ -244,10 +255,13 @@ run_plan(): 逐步执行，产出步骤卡片数据
 改渲染或算子前后，按这个顺序跑：
 
 ```bash
-.venv\Scripts\python.exe tools\verify_render.py   # 完备性 + 像素比对（最该看的）
-.venv\Scripts\python.exe tools\perf_profile.py    # 一帧耗时拆到 构建/简化/绘制/合成
-.venv\Scripts\python.exe tools\test_ux_batch.py   # 选区/撤销/属性表联动
-.venv\Scripts\python.exe tools\smoke_app.py       # 整机冒烟 + 截图
+.venv\Scripts\python.exe tools\test_agent_v2.py     # 工具契约/引擎/多轮/自定义算子安全
+.venv\Scripts\python.exe tools\test_agent_llm.py    # 假 LLM：校验修复/执行修复/澄清/reply
+.venv\Scripts\python.exe tools\smoke_web.py         # 真起 uvicorn：示例/多轮/多文件上传/导出
+.venv\Scripts\python.exe tools\verify_render.py     # 完备性 + 像素比对（最该看的）
+.venv\Scripts\python.exe tools\perf_profile.py      # 一帧耗时拆到 构建/简化/绘制/合成
+.venv\Scripts\python.exe tools\test_ux_batch.py     # 选区/撤销/属性表联动
+.venv\Scripts\python.exe tools\smoke_app.py         # 整机冒烟 + 截图
 ```
 
 `perf_roads.py` / `perf_backend.py` 是「换实现之前先量一下」的工具：

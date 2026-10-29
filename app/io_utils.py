@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import zipfile
 from pathlib import Path
@@ -40,8 +41,8 @@ def read_vector(path: Path, encoding: str | None = None) -> gpd.GeoDataFrame:
             raise ValueError(f"读取失败：{first}") from first
     if gdf.empty:
         raise ValueError("读取成功但没有任何要素。")
-    if gdf.crs is None:
-        gdf = gdf.set_crs(4326)
+    # 不再静默 set_crs(4326)：缺 .prj 的投影数据会被误当经纬度。
+    # 真正需要 4326 的算子会走 engine._ensure_crs，并在坐标越界时明确拒绝。
     return gdf
 
 
@@ -143,7 +144,11 @@ def load_any(path: Path) -> gpd.GeoDataFrame:
 
 
 def extract_zip(zip_path: Path) -> tuple[Path, list[Path]]:
-    """解压并返回（解压根目录, 矢量文件列表，按体积降序）。"""
+    """解压并返回（解压根目录, 矢量文件列表，按体积降序）。
+
+    加了解压大小/文件数上限：上传的 zip 不能把磁盘写满（zip bomb）。
+    路径穿越由标准库 zipfile 负责清理，这里只做资源限制。
+    """
     zip_path = Path(zip_path)
     out = zip_path.parent / ("x_" + zip_path.stem[:12])
     n = 1
@@ -151,7 +156,15 @@ def extract_zip(zip_path: Path) -> tuple[Path, list[Path]]:
         n += 1
         out = zip_path.parent / f"x_{zip_path.stem[:12]}_{n}"
     out.mkdir(parents=True, exist_ok=True)
+    max_files = int(os.environ.get("GIS_AGENT_MAX_ZIP_FILES", "2000"))
+    max_mb = int(os.environ.get("GIS_AGENT_MAX_ZIP_MB", "2048"))
     with zipfile.ZipFile(zip_path) as z:
+        infos = z.infolist()
+        if len(infos) > max_files:
+            raise ValueError(f"压缩包文件数过多（{len(infos)}），上限 {max_files}。")
+        total = sum(max(0, i.file_size) for i in infos)
+        if total > max_mb * 1024 * 1024:
+            raise ValueError(f"压缩包解压后约 {total / (1024*1024):.0f} MB，超过 {max_mb} MB 限制。")
         z.extractall(out)
     files = sorted({p for ext in VECTOR_EXTS for p in out.rglob("*" + ext)},
                    key=lambda p: -p.stat().st_size)

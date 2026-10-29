@@ -1,6 +1,7 @@
 """主窗口：三栏工作台（图层 / 地图 / 对话），纯 Qt 控件，无 Web 引擎。"""
 from __future__ import annotations
 
+import atexit
 import shutil
 import time
 import traceback
@@ -15,12 +16,13 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QFileDialog, QF
                                QScrollArea, QSizePolicy, QToolTip, QVBoxLayout, QWidget)
 
 from app import custom_ops
-from app.agent import Planner, run_plan
+from app.agent import Planner, run_agent, run_plan
 from app.config import explain, is_ready, load_cfg, save_cfg
 from app.engine import Store
 from app.io_utils import export_layer as write_layer_file
 from app.io_utils import extract_zip, file_info, load_any
 from app.samples import ensure_samples
+from app.tool_registry import template_map
 
 from .chat import ChatPanel, Worker
 from .dialogs import ImportDialog, OperatorDialog, SettingsDialog, TableDialog
@@ -32,31 +34,7 @@ FILE_FILTER = ("矢量数据 (*.zip *.shp *.geojson *.json *.gpkg *.kml *.gml *.
                "Shapefile 压缩包 (*.zip);;GeoJSON (*.geojson *.json);;"
                "GeoPackage (*.gpkg);;CSV (*.csv);;所有文件 (*.*)")
 
-TOOL_TEMPLATES = {
-    "describe": "检查「{L}」的数据质量",
-    "buffer": "对「{L}」做 500 米缓冲区",
-    "clip": "用「{O}」裁剪「{L}」",
-    "intersect": "「{L}」与「{O}」求交",
-    "union": "「{L}」与「{O}」叠加合并",
-    "erase": "从「{L}」中擦除「{O}」范围",
-    "dissolve": "按字段融合「{L}」",
-    "reproject": "把「{L}」投影到 EPSG:4547",
-    "simplify": "简化「{L}」容差 10 米",
-    "centroid": "取「{L}」的质心",
-    "convex_hull": "生成「{L}」的凸包",
-    "voronoi": "对「{L}」生成泰森多边形",
-    "grid": "在「{L}」范围生成 1 公里渔网",
-    "sjoin": "把「{O}」的属性空间连接到「{L}」",
-    "nearest": "为「{L}」查找最近的「{O}」",
-    "filter": "筛选「{L}」中容积率 > 3 的要素",
-    "field_calc": "在「{L}」新增字段 密度 = 人口 / 面积",
-    "area_stats": "按类型统计「{L}」的面积",
-    "merge": "合并所有图层",
-    "dedupe": "对「{L}」去重",
-    "fix_geometry": "修复「{L}」的无效几何",
-    "explode": "拆分「{L}」的多部件",
-    "bbox_select": "框选「{L}」的一部分",
-}
+TOOL_TEMPLATES = template_map()
 
 
 # --------------------------------------------------------------------------- 图标
@@ -242,6 +220,7 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(QSS)
         self._build()
         self._shortcuts()
+        self._register_exit()
         self._refresh_planner_pill()
         self._greet()
         # 把 data/operators/ 里存过的自定义算子重新装回运行时
@@ -253,6 +232,26 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         QTimer.singleShot(120, self._refresh_tools)
+
+    def _register_exit(self) -> None:
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._shutdown_threads)
+        atexit.register(self._shutdown_threads)
+
+    def _shutdown_threads(self) -> None:
+        """停掉渲染/任务线程；正常关窗、解释器退出、测试脚本直接退出都要走这里。"""
+        try:
+            self.map.shutdown()
+        except Exception:
+            pass
+        for name in ("_worker", "_cleanup_worker"):
+            w = getattr(self, name, None)
+            try:
+                if w is not None and w.isRunning():
+                    w.wait(5000)
+            except Exception:
+                pass
 
     def closeEvent(self, e):  # noqa: N802
         """关窗时先停掉地图的渲染线程。
@@ -267,7 +266,13 @@ class MainWindow(QMainWindow):
             pass
         try:
             if self._worker is not None and self._worker.isRunning():
-                self._worker.wait(2000)
+                # 长算子可能跑几十秒；关窗时先等它收尾，避免 QThread 被销毁导致崩溃
+                self._worker.wait(15000)
+        except Exception:
+            pass
+        try:
+            if self._cleanup_worker is not None and self._cleanup_worker.isRunning():
+                self._cleanup_worker.wait(5000)
         except Exception:
             pass
         super().closeEvent(e)
@@ -1272,46 +1277,12 @@ class MainWindow(QMainWindow):
                 return {"op_gen": self.planner.gen_operator(brief, current, cfg),
                         "brief": brief, "user": text,
                         "steps": [], "lines": [], "source": "gen", "note": ""}
-            # 纯对话（问候 / 道谢 / 问能做什么）先兜住，别送进规划器
-            small = self.planner.chit_chat(text, has_data=True)
-            if small:
-                return {"chat": small, "steps": [], "lines": [], "source": "chat",
-                        "note": "", "user": text}
-            plan, source, note = None, "rule", ""
-            if is_ready(cfg):
-                try:
-                    out = self.planner.llm_plan(text, current, cfg, self.history)
-                except Exception:
-                    out = None
-                if out and out.get("plan"):
-                    plan, source = out["plan"], "llm"
-                    note = out.get("reply") or ""
-                elif out and out.get("error"):
-                    note = out["error"]
-                elif out and out.get("reply") and not out.get("plan"):
-                    # 大模型判断这是闲聊/问询，给了自然语言回复 → 直接用
-                    return {"chat": out["reply"], "steps": [], "lines": [],
-                            "source": "llm", "note": "", "user": text}
-            if not plan:
-                plan = self.planner.rule_plan(text, current)
-
-            exports = [p for p in plan if p.get("tool") == "__export__"]
-            plan = [p for p in plan if p.get("tool") != "__export__"]
-            steps, lines, new_layers = run_plan(self.store, plan) if plan else ([], [], [])
-            for ex in exports:
-                args = ex.get("args") or {}
-                lid = args.get("layer")
-                lay = self.store.get(lid)
-                fmt = args.get("format", "geojson")
-                if lay:
-                    steps.append({"tool": "export", "label": "导出",
-                                  "args": {"layer": lay.name, "format": fmt},
-                                  "status": "ok", "message": f"生成 {fmt.upper()}",
-                                  "warnings": [], "elapsed": 0,
-                                  "data": {"layer_id": lay.id, "format": fmt}})
-                    lines.append(f"已准备「{lay.name}」的 {fmt.upper()} 导出。")
-            return {"steps": steps, "lines": lines, "source": source, "note": note,
-                    "user": text}
+            # 统一走 Agent 闭环：闲聊/规划/执行/修复/澄清都在 run_agent 里
+            res = run_agent(self.store, self.planner, text, current, cfg,
+                            self.history, use_llm=is_ready(cfg))
+            res["user"] = text
+            res["source"] = res.get("planner") or "rule"
+            return res
 
         self._worker = Worker(job)
         self._worker.done.connect(self._on_plan_done)
@@ -1340,7 +1311,7 @@ class MainWindow(QMainWindow):
             self._handle_operator_gen(res.get("op_gen") or {}, res.get("brief") or user)
             return
 
-        # 纯对话：直接回一句，不进步骤卡片
+        # 纯对话/澄清：直接回一句，不进步骤卡片
         if res.get("chat"):
             reply = res["chat"]
             self.chat.add_agent(reply)
@@ -1349,19 +1320,20 @@ class MainWindow(QMainWindow):
             return
 
         if not steps:
-            note = (res.get("note") or "").strip()
+            reply = (res.get("reply") or res.get("note") or "").strip()
             # 大模型/解析器给了自然语言说明就用它，别再甩模板
-            reply = note or ("这句我还拆不出可执行的步骤。可以这样描述：\n"
-                             "· 对「图层名」做 500 米缓冲区\n"
-                             "· 用「边界」裁剪「地块」\n"
-                             "· 按「类型」融合后统计各类面积")
+            reply = reply or ("这句我还拆不出可执行的步骤。可以这样描述：\n"
+                              "· 对「图层名」做 500 米缓冲区\n"
+                              "· 用「边界」裁剪「地块」\n"
+                              "· 按「类型」融合后统计各类面积")
             self.chat.add_agent(reply)
             self._remember(user, reply)
+            self._refresh_planner_pill(res.get("source"))
             return
         err = sum(1 for s in steps if s.get("status") == "error")
         head = f"执行了 {len(steps)} 步" + (f"，其中 {err} 步失败" if err else "，全部成功") + "："
         body = "\n".join(f"{i + 1}. {l}" for i, l in enumerate(lines))
-        text = (res.get("note") + "\n" if res.get("note") else "") + head + "\n" + body
+        text = res.get("reply") or ((res.get("note") + "\n" if res.get("note") else "") + head + "\n" + body)
         self.chat.add_agent(text, steps)
         self._remember(user, text)
 
