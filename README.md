@@ -225,28 +225,21 @@ QPainter 在 GL 上要把路径三角化（stencil-and-cover），而 CPU 光栅
 
 ```
 gis-agent/
-├─ 启动.bat               # 双击即用：打开原生窗口（pythonw，无控制台）
-├─ 调试启动.bat           # 带控制台启动，排查问题用
-├─ native_app.py          # 桌面入口（QApplication + 主窗口）
-├─ native/                # 纯 Qt 界面层
-│  ├─ app.py              # 主窗口：三栏布局、图层、动作、对话编排
-│  ├─ mapview.py          # 地图控件：QPainter 自绘 / 分块渲染 / 比例尺分级 / 拾取
-│  ├─ chat.py             # 对话面板：气泡、步骤卡片、后台线程
-│  ├─ dialogs.py          # 属性表 / 模型设置 / 多图层选择
-│  ├─ theme.py            # 浅色主题样式表
-│  └─ format.py           # 数值与字段名格式化
-├─ app/                   # 与界面无关的内核
-│  ├─ engine.py           # 图层仓库 + 25 个算子的真实实现（GeoPandas/Shapely/PyProj）
-│  ├─ agent.py            # 两级规划器（规则 / 大模型）+ 计划执行器 + 算子签名
-│  ├─ io_utils.py         # 矢量读写、压缩包解压、导出（编码/字段名/空值都在这处理）
-│  ├─ config.py           # 大模型配置读写
-│  ├─ util.py             # JSON 安全化（NaN/Inf/numpy/时间）
-│  ├─ samples.py          # 示例数据生成器
-│  └─ main.py             # （可选）FastAPI 服务，给网页版用
-├─ web/ + desktop.py + run.py   # 网页版界面（旧方案，仍可用）
-├─ samples/               # 生成后的示例 GeoJSON
-└─ data/                  # 上传缓存 + settings.json + app.log
+├─ native_app.py / run.py / desktop.py   三个入口：桌面版 / 网页版 / 网页版套原生窗口
+├─ native/      纯 Qt 界面层：主窗口（app.py）、地图与渲染管线（mapview.py）、
+│               对话面板（chat.py）、对话框（dialogs.py）、主题（theme.py）
+├─ app/         与界面无关的内核：图层仓库与 25 个算子（engine.py）、两级规划器与执行器
+│               （agent.py）、自定义算子（custom_ops.py）、矢量读写（io_utils.py）
+├─ web/         网页版前端，与桌面版共用 app/ 内核
+├─ tools/       验证与性能工具：verify_render（完备性 + 像素比对）、perf_*（耗时分解）、
+│               test_*（回归）、smoke_app（整机冒烟）
+├─ samples/     内置示例 GeoJSON
+├─ docs/        验证截图（perf/）、QGIS 对照头文件、架构文档（ARCHITECTURE.md）
+└─ data/        运行时产生：上传数据、settings.json、自定义算子源码（已 gitignore）
 ```
+
+**每个文件负责什么、一帧地图怎么画出来、一句话需求怎么变成图层，见
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**（含数据流图、线程模型、缓存分层与「改动时必须守住的不变量」）。
 
 ## 扩展一个新算子
 
@@ -258,7 +251,10 @@ gis-agent/
 ## 已知边界
 
 - 单机单会话，图层存内存，关掉窗口后需重新载入（已导出的文件不受影响）。
-- 单图层绘制上限 6 万要素（超出按等距抽样显示，点击拾取仍走全量空间索引）；24 万要素的图层实测首次绘制约 0.2 s、缩放重绘 0.13 s。
+- **要素不抽样**：视口内的要素会全量进渲染集，没有「超过 N 个就抽稀」的开关 ——
+  抽样是有意去掉的，它会在屏幕上留下成块的空洞。性能靠「1px 笔宽、按批合并路径、
+  亚像素要素降为点」而不是靠少画要素。
+- 大图层（77 万要素）载入约 20 s，其中约 15 s 是 Shapefile 解析；渲染本身见上面的性能表。
 - 底图是经纬网，不含在线瓦片；要接底图可自行往 `MapView.paintEvent` 里插瓦片图层。
 - 规则引擎覆盖常见中文表达，长句、口语化、多目标推理建议接大模型。
 - 网页版（`run.py` + `web/`）仍保留，接口与算子完全共用，只是界面不同。
