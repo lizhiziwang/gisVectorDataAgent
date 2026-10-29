@@ -1,0 +1,22 @@
+# ---- 运行环境 / 依赖 ----
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ---- 数据与本地配置 ----
+# data/ 里是上传的矢量数据（几百 MB）和 settings.json（含大模型 API Key），一律不入库
+data/
+*.log
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ---- 临时文件 ----
+*.tmp
+*.bak
+~$*

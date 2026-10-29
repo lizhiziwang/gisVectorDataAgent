@@ -1,0 +1,5 @@
+步骤卡片 1
+按钮数: 3 OK
+定位图层: 缩远后 217802 → 1452012，OK
+属性表: {'title': '属性表 · 地块_缓冲500.00m', 'cls': 'TableDialog'} OK
+导出菜单: {'n': 1, 'items': ['GeoJSON (.geojson)', 'GeoPackage (.gpkg)', 'Shapefile (.zip)', 'CSV 属性表 (.csv)']} OK

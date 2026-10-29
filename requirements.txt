@@ -1,0 +1,13 @@
+geopandas>=1.0
+pyogrio>=0.10
+shapely>=2.0
+pyproj>=3.6
+pandas>=2.2
+numpy>=1.26
+# 原生桌面界面（Qt，无 Web 引擎）
+PySide6>=6.5
+# 以下仅在「服务模式 / 网页版界面」时需要
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+pywebview>=5.0

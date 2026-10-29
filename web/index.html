@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>GIS 矢量数据 Agent · 自然语言空间分析工作台</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <div class="logo">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 7.5 9 4l6 3.5L21 4v12.5L15 20l-6-3.5L3 20z"/><path d="M9 4v12.5M15 7.5V20"/>
+      </svg>
+    </div>
+    <div class="brand-text">
+      <h1>GIS 矢量数据 Agent</h1>
+      <p>说一句话，完成空间分析</p>
+    </div>
+  </div>
+  <div class="topactions">
+    <span class="pill" id="enginePill" title="当前规划引擎"><i class="dot"></i>规则引擎</span>
+    <button class="btn ghost" id="btnSamples">
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 21h16"/></svg>
+      示例数据
+    </button>
+    <button class="btn ghost" id="btnSettings">
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2V21a2 2 0 1 1-4 0v-.1A1.7 1.7 0 0 0 7 19.4a1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.7 1.7 0 0 0 3 15H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.6 7a1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.7 1.7 0 0 0 9 3V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0 1.2 2.9H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+      模型设置
+    </button>
+    <button class="btn primary" id="btnUpload">
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M12 18V6m0 0 4 4m-4-4-4 4"/><path d="M4 20h16"/></svg>
+      上传矢量数据
+    </button>
+    <input type="file" id="fileInput" multiple accept=".shp,.zip,.geojson,.json,.gpkg,.kml,.gml,.csv" hidden />
+  </div>
+</header>
+
+<main class="workbench">
+  <!-- 左：数据与算子 -->
+  <aside class="panel left">
+    <div class="panel-head">
+      <span>数据图层</span><span class="badge" id="layerCount">0</span>
+    </div>
+    <div class="dropzone" id="dropzone">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 16V4m0 0 4.5 4.5M12 4 7.5 8.5"/><path d="M4 15v3.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V15"/></svg>
+      <div class="dz-title">拖入文件或点击上传</div>
+      <div class="dz-sub">shp(zip) · GeoJSON · GPKG · KML · CSV</div>
+    </div>
+    <div class="layer-list" id="layerList"></div>
+    <div class="panel-head sub">
+      <span>算子库</span><span class="badge ghost" id="toolCount">22</span>
+    </div>
+    <div class="tool-grid" id="toolGrid"></div>
+  </aside>
+
+  <!-- 中：地图 -->
+  <section class="maparea">
+    <canvas id="map"></canvas>
+    <div class="map-tools">
+      <button class="icobtn" id="zoomIn" title="放大">+</button>
+      <button class="icobtn" id="zoomOut" title="缩小">−</button>
+      <button class="icobtn" id="zoomFit" title="全图">⤢</button>
+    </div>
+    <div class="legend" id="legend"></div>
+    <div class="tooltip" id="tooltip"></div>
+    <div class="empty-hint" id="emptyHint">
+      <div class="eh-icon">◈</div>
+      <div class="eh-title">还没有数据</div>
+      <div class="eh-sub">上传矢量文件，或点右上角「示例数据」立即体验</div>
+    </div>
+    <div class="mapinfo" id="mapInfo">—</div>
+  </section>
+
+  <!-- 右：Agent 对话 -->
+  <aside class="panel right">
+    <div class="chat-head">
+      <div class="avatar">A</div>
+      <div class="chat-title">
+        <strong>空间分析助手</strong>
+        <span id="plannerState">规则引擎 · 离线可用</span>
+      </div>
+      <button class="icobtn" id="btnClear" title="清空对话">⟲</button>
+    </div>
+    <div class="messages" id="messages"></div>
+    <div class="composer">
+      <div class="chips" id="chips"></div>
+      <div class="inputrow">
+        <textarea id="input" rows="1" placeholder="例如：对地块做 500 米缓冲区，然后按用地类型统计面积"></textarea>
+        <button class="sendbtn" id="send" title="发送 (Enter)">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12h15m0 0-5.5-5.5M19 12l-5.5 5.5"/></svg>
+        </button>
+      </div>
+      <div class="composer-foot">Enter 发送 · Shift+Enter 换行 · 原始数据只读，每步运算产出新图层</div>
+    </div>
+  </aside>
+</main>
+
+<footer class="statusbar">
+  <span id="stCursor">光标 —</span>
+  <span class="sep"></span>
+  <span id="stScale">比例尺 —</span>
+  <span class="sep"></span>
+  <span id="stFeatures">要素 0</span>
+  <span class="grow"></span>
+  <span id="stMsg">就绪</span>
+</footer>
+
+<!-- 设置弹窗 -->
+<div class="modal-mask" id="settingsModal" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <h3>大模型设置</h3>
+      <button class="icobtn" data-close>✕</button>
+    </div>
+    <div class="modal-body">
+      <p class="tip">规则引擎已能理解常见中文指令，离线即可用。接入任意 <b>OpenAI 兼容</b> 接口后，可用更自由的口语表达。</p>
+      <label class="field">
+        <span>接口地址 Base URL</span>
+        <input id="cfgBase" placeholder="https://api.deepseek.com/v1" />
+      </label>
+      <div class="presets">
+        <button data-preset="deepseek">DeepSeek</button>
+        <button data-preset="dashscope">通义千问</button>
+        <button data-preset="openai">OpenAI</button>
+        <button data-preset="ollama">本地 Ollama</button>
+      </div>
+      <label class="field">
+        <span>模型名称</span>
+        <input id="cfgModel" placeholder="deepseek-chat" />
+      </label>
+      <label class="field">
+        <span>API Key</span>
+        <input id="cfgKey" type="password" placeholder="sk-..." />
+      </label>
+      <label class="switch">
+        <input type="checkbox" id="cfgEnabled" />
+        <span>启用大模型规划（失败自动回退规则引擎）</span>
+      </label>
+      <p class="tip small">Key 仅保存在本机 <code>gis-agent/data/settings.json</code>，不会外传。</p>
+    </div>
+    <div class="modal-foot">
+      <button class="btn ghost" data-close>取消</button>
+      <button class="btn primary" id="saveSettings">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 属性表弹窗 -->
+<div class="modal-mask" id="tableModal" hidden>
+  <div class="modal wide">
+    <div class="modal-head">
+      <h3 id="tableTitle">属性表</h3>
+      <button class="icobtn" data-close>✕</button>
+    </div>
+    <div class="modal-body nopad">
+      <div class="tablewrap" id="tableBody"></div>
+    </div>
+    <div class="modal-foot">
+      <span class="tip small" id="tableMeta"></span>
+      <span class="grow"></span>
+      <button class="btn ghost" data-close>关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- 多图层压缩包：选择要载入哪些图层 -->
+<div class="modal-mask" id="importModal" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <h3>选择要载入的图层</h3>
+      <button class="icobtn" data-close>✕</button>
+    </div>
+    <div class="modal-body">
+      <p class="tip" id="importHint">压缩包里有多个矢量图层，勾选需要的（可多选）。</p>
+      <div class="picklist" id="importList"></div>
+      <p class="tip small">要素量大的图层载入和绘制会慢一些，可先载入主要图层，其余之后再导。</p>
+    </div>
+    <div class="modal-foot">
+      <span class="tip small" id="importMeta"></span>
+      <span class="grow"></span>
+      <button class="btn ghost" id="importCancel">取消</button>
+      <button class="btn primary" id="importOk">载入所选</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="map.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
