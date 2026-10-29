@@ -17,6 +17,10 @@ python -m venv .venv
 .venv\Scripts\python.exe native_app.py   # 原生 Qt 界面（等同双击 启动.bat）
 ```
 
+依赖只需 Python **3.10 ~ 3.13**；`requirements.txt` 里标了实测版本（PySide6 6.12 / GeoPandas 1.2 /
+Shapely 2.2 / pandas 3.1），并分成「核心 / 桌面界面 / 可选：网页版」三段 —— 只用桌面端时
+fastapi、uvicorn、pywebview 可以不装。
+
 启动异常时双击 `调试启动.bat`（带控制台）；数据载入、运算的日志在 `data\app.log`。
 
 首次打开点右上角 **示例数据**，会生成成都某片区的 4 个图层（行政区 / 地块 665 / 道路 / 学校），可直接演示。

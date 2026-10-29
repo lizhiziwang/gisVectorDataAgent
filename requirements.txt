@@ -1,13 +1,41 @@
-geopandas>=1.0
-pyogrio>=0.10
-shapely>=2.0
-pyproj>=3.6
-pandas>=2.2
-numpy>=1.26
-# 原生桌面界面（Qt，无 Web 引擎）
-PySide6>=6.5
-# 以下仅在「服务模式 / 网页版界面」时需要
+# GIS 矢量数据 Agent —— 依赖清单
+#
+# 安装：
+#   python -m venv .venv
+#   .venv\Scripts\python.exe -m pip install -r requirements.txt      # Windows
+#   .venv/bin/python -m pip install -r requirements.txt              # macOS / Linux
+#
+# 实测环境：Windows 11 + Python 3.13.14
+#   GeoPandas 1.2.0 / pyogrio 0.13.0 / Shapely 2.2.0 / pyproj 3.8.0
+#   pandas 3.1.0 / NumPy 2.5.4 / PySide6 6.12.0
+# Python 3.10 ~ 3.13 都有对应 wheel。
+
+# ---------------------------------------------------------------------------
+# 核心：矢量数据读写 + 空间运算
+# ---------------------------------------------------------------------------
+geopandas>=1.0,<2
+pyogrio>=0.10            # GeoPandas 1.x 的默认 IO 引擎，自带 GDAL，无需另装
+shapely>=2.0,<3          # 2.x 的向量化 API（构建/简化/拾取全程依赖）
+pyproj>=3.6              # 坐标系转换（距离、面积统一投到 CGCS2000 3 度带）
+pandas>=2.2,<4
+numpy>=1.26,<3
+
+# ---------------------------------------------------------------------------
+# 桌面界面：纯 Qt 原生控件 + QPainter 自绘地图（无 WebView）
+# ---------------------------------------------------------------------------
+PySide6>=6.5,<7          # 会一并装上 PySide6-Essentials / PySide6-Addons / shiboken6
+
+# ---------------------------------------------------------------------------
+# 可选：网页版 / 服务模式（run.py、desktop.py）
+# 只用桌面端（native_app.py）时这几行可以不装。
+# ---------------------------------------------------------------------------
 fastapi>=0.110
 uvicorn[standard]>=0.29
-python-multipart>=0.0.9
-pywebview>=5.0
+python-multipart>=0.0.9  # FastAPI 收文件上传（UploadFile）必需
+pywebview>=5.0           # desktop.py 把网页版套进原生窗口
+
+# ---------------------------------------------------------------------------
+# 可选补充
+# ---------------------------------------------------------------------------
+# fiona>=1.9             # pyogrio 读不了的老格式兜底（app/io_utils.py 会自动尝试）
+# pyarrow>=15            # 需要读写 Parquet / GeoParquet 时再装
