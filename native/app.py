@@ -8,13 +8,14 @@ import time
 import traceback
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (QColor, QCursor, QIcon, QKeySequence, QPainter, QPen, QPixmap,
                            QShortcut)
 from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QFileDialog, QFrame, QGridLayout,
                                QHBoxLayout, QInputDialog, QLabel, QListWidget, QListWidgetItem,
-                               QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton,
-                               QScrollArea, QSizePolicy, QToolTip, QVBoxLayout, QWidget)
+                               QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar,
+                               QPushButton, QScrollArea, QSizePolicy, QToolTip, QVBoxLayout,
+                               QWidget)
 
 from app import custom_ops
 from app.agent import Planner, run_agent, run_plan
@@ -23,6 +24,9 @@ from app.engine import Store
 from app.io_utils import export_layer as write_layer_file
 from app.io_utils import extract_zip, file_info, load_any
 from app.models import LayerRecord
+from app.memory import MemoryManager
+from app.runtime import (AgentRuntime, PRIORITY_CHAT, PRIORITY_EXPORT, PRIORITY_IMPORT,
+                         PRIORITY_OPGEN, TaskScheduler, recover_interrupted_runs)
 from app.samples import ensure_samples
 from app.storage import AgentStore
 from app.tool_registry import template_map
@@ -31,6 +35,8 @@ from .chat import ChatPanel, Worker
 from .dialogs import ImportDialog, OperatorDialog, SettingsDialog, TableDialog
 from .format import fmt_num
 from .mapview import MapView
+from .memory_panel import MemoryPanel
+from .taskcenter import TaskCenter
 from .theme import QSS
 
 FILE_FILTER = ("矢量数据 (*.zip *.shp *.geojson *.json *.gpkg *.kml *.gml *.csv);;"
@@ -192,6 +198,11 @@ class LayerRow(QWidget):
         vl.addWidget(sub)
 
 
+class _TaskBridge(QObject):
+    """把 TaskScheduler 的 worker 线程事件转成 Qt 主线程 signal。"""
+    event = Signal(str, str, object)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -226,9 +237,11 @@ class MainWindow(QMainWindow):
         self.persist = (persist_env == "1") or (
             persist_env != "0" and os.environ.get("QT_QPA_PLATFORM", "") != "offscreen")
         self.agent_db: AgentStore | None = None
+        self.memory: MemoryManager | None = None
         self.project_id = ""
         self.session_id = ""
         self._synced_layers: dict[str, tuple] = {}
+        self._interrupted_runs: list[str] = []
         if self.persist:
             try:
                 self.agent_db = AgentStore()
@@ -238,6 +251,7 @@ class MainWindow(QMainWindow):
                 if session is None:
                     session = self.agent_db.create_session(project.id, "新会话")
                 self.session_id = session.id
+                self.memory = MemoryManager(self.agent_db, self.project_id, self.session_id)
                 self.history = self.agent_db.latest_messages_text(self.session_id, 20)
                 saved = self.agent_db.session_state(self.session_id)
                 mem = saved.get("planner_memory") if isinstance(saved, dict) else None
@@ -245,10 +259,31 @@ class MainWindow(QMainWindow):
                     self.planner.memory.update(mem)
                     # 重启后图层没有恢复，指向旧图层 id 的指代会失效
                     self.planner.memory["last_layer"] = None
+                # 上次退出时没跑完的任务 → 标记 interrupted（不自动重跑）
+                try:
+                    self._interrupted_runs = recover_interrupted_runs(self.agent_db)
+                except Exception:
+                    self._interrupted_runs = []
             except Exception:
                 self.persist = False
                 self.agent_db = None
+                self.memory = None
                 self.history = []
+
+        # 多任务：聊天/导出/生成算子进优先级队列，单 writer 串行执行
+        self._task_bridge = _TaskBridge(self)
+        self._task_bridge.event.connect(self._on_task_event, Qt.QueuedConnection)
+        self.runtime = AgentRuntime(
+            self.agent_db,
+            on_event=lambda ev, task, payload: self._task_bridge.event.emit(task.id, ev, payload))
+        # tasks 是 runtime 里的调度器（保留旧名字，兼容既有调用点）
+        self.tasks = self.runtime.scheduler
+        if self.agent_db is not None:
+            self.runtime.bind_session(self.project_id, self.session_id)
+        self._task_handlers: dict[str, dict] = {}
+        self._task_retry: dict[str, dict] = {}
+        self._current_task_id: str | None = None
+        self._last_run_id: str = ""
 
         self.setStyleSheet(QSS)
         self._build()
@@ -267,6 +302,13 @@ class MainWindow(QMainWindow):
                                     + "、".join("「" + s["title"] + "」" for s in installed))
         except Exception:
             pass
+        # 上次退出时没跑完的任务 → 提示可重试（不自动重跑）
+        if self._interrupted_runs:
+            n = len(self._interrupted_runs)
+            self.chat.add_agent(
+                f"上次有 {n} 个任务没跑完（已标记为「未完成」）。"
+                "它们不会自动重跑——你可以直接再说一次同样的需求。")
+            self.set_status(f"{n} 个任务上次未完成")
         QTimer.singleShot(120, self._refresh_tools)
 
     def _register_exit(self) -> None:
@@ -289,6 +331,11 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         try:
+            if getattr(self, "tasks", None) is not None:
+                self.tasks.shutdown(wait=False)
+        except Exception:
+            pass
+        try:
             if getattr(self, "agent_db", None) is not None:
                 self.agent_db.close()
         except Exception:
@@ -301,6 +348,10 @@ class MainWindow(QMainWindow):
         QThread 被销毁会导致进程崩溃（"QThread: Destroyed while thread is
         still running"）——所以必须在这里显式停下来并等待退出。
         """
+        # 有任务在跑时先问一句：等它跑完、还是直接取消（设计文档 §5.5）
+        if not self._confirm_close_with_tasks():
+            e.ignore()
+            return
         try:
             self.map.shutdown()
         except Exception:
@@ -316,7 +367,47 @@ class MainWindow(QMainWindow):
                 self._cleanup_worker.wait(5000)
         except Exception:
             pass
+        # 取消所有还在跑/排队的任务，让 worker 线程尽快退出
+        try:
+            for t in self.tasks.active_tasks + self.tasks.pending_tasks():
+                self.tasks.cancel(t.id)
+        except Exception:
+            pass
+        try:
+            self.tasks.shutdown(wait=True)
+        except Exception:
+            pass
         super().closeEvent(e)
+
+    def _confirm_close_with_tasks(self) -> bool:
+        """关窗前确认：还有任务在跑时给用户「等待 / 取消」的选择。
+
+        返回 True 表示可以关闭。
+        """
+        try:
+            n_run = self.tasks.running_count
+            n_pending = self.tasks.pending_count
+        except Exception:
+            return True
+        if not n_run and not n_pending:
+            return True
+        box = QMessageBox(self)
+        box.setWindowTitle("还有任务在跑")
+        box.setIcon(QMessageBox.Question)
+        box.setText(f"还有 {n_run} 个任务正在执行、{n_pending} 个在排队。")
+        box.setInformativeText("可以等它们跑完再关，也可以现在取消并关闭。")
+        wait_btn = box.addButton("等待完成", QMessageBox.AcceptRole)
+        cancel_btn = box.addButton("取消并关闭", QMessageBox.DestructiveRole)
+        box.setDefaultButton(wait_btn)
+        box.exec()
+        if box.clickedButton() is cancel_btn:
+            for t in self.tasks.active_tasks + self.tasks.pending_tasks():
+                try:
+                    self.tasks.cancel(t.id)
+                except Exception:
+                    pass
+            return True
+        return True
 
     # ================================================================== 布局
     def _build(self) -> None:
@@ -382,6 +473,12 @@ class MainWindow(QMainWindow):
         self.btn_settings.setObjectName("ghost")
         self.btn_settings.clicked.connect(self.open_settings)
         hl.addWidget(self.btn_settings)
+
+        self.btn_memory = QPushButton("◈ 记忆")
+        self.btn_memory.setObjectName("ghost")
+        self.btn_memory.setToolTip("查看和编辑 Agent 记住的偏好、项目事实和工作流")
+        self.btn_memory.clicked.connect(self.open_memory_panel)
+        hl.addWidget(self.btn_memory)
 
         self.btn_upload = QPushButton("↑ 上传矢量数据")
         self.btn_upload.setObjectName("primary")
@@ -544,10 +641,16 @@ class MainWindow(QMainWindow):
         panel.setFixedWidth(412)
         vl = QVBoxLayout(panel)
         vl.setContentsMargins(0, 0, 0, 0)
+        # 任务中心：有任务时自动展开，折叠时不占地方
+        self.task_center = TaskCenter(snapshot=self.tasks.snapshot, parent=panel)
+        self.task_center.cancel_requested.connect(self._cancel_task)
+        self.task_center.retry_requested.connect(self._retry_task)
+        self.task_center.log_requested.connect(self._show_task_log)
+        vl.addWidget(self.task_center)
         self.chat = ChatPanel(self)
         self.chat.sent.connect(self.on_send)
         self.chat.clear_btn.clicked.connect(self.clear_all)
-        vl.addWidget(self.chat)
+        vl.addWidget(self.chat, 1)
         return panel
 
     # ---------------------------------------------------------------- 状态栏
@@ -573,6 +676,14 @@ class MainWindow(QMainWindow):
         self.st_cancel.clicked.connect(lambda _checked=False: self.cancel_load())
         self.st_cancel.hide()
         sb.addPermanentWidget(self.st_cancel)
+        # Agent 任务取消：只对当前 writer 任务生效，在 step 边界停止
+        self.st_task_cancel = QPushButton("停止任务")
+        self.st_task_cancel.setObjectName("tiny")
+        self.st_task_cancel.setCursor(Qt.PointingHandCursor)
+        self.st_task_cancel.setToolTip("停止当前 Agent 任务（当前步骤跑完后停止）")
+        self.st_task_cancel.clicked.connect(lambda _checked=False: self._cancel_active_task())
+        self.st_task_cancel.hide()
+        sb.addPermanentWidget(self.st_task_cancel)
         sb.addPermanentWidget(self.st_prog)
         sb.addPermanentWidget(self.st_msg)
 
@@ -1024,9 +1135,7 @@ class MainWindow(QMainWindow):
             self.load_paths(paths)
 
     def load_paths(self, paths: list[str]) -> None:
-        if self._busy:
-            QMessageBox.information(self, "正在执行", "当前还有任务在跑，请稍候。")
-            return
+        # 导入不再被「有任务在跑」直接拒绝：排到当前任务后面即可
         # 排队串行载入：一次只解析一个文件。
         # 并发解析看似更快，但 gpd.read_file 在后台线程里长时间持有 GIL，
         # 3 个线程一起跑会把主线程饿死，界面一卡就是好几秒；
@@ -1124,9 +1233,10 @@ class MainWindow(QMainWindow):
         # 占着 GIL，两边一起跑会互相饿死（实测 4 个大图层：11s 的活抢成 50s）。
         self.map.set_loading(True)
 
-        def job():
+        def job(token):
             out, errors = [], []
             for f in files:
+                token.raise_if_cancelled()
                 try:
                     gdf = load_any(f)
                     lay = self.store.add(gdf, f.stem, source=source, op="load")
@@ -1135,10 +1245,12 @@ class MainWindow(QMainWindow):
                     errors.append(f"{f.name}：{e}")
             return out, errors
 
-        self._worker = Worker(job)
-        self._worker.done.connect(self._on_loaded)
-        self._worker.failed.connect(self._on_load_failed)
-        self._worker.start()
+        # 导入也走调度器：排在 Agent 任务之后，不再直接拒绝
+        task = self.runtime.submit_run(job, kind="import",
+                                       label=f"导入 {files[0].name if files else source}",
+                                       priority=PRIORITY_IMPORT)
+        self._task_handlers[task.id] = {"kind": "import", "user": source}
+        self._update_task_ui()
 
     def _on_load_failed(self, msg: str) -> None:
         self.map.set_loading(False)
@@ -1184,22 +1296,26 @@ class MainWindow(QMainWindow):
     def load_samples(self) -> None:
         self._set_busy(True, "正在生成示例数据…")
 
-        def job():
+        def job(token):
             import geopandas as gpd
             out = []
             for f in ensure_samples():
+                token.raise_if_cancelled()
                 gdf = gpd.read_file(f)
                 if gdf.crs is None:
                     gdf = gdf.set_crs(4326)
                 out.append(self.store.add(gdf, f.stem, source=f.name, op="sample"))
             return out, []
 
-        self._worker = Worker(job)
-        self._worker.done.connect(self._on_loaded)
-        self._worker.failed.connect(lambda msg: (self._set_busy(False), self._error("载入失败", msg)))
-        self._worker.start()
+        task = self.runtime.submit_run(job, kind="import", label="生成示例数据",
+                                       priority=PRIORITY_IMPORT)
+        self._task_handlers[task.id] = {"kind": "import", "user": "示例数据"}
+        self._update_task_ui()
 
     def clear_all(self) -> None:
+        if self.tasks.running_count or self.tasks.pending_count:
+            QMessageBox.information(self, "正在执行", "还有 Agent 任务在跑，先等它结束或停止任务。")
+            return
         # 保留旧会话（DB 里可追溯），当前窗口开一个新会话
         if self.persist and self.agent_db is not None:
             for lid in list(self._synced_layers):
@@ -1211,6 +1327,10 @@ class MainWindow(QMainWindow):
             try:
                 session = self.agent_db.create_session(self.project_id, "新会话")
                 self.session_id = session.id
+                if self.memory is not None:
+                    self.memory.session_id = self.session_id
+                # 新会话要重新绑定 runtime，否则 run 会挂到旧 session 上
+                self.runtime.bind_session(self.project_id, self.session_id)
             except Exception:
                 pass
         self.store.clear()
@@ -1385,20 +1505,22 @@ class MainWindow(QMainWindow):
                 "或者点右上角「示例数据」先试一遍。")
             self.chat.add_agent(reply)
             self._remember(text, reply)
+            if self.memory is not None:
+                try:
+                    self.memory.observe_turn(text, {"steps": []}, session_id=self.session_id)
+                except Exception:
+                    pass
             return
         self.chat.add_user(text)
-        self.chat.add_typing()
         sel_note = self._apply_selection_as_layer()
-        self._set_busy(True, "Agent 正在执行…", cursor=False)
-        self._exec_t0 = time.time()
-        self._exec_timer.start()
         cfg = load_cfg()
         current = self.current_layer
         if sel_note:
             # 让规划器/大模型知道现在有一层「只含选中的要素」
             text = f"（当前图层只包含我选中的 {sel_note} 个要素，下面的操作都作用于它）{text}"
+        mem_text = self.memory.context(text) if self.memory is not None else ""
 
-        def job():
+        def job(token):
             self.planner.store = self.store
             # 「写一个算子：……」→ 走生成流程，不进规划器
             if self.planner.wants_new_operator(text):
@@ -1408,19 +1530,189 @@ class MainWindow(QMainWindow):
                         "steps": [], "lines": [], "source": "gen", "note": ""}
             # 统一走 Agent 闭环：闲聊/规划/执行/修复/澄清都在 run_agent 里
             res = run_agent(self.store, self.planner, text, current, cfg,
-                            self.history, use_llm=is_ready(cfg))
+                            self.history, use_llm=is_ready(cfg),
+                            cancel_token=token, memory_context=mem_text)
             res["user"] = text
             res["source"] = res.get("planner") or "rule"
             return res
 
-        self._worker = Worker(job)
-        self._worker.done.connect(self._on_plan_done)
-        self._worker.failed.connect(self._on_plan_failed)
-        self._worker.start()
+        task = self.runtime.submit_run(job, kind="agent", label=text[:48],
+                                       priority=PRIORITY_CHAT)
+        self._task_handlers[task.id] = {"kind": "agent", "user": text}
+        self._task_retry[task.id] = {"kind": "agent", "user": text}
+        self._update_task_ui()
+
+    def _on_task_event(self, task_id: str, event: str, payload) -> None:
+        """主线程处理 TaskScheduler 事件。"""
+        info = self._task_handlers.get(task_id) or {}
+        label = info.get("user") or ""
+        task = self.tasks.get(task_id)
+        if task is not None and task.run_id:
+            self._last_run_id = task.run_id
+        if event == "queued":
+            self.set_status(f"任务排队中 · {label[:30]}")
+        elif event == "started":
+            self._exec_t0 = time.time()
+            self._exec_timer.start()
+            if info.get("kind") in ("agent", "opgen"):
+                self.chat.add_typing()
+                self.chat.set_typing_text("正在规划并执行…")
+            self.set_status(f"正在执行 · {label[:30]}")
+            self._update_task_ui()
+        elif event == "cancel_requested":
+            self.set_status("正在取消…（当前步骤跑完后停止）")
+        elif event == "done":
+            self._task_handlers.pop(task_id, None)
+            kind = info.get("kind")
+            if kind in ("agent", "opgen"):
+                res = payload if isinstance(payload, dict) else {}
+                self._on_plan_done(res)
+            elif kind == "export":
+                try:
+                    self._on_exported(Path(str(payload)))
+                except Exception:
+                    pass
+            elif kind == "import":
+                try:
+                    self._on_loaded(payload)
+                except Exception:
+                    pass
+            self._update_task_ui()
+        elif event == "failed":
+            self._task_handlers.pop(task_id, None)
+            kind = info.get("kind")
+            if kind in ("agent", "opgen"):
+                self._on_plan_failed(str(payload or "任务失败"))
+            elif kind == "import":
+                self._on_load_failed(str(payload or "载入失败"))
+            else:
+                self._set_busy(False)
+                self._error("任务失败", str(payload or ""))
+            self._update_task_ui()
+        elif event == "cancelled":
+            self._task_handlers.pop(task_id, None)
+            self.chat.remove_typing()
+            kind = info.get("kind")
+            if kind in ("agent", "opgen"):
+                self.chat.add_agent("已取消当前任务。已生成的图层会保留。")
+            self.set_status("已取消")
+            self._update_task_ui()
+
+    def _update_task_ui(self) -> None:
+        active = self.tasks.active_task
+        pending = self.tasks.pending_count
+        if active or pending:
+            self.st_task_cancel.show()
+            self.st_task_cancel.setEnabled(bool(active))
+            extra = f"（排队 {pending}）" if pending else ""
+            if active is not None:
+                self.st_msg.setText(f"执行中{extra} · {active.label[:28]}")
+            else:
+                self.st_msg.setText(f"排队中{extra}")
+        else:
+            self.st_task_cancel.hide()
+        # 「有没有后台任务在跑」统一由调度器状态决定：
+        # 队列里还有任务时不能把 busy 清掉，否则老代码（载入/清空/工具栏）
+        # 会在任务还没跑完时就解除防护。
+        busy = bool(active or pending)
+        if busy != self._busy:
+            self._set_busy(busy)
+        # 任务中心同步刷新
+        try:
+            if getattr(self, "task_center", None) is not None:
+                self.task_center.refresh()
+        except Exception:
+            pass
+
+    def _cancel_task(self, task_id: str) -> None:
+        """任务中心的「取消」。"""
+        task = self.tasks.get(task_id)
+        if task is None:
+            return
+        if task.status == "running":
+            self.set_status("正在取消：当前步骤跑完后停止")
+        self.runtime.cancel(task_id)
+        self._update_task_ui()
+
+    def _retry_task(self, task_id: str) -> None:
+        """任务中心的「重试」：用同样的输入重新排一次。
+
+        任务结束后 ``_task_handlers`` 会被清掉，所以重试所需的输入
+        单独记在 ``_task_retry`` 里，直到用户主动重试或关窗。
+        """
+        info = self._task_retry.get(task_id) or self._task_handlers.get(task_id) or {}
+        kind = info.get("kind")
+        user = info.get("user") or ""
+        self._task_handlers.pop(task_id, None)
+        self._task_retry.pop(task_id, None)
+        if kind == "agent" and user:
+            self.on_send(user)
+        elif kind == "opgen":
+            self._run_operator_gen(user or "生成算子")
+        else:
+            self.set_status("这个任务不能直接重试，请重新操作一次")
+
+    def _show_task_log(self, task_id: str) -> None:
+        """任务中心的「日志」：展示这次 run 的完整事件流。"""
+        if self.agent_db is None:
+            self.set_status("这次运行没有可回放的日志")
+            return
+        run_id = ""
+        task = self.tasks.get(task_id)
+        if task is not None:
+            run_id = task.run_id or ""
+        if not run_id:
+            # 任务已经不在内存里了（重启后），退而求其次找最近一次运行
+            runs = self.agent_db.list_recent_runs(self.session_id, limit=50)
+            run_id = runs[0].id if runs else ""
+        if not run_id:
+            self.set_status("这次运行没有可回放的日志")
+            return
+        try:
+            events = self.agent_db.list_events(run_id)
+            steps = self.agent_db.list_steps(run_id)
+        except Exception:
+            events, steps = [], []
+        if not events and not steps:
+            self.set_status("这次运行没有可回放的日志")
+            return
+        lines: list[str] = []
+        if steps:
+            lines.append("— 步骤 —")
+            for s in steps:
+                lines.append(f"{s.ordinal + 1}. {s.tool} [{s.status}] {s.message}")
+        if events:
+            lines.append("— 事件 —")
+            for e in events:
+                payload = e.payload or {}
+                extra = payload.get("error") or payload.get("tool") or ""
+                lines.append(f"{e.seq}. {e.type}" + (f"  {extra}" if extra else ""))
+        dlg = QDialog(self)
+        dlg.setWindowTitle("运行日志")
+        dlg.resize(640, 460)
+        vl = QVBoxLayout(dlg)
+        edit = QPlainTextEdit()
+        edit.setReadOnly(True)
+        edit.setPlainText("\n".join(lines))
+        vl.addWidget(edit)
+        btn = QPushButton("关闭")
+        btn.clicked.connect(dlg.accept)
+        vl.addWidget(btn, 0, Qt.AlignRight)
+        dlg.exec()
+
+    def _cancel_active_task(self) -> None:
+        task = self.tasks.active_task
+        if task is None:
+            return
+        self.tasks.cancel(task.id)
+        self.st_task_cancel.setEnabled(False)
+        self.st_task_cancel.setText("正在停止…")
+        self.set_status("正在取消：当前步骤跑完后停止")
+        QTimer.singleShot(3000, lambda: self.st_task_cancel.setText("停止任务"))
 
     def _tick_exec(self) -> None:
         """每秒刷一次「正在执行… Ns」，让长算子看起来是在干活而不是卡死。"""
-        if not self._busy:
+        if not self.tasks.running_count:
             self._exec_timer.stop()
             return
         sec = int(time.time() - self._exec_t0)
@@ -1430,10 +1722,26 @@ class MainWindow(QMainWindow):
     def _on_plan_done(self, res: dict) -> None:
         self._exec_timer.stop()
         self.chat.remove_typing()
-        self._set_busy(False)
+        # 注意：这里不直接 _set_busy(False)——队列里可能还有别的任务，
+        # busy 状态统一由 _update_task_ui() 按调度器状态维护。
         user = res.get("user") or ""
         steps = res.get("steps") or []
         lines = res.get("lines") or []
+
+        # 把这次运行的步骤落库（可回放）
+        self._record_run_steps(res, steps)
+
+        # 先抽取记忆（偏好/图层事实/工作流），再展示结果
+        if self.memory is not None and res.get("op_gen") is None:
+            try:
+                self.memory.observe_turn(user, res, session_id=self.session_id)
+            except Exception:
+                pass
+            # 消息够了就压缩一次会话摘要
+            try:
+                self.memory.maybe_summarize(self.session_id)
+            except Exception:
+                pass
 
         # 生成算子：先给用户看代码，确认后才入库
         if res.get("op_gen") is not None:
@@ -1480,6 +1788,30 @@ class MainWindow(QMainWindow):
         else:
             self.set_status(f"完成 {len(steps)} 步")
         self._refresh_planner_pill(res.get("source"))
+
+    def _record_run_steps(self, res: dict, steps: list[dict]) -> None:
+        """把这次运行的步骤写进 DB（steps 表 + step.finished 事件）。
+
+        找不到对应 run 时静默跳过——持久化是加分项，不该因为它让主流程失败。
+        """
+        if self.agent_db is None or not steps:
+            return
+        run_id = res.get("run_id") or self._last_run_id
+        if not run_id:
+            return
+        try:
+            for s in steps:
+                layer = s.get("layer") or {}
+                self.runtime.record_step(run_id, {
+                    "tool": s.get("tool") or "",
+                    "args": s.get("args") or {},
+                    "message": s.get("message") or "",
+                    "warnings": s.get("warnings") or [],
+                    "data": s.get("data") or {},
+                    "layer_id": layer.get("id") if isinstance(layer, dict) else None,
+                }, status=str(s.get("status") or "ok"))
+        except Exception:
+            pass
 
     def _on_plan_failed(self, msg: str) -> None:
         self._exec_timer.stop()
@@ -1528,18 +1860,21 @@ class MainWindow(QMainWindow):
         if not path:
             return
         dest = Path(path if path.lower().endswith(ext) else path + ext)
-        self._set_busy(True, "正在导出…")
 
-        def job():
-            return write_layer_file(lay.gdf, lay.name, fmt, dest)
+        def job(token):
+            # 只读任务：拿一份 gdf 快照，和 Agent 任务并发跑也不会互相污染
+            gdf = lay.gdf
+            token.raise_if_cancelled()
+            return write_layer_file(gdf, lay.name, fmt, dest)
 
-        self._worker = Worker(job)
-        self._worker.done.connect(lambda p: self._on_exported(Path(p)))
-        self._worker.failed.connect(lambda msg: (self._set_busy(False), self._error("导出失败", msg)))
-        self._worker.start()
+        # 导出走调度器：分析中也能排队，不会覆盖 _worker 导致线程崩溃
+        task = self.runtime.submit_run(job, kind="export",
+                                       label=f"导出 {lay.name}",
+                                       priority=PRIORITY_EXPORT)
+        self._task_handlers[task.id] = {"kind": "export", "user": lay.name}
+        self._update_task_ui()
 
     def _on_exported(self, path: Path) -> None:
-        self._set_busy(False)
         self.set_status(f"已导出 {path.name}")
         QMessageBox.information(self, "导出完成", f"已保存到：\n{path}")
 
@@ -1562,6 +1897,17 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "已保存", f"暂未生效：{explain(cfg)}。")
         else:
             self.set_status("设置已保存")
+
+    def open_memory_panel(self) -> None:
+        """打开记忆管理面板。"""
+        if self.memory is None:
+            QMessageBox.information(
+                self, "记忆管理",
+                "当前没有启用持久化，记忆功能不可用。\n"
+                "（正常启动桌面端时是开启的；测试环境默认关闭。）")
+            return
+        dlg = MemoryPanel(self.memory, self)
+        dlg.exec()
 
     def _remember(self, user: str, reply: str) -> None:
         """记下这一轮对话：内存 history 给模型，SQLite 给下次启动。"""
@@ -1624,21 +1970,17 @@ class MainWindow(QMainWindow):
 
     def _run_operator_gen(self, brief: str) -> None:
         """后台调用大模型生成算子，完成后弹预览。"""
-        self.chat.add_typing()
-        self._set_busy(True, "正在生成算子…", cursor=False)
-        self._exec_t0 = time.time()
-        self._exec_timer.start()
-
-        def job():
+        def job(token):
             self.planner.store = self.store
             return {"op_gen": self.planner.gen_operator(brief, self.current_layer, load_cfg()),
                     "brief": brief, "user": "", "steps": [], "lines": [],
                     "source": "gen", "note": ""}
 
-        self._worker = Worker(job)
-        self._worker.done.connect(self._on_plan_done)
-        self._worker.failed.connect(self._on_plan_failed)
-        self._worker.start()
+        task = self.runtime.submit_run(job, kind="opgen", label="生成算子",
+                                       priority=PRIORITY_OPGEN)
+        self._task_handlers[task.id] = {"kind": "opgen", "user": "生成算子"}
+        self._task_retry[task.id] = {"kind": "opgen", "user": brief}
+        self._update_task_ui()
 
     def _handle_operator_gen(self, res: dict, brief: str) -> None:
         """展示生成的算子：代码可改，确认后落盘并注册。"""

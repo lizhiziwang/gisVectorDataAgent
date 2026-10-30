@@ -55,7 +55,7 @@ with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
     print("[3] 运行/步骤/事件/session state")
     r = s.create_run(se.id, kind="chat", message_id=m1.id)
     s.update_run(r.id, status="running", started_at=1.0)
-    st = s.append_step(r.id, Step(id="", run_id=r.id, ordinal=0, tool="buffer",
+    st = s.append_step(r.id, Step(id="", run_id=r.id, ordinal=None, tool="buffer",
                                   args={"distance": 500}, status="ok",
                                   message="ok", data={"features_out": 2}))
     s.append_event(r.id, "plan.created", {"steps": 1}, session_id=se.id)

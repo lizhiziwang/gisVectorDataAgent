@@ -253,20 +253,62 @@ QPainter 在 GL 上要把路径三角化（stencil-and-cover），而 CPU 光栅
 gis-agent/
 ├─ native_app.py / run.py / desktop.py   三个入口：桌面版 / 网页版 / 网页版套原生窗口
 ├─ native/      纯 Qt 界面层：主窗口（app.py）、地图与渲染管线（mapview.py）、
-│               对话面板（chat.py）、对话框（dialogs.py）、主题（theme.py）
+│               对话面板（chat.py）、对话框（dialogs.py）、任务中心（taskcenter.py）、
+│               记忆管理面板（memory_panel.py）、主题（theme.py）
 ├─ app/         与界面无关的内核：图层仓库与 25 个算子（engine.py）、两级规划器与执行器
 │               （agent.py）、算子契约与参数校验（tool_registry.py）、自定义算子（custom_ops.py）、
-│               矢量读写（io_utils.py）
+│               矢量读写（io_utils.py）、会话与记忆持久化（storage.py / models.py）、
+│               任务调度与事件流（runtime.py）、记忆提取与检索（memory.py）
 ├─ web/         网页版前端（本分支暂缓维护，桌面端优先）
 ├─ tools/       验证与性能工具：verify_render（完备性 + 像素比对）、perf_*（耗时分解）、
-│               test_*（回归）、smoke_app（整机冒烟）
+│               test_*（回归）、run_regression.py（跑全部回归）、smoke_app（整机冒烟）
 ├─ samples/     内置示例 GeoJSON
-├─ docs/        验证截图（perf/）、QGIS 对照头文件、架构文档（ARCHITECTURE.md）
-└─ data/        运行时产生：上传数据、settings.json、自定义算子源码（已 gitignore）
+├─ docs/        验证截图（perf/）、QGIS 对照头文件、架构文档（ARCHITECTURE.md）、
+│               运行时设计（AGENT-RUNTIME-DESIGN.md）
+└─ data/        运行时产生：上传数据、settings.json、自定义算子源码、agent.db（已 gitignore）
 ```
 
 **每个文件负责什么、一帧地图怎么画出来、一句话需求怎么变成图层，见
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**（含数据流图、线程模型、缓存分层与「改动时必须守住的不变量」）。
+
+## Agent 运行时：多任务 · 会话 · 记忆
+
+桌面端不再是一个 Worker + 一个 `_busy` + 内存 history，而是**可排队、可取消、可恢复、
+会话可持久化、记忆分层**的运行时。设计细节见
+[docs/AGENT-RUNTIME-DESIGN.md](docs/AGENT-RUNTIME-DESIGN.md)。
+
+**多任务**
+
+- 聊天 / 导出 / 导入 / 生成算子都进同一个优先级队列（聊天 100 > 生成算子 90 >
+  导出 70 > 导入 60），单写通道串行执行——GIS 算子会新建图层，并行写要上 MVCC，第一版不做。
+- 右栏顶部有**任务中心**：执行中 / 排队中 / 已完成 / 失败一目了然，
+  可以**取消**排队或执行中的任务、**重试**失败的任务、**看日志**回放这次运行。
+- 分析运行中导出不再被拒绝，而是排到队列后面；不再覆盖 `_worker`，没有 QThread 崩溃风险。
+- 取消是**协作式**的：长 GEOS 调用杀不掉，语义是「当前步骤跑完后停止」，界面显示「正在取消…」。
+- 关窗时若有任务在跑会先问一句：等它跑完，还是取消并关闭。
+
+**会话持久化**
+
+- 消息、运行、步骤、事件、图层元信息、记忆全部落在 `data/agent.db`（SQLite WAL + 外键）。
+- 每次运行的完整事件流可回放（「日志」按钮），失败能看出失败在哪一步。
+- 上次退出时没跑完的任务，重启后标记为 `interrupted` 并提示——**不会自动重跑**
+  （免得刚开应用就偷偷跑 50 万要素的 overlay）。
+- 图层元信息（字段、CRS、要素数、范围）入库，删图层是逻辑删除，历史可追溯。
+
+**记忆**
+
+- **四类**：偏好（默认单位 / CRS / 导出格式）、项目事实（图层字段与 CRS）、
+  工作流（成功的多步计划）、纠正（「不是道路，是管线」「按类型」→ 真实字段 `用地类型`）。
+- 自动提取规则可解释，全部本地存储，不上传、不存原始属性表、不存密钥。
+- 检索用 FTS5 trigram（中文友好）+ 结构化 key，冲突按「偏好 > 纠正 > 项目事实 > 工作流」消解，
+  注入 prompt 时截断到预算内。
+- 顶栏「◈ 记忆」打开管理面板：分组查看、编辑、置顶、删除、清空，以及 JSON 导入导出。
+- 会话消息攒够会压成一句摘要（原文保留，随时可翻）。
+
+```bash
+# 跑全部回归测试（21 个，约 2 分钟）
+.venv\Scripts\python.exe tools\run_regression.py
+```
 
 ## 扩展一个新算子
 

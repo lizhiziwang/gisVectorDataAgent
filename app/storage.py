@@ -443,7 +443,9 @@ class AgentStore:
         with self._write() as c:
             row = c.execute("SELECT COALESCE(MAX(ordinal),-1)+1 FROM steps WHERE run_id=?",
                             (run_id,)).fetchone()
-            ordinal = int(row[0]) if not s.ordinal else s.ordinal
+            # ordinal 为 None 表示「自动接在最后一条后面」；
+            # 显式给 0 是合法的（第一条步骤），不能当成自动。
+            ordinal = int(row[0]) if s.ordinal is None else int(s.ordinal)
             sid = s.id or new_id("step_")
             c.execute(
                 "INSERT INTO steps(id,run_id,ordinal,tool,args_json,status,message,warnings_json,"
@@ -472,12 +474,13 @@ class AgentStore:
 
     def append_event(self, run_id: str | None, type_: str, payload: dict | None = None,
                      session_id: str | None = None) -> Event:
-        c = self.conn()
-        row = c.execute("SELECT COALESCE(MAX(seq),0)+1 FROM events WHERE run_id IS ?",
-                        (run_id,)).fetchone()
-        seq = int(row[0])
+        # seq 必须在写锁里算：并发 append 时否则会拿到同一个 seq，
+        # 事件回放（按 seq 排序）就会乱序。
         t = now()
         with self._write() as cw:
+            row = cw.execute("SELECT COALESCE(MAX(seq),0)+1 FROM events WHERE run_id IS ?",
+                             (run_id,)).fetchone()
+            seq = int(row[0])
             cur = cw.execute("INSERT INTO events(run_id,session_id,seq,type,payload_json,created_at) "
                              "VALUES(?,?,?,?,?,?)",
                              (run_id, session_id, seq, type_,
@@ -494,6 +497,44 @@ class AgentStore:
                       seq=r["seq"], type=r["type"],
                       payload=self._loads(r["payload_json"], {}),
                       created_at=r["created_at"]) for r in rows]
+
+    def list_session_events(self, session_id: str, limit: int = 200) -> list[Event]:
+        rows = self.conn().execute(
+            "SELECT * FROM events WHERE session_id=? ORDER BY id DESC LIMIT ?",
+            (session_id, limit)).fetchall()
+        return [Event(id=r["id"], run_id=r["run_id"] or "", session_id=r["session_id"],
+                      seq=r["seq"], type=r["type"],
+                      payload=self._loads(r["payload_json"], {}),
+                      created_at=r["created_at"]) for r in reversed(rows)]
+
+    def list_unfinished_runs(self, limit: int = 100) -> list[Run]:
+        """未完成的 run（queued/running/waiting）——重启后用于标记 interrupted。"""
+        rows = self.conn().execute(
+            "SELECT * FROM runs WHERE status IN ('queued','running','waiting') "
+            "ORDER BY created_at LIMIT ?", (limit,)).fetchall()
+        return [self._run(r) for r in rows]
+
+    def list_recent_runs(self, session_id: str = "", limit: int = 50) -> list[Run]:
+        if session_id:
+            rows = self.conn().execute(
+                "SELECT * FROM runs WHERE session_id=? ORDER BY created_at DESC LIMIT ?",
+                (session_id, limit)).fetchall()
+        else:
+            rows = self.conn().execute(
+                "SELECT * FROM runs ORDER BY created_at DESC LIMIT ?",
+                (limit,)).fetchall()
+        return [self._run(r) for r in rows]
+
+    def set_session_summary(self, session_id: str, summary: str,
+                            summary_tokens: int = 0) -> None:
+        with self._write() as c:
+            c.execute("UPDATE sessions SET summary=?, summary_tokens=?, updated_at=? "
+                      "WHERE id=?", (summary, int(summary_tokens), now(), session_id))
+
+    def count_messages(self, session_id: str) -> int:
+        row = self.conn().execute("SELECT COUNT(*) FROM messages WHERE session_id=?",
+                                  (session_id,)).fetchone()
+        return int(row[0]) if row else 0
 
     # ------------------------------------------------------------------ 图层元信息
     def upsert_layer(self, rec: LayerRecord) -> None:
@@ -571,24 +612,31 @@ class AgentStore:
         q = (query or "").strip()
         if not q:
             return self.list_memories(project_id, limit=limit)
+        import re as _re
+        tokens = [t for t in _re.split(r"\s+", q) if t][:8]
         found: dict[str, Memory] = {}
         if self.fts_enabled:
             try:
+                fts_q = " OR ".join('"' + t.replace('"', '""') + '"' for t in tokens)
                 rows = self.conn().execute(
                     "SELECT m.* FROM memories_fts f JOIN memories m ON m.rowid=f.rowid "
                     "WHERE memories_fts MATCH ? AND m.project_id=? LIMIT ?",
-                    (f'"{q}"', project_id, limit)).fetchall()
+                    (fts_q, project_id, limit)).fetchall()
                 for r in rows:
                     m = self._memory(r)
                     found[m.id] = m
             except sqlite3.OperationalError:
                 pass
         if len(found) < limit:
-            like = f"%{q}%"
+            where = " OR ".join("(key LIKE ? OR value_text LIKE ?)" for _ in tokens)
+            params: list[Any] = [project_id]
+            for t in tokens:
+                params.extend([f"%{t}%", f"%{t}%"])
+            params.append(limit)
             rows = self.conn().execute(
-                "SELECT * FROM memories WHERE project_id=? AND (key LIKE ? OR value_text LIKE ?) "
+                f"SELECT * FROM memories WHERE project_id=? AND ({where}) "
                 "ORDER BY pinned DESC, importance DESC LIMIT ?",
-                (project_id, like, like, limit)).fetchall()
+                params).fetchall()
             for r in rows:
                 m = self._memory(r)
                 found.setdefault(m.id, m)

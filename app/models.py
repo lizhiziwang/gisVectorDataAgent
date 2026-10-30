@@ -89,7 +89,7 @@ class Run:
 class Step:
     id: str
     run_id: str
-    ordinal: int
+    ordinal: int | None      # None = 自动接在最后一条后面
     tool: str
     args: dict
     status: str

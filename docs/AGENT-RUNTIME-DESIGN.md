@@ -506,33 +506,35 @@ score = 0.50 * fts_score
 
 ## 7. 从当前代码迁移的步骤
 
-### Phase 1：持久化底座（不改 UI 行为）
+### Phase 1：持久化底座（不改 UI 行为）—— ✅ 已完成
 
-1. 新增 `app/storage.py`：连接、迁移、Repository；
-2. 新增 `app/models.py`：Session/Message/Part/Run/Step/Memory dataclass；
-3. 默认 project + 默认 session；启动时把 `MainWindow.history` 读/写 DB；
-4. `Store.add` 通过回调写 `layers` 表（或 MainWindow 统一登记）；
-5. `Planner.memory` 落 `session_state` / `working_memory` JSON，启动恢复；
-6. 测试：迁移幂等、消息 roundtrip、崩溃恢复、级联删除。
+1. ✅ 新增 `app/storage.py`：连接、迁移、Repository；
+2. ✅ 新增 `app/models.py`：Session/Message/Part/Run/Step/Memory dataclass；
+3. ✅ 默认 project + 默认 session；启动时把 `MainWindow.history` 读/写 DB；
+4. ✅ `Store.add` 通过回调写 `layers` 表（`MainWindow._sync_layer_registry` 统一登记）；
+5. ✅ `Planner.memory` 落 `session_state` / `working_memory` JSON，启动恢复；
+6. ✅ 测试：`tools/test_storage.py`（迁移幂等、消息 roundtrip、崩溃恢复、级联删除）。
 
-### Phase 2：任务调度 + 事件
+### Phase 2：任务调度 + 事件 —— ✅ 已完成
 
-1. 新增 `app/runtime.py`：`AgentRuntime` / `TaskScheduler` / `EventBus`；
-2. 把 `MainWindow.on_send` 从「直接 new Worker」改为 `runtime.submit_run(...)`；
-3. 删除 `self._busy` 的单任务语义，改成「任务中心状态」；
-4. `export/load/custom_op` 都走 scheduler；
-5. 任务中心 UI；取消/重试；
-6. 测试：排队、并发、取消、失败重试、关窗提示、无 QThread 泄漏。
+1. ✅ 新增 `app/runtime.py`：`AgentRuntime` / `TaskScheduler` / `CancelToken`；
+2. ✅ `MainWindow.on_send` 改为 `runtime.submit_run(...)`；
+3. ✅ `self._busy` 改为由调度器状态统一维护（不再是单任务语义）；
+4. ✅ `export/load/custom_op` 都走 scheduler；
+5. ✅ 任务中心 UI（`native/taskcenter.py`）：排队列表、取消、重试、看日志；
+6. ✅ 测试：`tools/test_task_scheduler.py`、`tools/test_multitask.py`、
+   `tools/test_runtime_phase2.py`（排队、并发、取消、事件回放、关窗提示）。
 
-### Phase 3：记忆
+### Phase 3：记忆 —— ✅ 已完成
 
-1. 规则提取 + `project_fact/preference/correction/workflow`；
-2. FTS5 + `MemoryManager.retrieve()` 注入 prompt；
-3. 会话摘要；
-4. 记忆管理 UI；
-5. 测试：偏好持久化、冲突覆盖、token 截断、删除/清空。
+1. ✅ 规则提取 + `project_fact/preference/correction/workflow`；
+2. ✅ FTS5 trigram + `MemoryManager.context()` 打分注入 prompt；
+3. ✅ 会话摘要（`sessions.summary`，原文保留）；
+4. ✅ 记忆管理 UI（`native/memory_panel.py`）：分组展示、编辑、置顶、删除、清空、JSON 导入导出；
+5. ✅ 测试：`tools/test_memory.py`、`tools/test_memory_phase3.py`、
+   `tools/test_memory_ui.py`、`tools/test_acceptance.py`。
 
-### Phase 4：进阶（可选）
+### Phase 4：进阶（可选）—— ⏳ 未开始
 
 - 子 Agent：`ProfileAgent`（只读体检）、`VerifierAgent`（结果校验）；
 - 任务 DAG：导入 → 多图层并行 profile → 规划；
@@ -620,19 +622,53 @@ class AgentStore:
 class CancelToken:
     def cancel(self) -> None: ...
     def is_set(self) -> bool: ...
+    def raise_if_cancelled(self) -> None: ...      # 取消检查点
 
 class TaskScheduler:
-    def submit(self, run: Run, fn: Callable[[CancelToken], dict]) -> None: ...
-    def cancel(self, run_id: str) -> None: ...
+    def submit(self, fn: Callable[[CancelToken], Any], kind: str = "task",
+               label: str = "", priority: int = 50) -> Task: ...
+    def cancel(self, task_id: str) -> bool: ...
+    def snapshot(self) -> list[dict]: ...          # 任务中心渲染用
+
+class AgentRuntime:
+    def bind_session(self, project_id: str, session_id: str) -> None: ...
+    def submit_run(self, fn: Callable[[CancelToken], Any], kind: str = "chat",
+                   label: str = "", priority: int = PRIORITY_CHAT) -> Task: ...
+    def record_step(self, run_id: str, step: dict, status: str = "ok") -> None: ...
+    def cancel(self, task_id: str) -> bool: ...
+
+def recover_interrupted_runs(store: AgentStore) -> list[str]: ...   # 重启后标记中断
 
 # app/memory.py
 class MemoryManager:
-    def retrieve(self, project_id: str, query: str, budget: int = 1200) -> str: ...
-    def observe_run(self, run: Run, result: dict, messages: list[Message]) -> None: ...
-    def forget(self, memory_id: str) -> None: ...
+    def context(self, query: str, budget_chars: int = 1600) -> str: ...
+    def observe_turn(self, user_text: str, result: dict,
+                     session_id: str | None = None) -> list[Memory]: ...
+    def maybe_summarize(self, session_id: str | None = None) -> str: ...
+    def forget(self, memory_id: str) -> bool: ...
+    def clear(self, type_: str = "") -> int: ...
+    def grouped(self) -> dict[str, list[Memory]]: ...
 ```
 
 第一版不需要改 `run_agent` 的算法，只把它包进 `TaskScheduler` 的 writer lane，并把 `run_plan` 的 step 回调写成 `events`。
+
+### 10.1 与原文的差异说明
+
+实现时对第 10 节的接口做了几处调整，都是为了适配现有代码：
+
+| 原文 | 实际实现 | 原因 |
+|---|---|---|
+| `TaskScheduler.submit(run, fn)` | `submit(fn, kind, label, priority)` → 返回 `Task` | 调度器不该知道 DB 的 `Run`；运行记录由 `AgentRuntime` 负责落库 |
+| `MemoryManager.retrieve()` | `context()` | 直接返回可注入 prompt 的 `<MEMORY>` 块，检索和拼装合成一步 |
+| `MemoryManager.observe_run()` | `observe_turn(user_text, result, ...)` | 现有的执行结果结构是 `{"steps": [...], "lines": [...]}`，按这个形状抽取更直接 |
+| `AgentStore` 只列了核心方法 | 另加 `list_recent_runs` / `list_unfinished_runs` / `set_session_summary` / `count_messages` | 任务中心和摘要要用 |
+
+另外实现时补了两个原文没提、但实际必须有的东西：
+
+- **`TaskScheduler.add_hook()`**：运行状态持久化走独立钩子，不挂在对外的事件回调上。
+  否则上层一旦替换回调（比如接 UI），运行状态就悄悄不落库了。
+- **`AgentStore.append_event` 的 seq 在写锁内计算**：并发写事件时，
+  先读 max(seq) 再插入会有竞态，回放顺序会乱。
 
 ---
 
@@ -643,4 +679,6 @@ class MemoryManager:
 - 社区对 opencode 架构的对照分析（client/server、SQLite WAL、SSE、session/subagent、permissions）：  
   <https://github.com/shenxingy/Clade/blob/v0.2.0/docs/research/2026-06-18-sst-opencode.md>
 - 本项目现有实现：  
-  [native/app.py](../native/app.py)、[app/agent.py](../app/agent.py)、[app/engine.py](../app/engine.py)、[app/tool_registry.py](../app/tool_registry.py)
+  [native/app.py](../native/app.py)、[app/agent.py](../app/agent.py)、[app/engine.py](../app/engine.py)、[app/tool_registry.py](../app/tool_registry.py)、
+  [app/runtime.py](../app/runtime.py)、[app/storage.py](../app/storage.py)、[app/memory.py](../app/memory.py)、
+  [native/taskcenter.py](../native/taskcenter.py)、[native/memory_panel.py](../native/memory_panel.py)

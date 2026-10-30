@@ -60,6 +60,39 @@ QLabel#badge {
     background: #ece8db; color: #6f6c64; border-radius: 8px;
     padding: 0px 6px; font-size: 10px;
 }
+
+/* ---- 任务中心 ---- */
+QFrame#taskCenter {
+    background: #fbfaf6;
+    border: none;
+    border-bottom: 1px solid #e7e3d8;
+}
+QFrame#taskHead { background: #fbfaf6; border: none; }
+QFrame#taskHead:hover { background: #f5f2e9; }
+QLabel#taskHeadTitle { font-size: 11px; font-weight: 500; color: #6f6c64; }
+QLabel#taskBadge {
+    background: #f6ece6; color: #b0522f; border-radius: 8px;
+    padding: 0px 6px; font-size: 10px;
+}
+QScrollArea#taskScroll { background: #fbfaf6; border: none; }
+QWidget#taskBody { background: #fbfaf6; }
+QFrame#taskRow {
+    background: #fbfaf6;
+    border: none;
+    border-top: 1px solid #efece2;
+}
+QFrame#taskRow:hover { background: #f5f2e9; }
+QLabel#taskDot { font-size: 12px; }
+QLabel#taskTitle { font-size: 12px; color: #43413c; }
+QLabel#taskSub { font-size: 10px; color: #9a968c; }
+
+/* ---- 记忆管理面板 ---- */
+QTreeWidget#memoryTree {
+    background: #ffffff; border: 1px solid #e7e3d8; border-radius: 7px;
+    font-size: 12px;
+}
+QTreeWidget#memoryTree::item { padding: 3px 2px; }
+QTreeWidget#memoryTree::item:selected { background: #f6ece6; color: #1f1e1d; }
 QLabel#pill {
     background: transparent; color: #6f6c64; border: 1px solid #e0dbcd;
     border-radius: 11px; padding: 2px 10px; font-size: 11px;
