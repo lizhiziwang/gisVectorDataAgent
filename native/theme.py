@@ -199,22 +199,15 @@ QTextEdit#chatInput:focus { border: none; }
 
 /* @ 图层补全弹窗 —— 和应用主体同一套配色（暖白 + 橙强调） */
 QFrame#mentionPopup { background: transparent; }
-QFrame#mentionBox {
-    background: #ffffff;
-    border: 1px solid #e0dbcd;
-    border-radius: 10px;
-}
+/* 表面由 MentionPopup.paintEvent 自绘（圆角 + 描边 + 投影），
+   这儿保持透明，别盖住自绘的那层 */
+QFrame#mentionBox { background: transparent; border: none; }
 QWidget#mentionHead { background: transparent; }
 QLabel#mentionTitle {
     font-size: 11px; font-weight: 600; color: #6f6c64; letter-spacing: .3px;
 }
 QLabel#mentionCount { font-size: 10px; color: #9a968c; }
-QWidget#mentionFoot {
-    background: #fbfaf6;
-    border-top: 1px solid #efece1;
-    border-bottom-left-radius: 9px;
-    border-bottom-right-radius: 9px;
-}
+QWidget#mentionFoot { background: transparent; }
 QLabel#mentionHint { font-size: 10px; color: #9a968c; }
 QListWidget#mentionList {
     border: none; background: transparent; outline: none;

@@ -143,6 +143,7 @@ check("每项有固定行高", popup.list.item(0).sizeHint().height(), 34)
 print("[9c] 自绘：几何色点 + 选中行高亮")
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QImage
+from PySide6.QtWidgets import QWidget
 popup.set_candidates(LAYERS, "")
 popup.resize(292, 44 + 34 * 5 + 30)
 popup.show()
@@ -173,6 +174,38 @@ for y in range(20, 60):
             found_accent = True
 check("选中行有浅底", found_sel, True)
 check("选中行有橙色强调条", found_accent, True)
+
+print("[9d] 弹窗背景不能是透明的（独立顶层窗口拿不到主窗口的 QSS）")
+from PySide6.QtCore import QPoint
+check("弹窗自己带了样式表", popup.styleSheet() != "", True)
+check("样式表里有 mentionBox 规则", "mentionBox" in popup.styleSheet(), True)
+anchor = QWidget()
+anchor.resize(400, 44)
+popup2 = MentionPopup()
+popup2.set_candidates(LAYERS, "")
+popup2.show_at(anchor)
+app.processEvents()
+img3 = QImage(popup2.size(), QImage.Format_ARGB32)
+img3.fill(QColor("#ffffff"))
+popup2.render(img3)
+
+
+def _at(x, y):
+    return QColor(img3.pixel(x, y)).name()
+
+
+check("内容区是白底（不是透明）", _at(150, 6), "#ffffff")
+check("底栏是浅色带", _at(150, popup2.height() - 8), "#fbfaf6")
+check("有细边框", _at(0, 40), "#e0dbcd")
+
+print("[9e] 圆角：四个角被遮罩裁掉")
+region = popup2.mask()
+check("有遮罩", not region.isEmpty(), True)
+check("左上角在框外", region.contains(QPoint(0, 0)), False)
+check("左下角在框外", region.contains(QPoint(0, popup2.height() - 1)), False)
+check("右上角在框外", region.contains(QPoint(popup2.width() - 1, 0)), False)
+check("右下角在框外", region.contains(QPoint(popup2.width() - 1, popup2.height() - 1)), False)
+check("中心在框内", region.contains(QPoint(popup2.width() // 2, popup2.height() // 2)), True)
 
 print("[10] 弹窗键盘操作")
 popup.set_candidates(LAYERS, "")

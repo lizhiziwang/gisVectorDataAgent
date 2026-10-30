@@ -14,10 +14,13 @@
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter, QPen
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import (QColor, QFont, QGuiApplication, QPainter, QPainterPath, QPen,
+                           QPixmap)
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
                                QStyle, QStyledItemDelegate, QVBoxLayout, QWidget)
+
+from .theme import QSS
 
 #: 配色（跟 theme.py 保持一致）
 _C_BG = QColor("#ffffff")
@@ -70,11 +73,18 @@ class MentionPopup(QFrame):
         self.setWindowFlags(Qt.Popup | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setObjectName("mentionPopup")
+        # 关键：这是**独立的顶层窗口**，不会继承主窗口的样式表
+        # （主窗口只把 QSS 设给了自己）。不在这儿设一遍的话
+        # 弹窗里所有 QSS 规则都不生效。
+        self.setStyleSheet(QSS)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         self.box = QFrame()
         self.box.setObjectName("mentionBox")
+        # 表面由 paintEvent 自己画（圆角 + 描边 + 投影），
+        # QSS 的 border-radius 裁不住子控件，画出来是方的。
+        self.box.setAttribute(Qt.WA_TranslucentBackground, True)
         inner = QVBoxLayout(self.box)
         inner.setContentsMargins(0, 0, 0, 0)
         inner.setSpacing(0)
@@ -93,6 +103,7 @@ class MentionPopup(QFrame):
         self.count_label.setObjectName("mentionCount")
         hl.addWidget(self.count_label)
         inner.addWidget(head)
+        self.head = head
 
         # 列表
         self.list = QListWidget()
@@ -110,6 +121,8 @@ class MentionPopup(QFrame):
         inner.addWidget(self.list)
 
         # 底部：快捷键提示
+        # 底栏的浅色底由 paintEvent 画（跟着圆角裁），
+        # 这儿只放文字 —— 用 QSS 的方角背景会在圆角处露出去。
         foot = QWidget()
         foot.setObjectName("mentionFoot")
         fl = QHBoxLayout(foot)
@@ -128,6 +141,9 @@ class MentionPopup(QFrame):
         self._meta: dict[str, tuple[str, str]] = {}
         self._items: list[str] = []     # 图层名列表
         self._current = 0
+        #: 底栏高度（paintEvent 要靠它画浅色带）
+        self._foot_h = 0
+        self.foot = foot
 
     # ------------------------------------------------------------------ 数据
     def set_candidates(self, layers, query: str = "") -> None:
@@ -218,6 +234,71 @@ class MentionPopup(QFrame):
             self.dismissed.emit()
 
     # ------------------------------------------------------------------ 绘制
+    def _apply_mask(self) -> None:
+        """给整个窗口套一个圆角遮罩。
+
+        光靠 paintEvent 画圆角矩形是不够的 —— 窗口本身还是方的，
+        半透明背景下四个角会露出直角。QSS 的 border-radius 也裁不住
+        子控件。真正管用的是 setMask()。
+        """
+        self.clearMask()
+        pm = QPixmap(self.size())
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#ffffff"))
+        p.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 10.0, 10.0)
+        p.end()
+        self.setMask(pm.mask())
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._apply_mask()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self._apply_mask()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        """自己画弹窗表面：圆角 + 细描边 + 淡投影 + 底栏浅色带。
+
+        遮罩负责裁形状，这里负责配色和层次。
+        底栏的浅色也得在这儿画 —— 用 QSS 给子控件上背景，
+        方角会在圆角边缘露出去。
+        """
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        radius = 10.0
+        # 投影（往下偏一点点）
+        shadow = QRectF(r).translated(0, 2)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(31, 30, 29, 26))
+        painter.drawRoundedRect(shadow, radius, radius)
+        # 底色
+        painter.setBrush(QColor("#ffffff"))
+        painter.drawRoundedRect(r, radius, radius)
+        # 底栏浅色带（跟着圆角裁，所以画在同一个路径里）
+        if self._foot_h > 0:
+            foot_rect = QRectF(0, r.bottom() - self._foot_h + 1, r.width(), self._foot_h)
+            painter.save()
+            path = QPainterPath()
+            path.addRoundedRect(r, radius, radius)
+            painter.setClipPath(path)
+            painter.setBrush(QColor("#fbfaf6"))
+            painter.drawRect(foot_rect)
+            # 底栏上方的细线
+            painter.setPen(QPen(QColor("#efece1"), 1))
+            painter.drawLine(QPointF(r.left(), foot_rect.top()),
+                             QPointF(r.right(), foot_rect.top()))
+            painter.restore()
+        # 描边
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(_C_BORDER, 1))
+        painter.drawRoundedRect(r, radius, radius)
+        painter.end()
+
     def _paint_row(self, painter: QPainter, rect: QRect, name: str,
                    selected: bool) -> None:
         """画一行：左侧几何色点 + 图层名 + 右侧元信息。"""
@@ -243,7 +324,11 @@ class MentionPopup(QFrame):
 
         # 图层名
         f = painter.font()
-        f.setPointSizeF(f.pointSizeF() + 0.5)
+        # pointSizeF() 可能是 -1（表示「用应用默认字号」），
+        # 这时候 +0.5 会变成负数，Qt 会警告并拒绝设置。
+        ps = f.pointSizeF()
+        if ps > 0:
+            f.setPointSizeF(ps + 0.5)
         if selected:
             f.setBold(True)
         painter.setFont(f)
@@ -266,9 +351,13 @@ class MentionPopup(QFrame):
     def show_at(self, anchor: QWidget, cursor_rect: QPoint | None = None) -> None:
         """在输入框上方定位显示。"""
         # 高度跟着候选数走 —— 2 个候选不该占 220px
-        h = 44 + _ROW_H * max(1, self.list.count()) + 30
-        self.setFixedHeight(h)
         self.list.setFixedHeight(_ROW_H * max(1, self.list.count()))
+        # 先让布局算一次，拿到底栏的真实高度（paintEvent 要用）
+        self.foot.adjustSize()
+        self._foot_h = self.foot.sizeHint().height()
+        head_h = self.head.sizeHint().height()
+        h = head_h + _ROW_H * max(1, self.list.count()) + self._foot_h
+        self.setFixedHeight(h)
         screen = QGuiApplication.screenAt(anchor.rect().center()) or QGuiApplication.primaryScreen()
         pos = anchor.mapToGlobal(QPoint(0, 0))
         if cursor_rect is not None:
