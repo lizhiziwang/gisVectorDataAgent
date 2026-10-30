@@ -3,10 +3,19 @@ from __future__ import annotations
 
 import json
 import sys
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+
+# 兜底：任何漏网的真实网络请求都让它炸掉。
+# data/settings.json 里可能存着真 key —— 测试绝不能拿它发请求（会花钱）。
+def _no_network(*a, **kw):
+    raise AssertionError("测试中不允许真实网络请求（会打到付费 LLM 接口）")
+
+
+urllib.request.urlopen = _no_network
 
 import geopandas as gpd
 from shapely.geometry import LineString, Polygon
@@ -43,12 +52,26 @@ class FakePlanner(Planner):
         super().__init__(st)
         self.responses = list(responses)
         self.calls = []
+        #: 最后一次请求的系统提示（用来断言澄清上下文确实进去了）
+        self.last_system = ""
+        #: 最后一次请求的用户消息
+        self.last_user = ""
+        #: 系统提示里是否出现了澄清上下文
+        self.saw_clarify = False
 
     def _call_llm(self, cfg, msgs, json_mode, max_tokens=1600):
         self.calls.append(msgs[-1].get("content", "")[:80])
+        for m in msgs:
+            if m.get("role") == "system":
+                self.last_system = m.get("content", "")
+                break
+        self.last_user = msgs[-1].get("content", "")
+        self.saw_clarify = "用户的回答" in self.last_system
         if not self.responses:
             return {"__error__": "no more fake responses", "__status__": 500}
         obj = self.responses.pop(0)
+        if isinstance(obj, dict) and "__error__" in obj:
+            return obj
         return json.dumps(obj, ensure_ascii=False), "stop"
 
 
@@ -104,6 +127,54 @@ before = len(st.layers)
 r = run_agent(st, pl, "做点奇怪的事", "地块", CFG, [], use_llm=True)
 check("没有新建图层", len(st.layers), before)
 check("回复说明不能执行", "不能直接执行" in r["reply"] or "不支持" in r["reply"], True)
+
+print("[6] 澄清答案要带回规划器（否则模型不知道在回答什么）")
+st = store()
+pl = FakePlanner(st, [
+    {"plan": [{"tool": "buffer", "args": {"layer": "道路", "distance": 100, "unit": "m"}}],
+     "reply": "按你的选择处理道路"},
+])
+r = run_agent(st, pl, "对道路做缓冲", "地块", CFG, [], use_llm=True,
+              clarify_context={"question": "要处理哪个图层？", "options": ["地块", "道路"],
+                               "origin": "对道路做缓冲", "answer": "道路"})
+# 执行器会把图层名解析成 id，所以按解析后的图层名断言
+lay_id = r["steps"][0]["args"].get("layer")
+lay = st.get(lay_id)
+check("按答案执行", lay.name if lay else None, "道路")
+# 系统提示里必须带上「刚才问了什么 + 用户答了什么」
+check("澄清上下文进入提示", pl.saw_clarify, True)
+check("提示里带原始需求", "对道路做缓冲" in pl.last_system, True)
+check("提示里带用户回答", "道路" in pl.last_system, True)
+
+print("[7] 大模型说「做不到」时不要偷偷退回规则引擎")
+st = store()
+pl = FakePlanner(st, [
+    {"plan": [], "reply": "现有算子做不了多边形内插值；可以先用 buffer 造缓冲区。"},
+])
+r = run_agent(st, pl, "帮我做多边形内插值", "地块", CFG, [], use_llm=True)
+check("保留模型的解释", "多边形内插值" in r["reply"], True)
+check("planner 是 llm", r["planner"], "llm")
+check("没有产生步骤", len(r["steps"]), 0)
+
+print("[8] 大模型出错 → 规则引擎兜底，但要如实告知")
+st = store()
+pl = FakePlanner(st, [
+    {"__error__": "接口超时", "__status__": 504},
+])
+r = run_agent(st, pl, "对地块做 100 米缓冲区", "地块", CFG, [], use_llm=True)
+check("规则引擎兜住了", len(r["steps"]) >= 1, True)
+check("标记了 llm_error", bool(r.get("llm_error")), True)
+
+print("[9] 现有算子做不了 → 模型请求写新算子")
+st = store()
+pl = FakePlanner(st, [
+    {"plan": [], "new_operator": {"brief": "计算每个地块内的道路总长度"},
+     "reply": "现有算子做不了这件事，我可以新写一个算子。"},
+])
+r = run_agent(st, pl, "算每个地块里的道路有多长", "地块", CFG, [], use_llm=True)
+check("返回了新算子请求", r.get("new_operator"), "计算每个地块内的道路总长度")
+check("没有产生步骤", len(r["steps"]), 0)
+check("保留了解释", "新写一个算子" in r["reply"], True)
 
 print("\n结论:", "PASS" if not fails else f"FAIL {fails}")
 sys.exit(0 if not fails else 1)

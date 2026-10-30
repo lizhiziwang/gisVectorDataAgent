@@ -65,6 +65,21 @@ check("显示模型回复", texts[-1], "这是模型给的自然语言回答。"
 check("记入历史", win.history[-2:], [{"role": "user", "content": "随便聊聊"},
                                     {"role": "assistant", "content": "这是模型给的自然语言回答。"}])
 
+# note 是「模型给的正常回复」时，不能被当成错误提示加前缀（否则同一句话说两遍）
+win._on_plan_done({"steps": [], "note": "这是模型给的自然语言回答。",
+                   "user": "随便聊聊", "source": "llm"})
+texts = [w.text() for w in win.chat.msgs.findChildren(QLabel) if w.objectName() == "agentText"]
+check("llm 的回复不加错误前缀", texts[-1], "这是模型给的自然语言回答。")
+
+# 大模型真的出错了（llm_error），要如实告知用户这次走的是规则引擎
+win._on_plan_done({"steps": [], "reply": "对地块做 100 米缓冲区",
+                   "note": "大模型接口调用失败，已回退规则引擎。",
+                   "llm_error": "大模型接口调用失败，已回退规则引擎。",
+                   "user": "对地块做缓冲", "source": "rule"})
+texts = [w.text() for w in win.chat.msgs.findChildren(QLabel) if w.objectName() == "agentText"]
+check("出错时告知用户", "已回退规则引擎" in texts[-1], True)
+check("出错时错误只出现一次", texts[-1].count("已回退规则引擎"), 1)
+
 win._on_plan_done({"steps": [], "note": "", "user": "abc"})
 texts = [w.text() for w in win.chat.msgs.findChildren(QLabel) if w.objectName() == "agentText"]
 check("没回复时仍给提示", "拆不出可执行" in texts[-1], True)

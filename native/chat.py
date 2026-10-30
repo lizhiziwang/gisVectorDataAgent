@@ -1,6 +1,8 @@
 """对话面板：消息气泡 + 步骤卡片 + 输入区（纯 Qt 控件）。"""
 from __future__ import annotations
 
+from typing import Callable
+
 from PySide6.QtCore import QSize, QThread, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea,
@@ -502,6 +504,36 @@ class ChatPanel(QWidget):
 
         for i, st in enumerate(steps or []):
             vl.addWidget(StepCard(i, st, self._win))
+        self._append(wrap)
+
+    def add_clarify(self, question: str, options: list[str],
+                   on_pick: Callable[[str], None]) -> None:
+        """渲染澄清问题 + 可点选项。
+
+        点一个选项就等于用户回答了这个问题——直接把选中的文本回填给 Agent，
+        让它带着答案重新规划（而不是让用户再打一遍）。
+        """
+        wrap = QWidget()
+        vl = QVBoxLayout(wrap)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(6)
+
+        vl.addWidget(self._make_bubble(question, "agent"), 0, Qt.AlignLeft)
+
+        if options:
+            row = QWidget()
+            hl = QHBoxLayout(row)
+            hl.setContentsMargins(2, 0, 0, 0)
+            hl.setSpacing(5)
+            for opt in options[:6]:
+                b = QPushButton(str(opt))
+                b.setObjectName("chip")
+                b.setCursor(Qt.PointingHandCursor)
+                b.setToolTip(f"选择「{opt}」")
+                b.clicked.connect(lambda _=False, t=str(opt): on_pick(t))
+                hl.addWidget(b)
+            hl.addStretch(1)
+            vl.addWidget(row)
         self._append(wrap)
 
     def add_typing(self) -> None:

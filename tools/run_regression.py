@@ -25,10 +25,13 @@ GUI_TESTS = {
     "test_custom_op.py", "test_noop_layer.py", "test_no_block.py",
     "test_scroll.py", "test_step_buttons.py", "test_ux_batch.py",
     "test_ux_more.py", "test_visible.py", "test_agent_v2.py",
+    "test_task_center.py", "test_clarify_flow.py",
 }
 
-#: 需要外部服务（LLM 接口）的测试，跳过
-SKIP = {"test_agent_llm.py"}
+#: 需要外部服务（真实 LLM 接口）的测试，跳过。
+#: 注意 test_agent_llm.py 用的是假 LLM（离线），**不在**这里 ——
+#: 它测的是「模型返回什么 → Agent 怎么反应」，不联网也能测。
+SKIP: set[str] = set()
 
 #: 顺序：先跑纯逻辑的，再跑要起窗口的
 ORDER = [
@@ -41,6 +44,8 @@ ORDER = [
     "test_memory_ui.py",
     "test_session_persist.py",
     "test_acceptance.py",
+    "test_agent_llm.py",
+    "test_clarify_flow.py",
 ]
 
 

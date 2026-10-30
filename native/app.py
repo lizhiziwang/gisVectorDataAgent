@@ -284,6 +284,10 @@ class MainWindow(QMainWindow):
         self._task_retry: dict[str, dict] = {}
         self._current_task_id: str | None = None
         self._last_run_id: str = ""
+        #: 待澄清的上下文：{"question": ..., "options": [...], "origin": 原始需求}
+        self._pending_clarify: dict | None = None
+        #: 用户对上一轮澄清的回答（带结构化上下文，供规划器使用）
+        self._clarify_answer: dict | None = None
 
         self.setStyleSheet(QSS)
         self._build()
@@ -1495,9 +1499,15 @@ class MainWindow(QMainWindow):
         self.chat.input.setPlainText(tpl.replace("{L}", lname).replace("{O}", other))
         self.chat.input.setFocus()
 
-    def on_send(self, text: str) -> None:
+    def on_send(self, text: str, display: str | None = None) -> None:
+        """处理一条用户输入。
+
+        ``display`` 是给界面看的文本（默认跟 text 一样）。
+        澄清场景下：发给模型的是「原始需求 + 问题的完整描述」，
+        但界面上只需要显示用户点的那个选项，读起来才自然。
+        """
         if not self.store.layers:
-            self.chat.add_user(text)
+            self.chat.add_user(display if display is not None else text)
             # 没数据时也可能是「你好」——先让闲聊逻辑接手，别一上来就催数据
             small = self.planner.chit_chat(text, has_data=False)
             reply = small or (
@@ -1511,13 +1521,17 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
             return
-        self.chat.add_user(text)
+        self.chat.add_user(display if display is not None else text)
         sel_note = self._apply_selection_as_layer()
         cfg = load_cfg()
         current = self.current_layer
         if sel_note:
             # 让规划器/大模型知道现在有一层「只含选中的要素」
             text = f"（当前图层只包含我选中的 {sel_note} 个要素，下面的操作都作用于它）{text}"
+        # 澄清轮次：把上一轮的问题和这次的回答一起带给规划器，
+        # 否则模型看到「道路」两个字，不知道用户到底想干什么。
+        clarify_ctx = self._clarify_answer
+        self._clarify_answer = None
         mem_text = self.memory.context(text) if self.memory is not None else ""
 
         def job(token):
@@ -1531,9 +1545,15 @@ class MainWindow(QMainWindow):
             # 统一走 Agent 闭环：闲聊/规划/执行/修复/澄清都在 run_agent 里
             res = run_agent(self.store, self.planner, text, current, cfg,
                             self.history, use_llm=is_ready(cfg),
-                            cancel_token=token, memory_context=mem_text)
+                            cancel_token=token, memory_context=mem_text,
+                            clarify_context=clarify_ctx)
             res["user"] = text
             res["source"] = res.get("planner") or "rule"
+            # 模型请求写新算子 → 真的去写，然后把代码交给用户确认
+            brief = res.get("new_operator")
+            if brief:
+                res["op_gen"] = self.planner.gen_operator(brief, current, cfg)
+                res["brief"] = brief
             return res
 
         task = self.runtime.submit_run(job, kind="agent", label=text[:48],
@@ -1719,6 +1739,43 @@ class MainWindow(QMainWindow):
         self.chat.set_typing_text(f"正在规划并执行… {sec}s")
         self.set_status(f"Agent 正在执行… {sec}s")
 
+    def _show_clarify(self, clarify: dict, origin: str, res: dict) -> None:
+        """渲染澄清问题，让用户点选项回答，然后带着答案重新规划。
+
+        这一步是「大模型负责理解自然语言」的关键闭环：
+        模型发现图层/字段有歧义时不该硬猜，而是把选择权交回用户；
+        用户点完，模型拿到「原始需求 + 用户的回答」重新出计划。
+        """
+        question = str(clarify.get("question") or "需要确认一下：")
+        options = [str(o) for o in (clarify.get("options") or []) if str(o).strip()]
+        self._pending_clarify = {"question": question, "options": options,
+                                 "origin": origin}
+        self.chat.add_clarify(question, options, self._on_clarify_picked)
+        self._remember(origin, question)
+        self.set_status("需要你确认一下")
+        self._refresh_planner_pill(res.get("source"))
+
+    def _on_clarify_picked(self, option: str) -> None:
+        """用户点了某个澄清选项：把答案送回 Agent 重新规划。"""
+        pending = self._pending_clarify or {}
+        self._pending_clarify = None
+        origin = pending.get("origin") or ""
+        question = pending.get("question") or ""
+        # 答案本身要完整——只发「道路」模型不知道是在回答哪一个问题，
+        # 所以把「原始需求 + 刚才问的 + 用户的回答」拼成一条完整指令，
+        # 并把结构化的澄清上下文一起交给规划器。
+        if origin:
+            text = f"{origin}\n（对刚才的问题「{question}」，我的回答是：{option}）"
+        else:
+            text = option
+        self._clarify_answer = {
+            "question": question, "options": pending.get("options") or [],
+            "origin": origin, "answer": option,
+        }
+        # 界面只显示用户点的那个选项；发给模型的是拼好的完整上下文。
+        # （on_send 内部会 add_user，这里别重复 add。）
+        self.on_send(text, display=option)
+
     def _on_plan_done(self, res: dict) -> None:
         self._exec_timer.stop()
         self.chat.remove_typing()
@@ -1745,6 +1802,11 @@ class MainWindow(QMainWindow):
 
         # 生成算子：先给用户看代码，确认后才入库
         if res.get("op_gen") is not None:
+            # 模型先解释了「为什么要新写算子」，把这段话也显示出来，
+            # 否则用户只看到一个代码弹窗，不知道这是回应他的哪个诉求。
+            why = (res.get("reply") or "").strip()
+            if why:
+                self.chat.add_agent(why)
             self._handle_operator_gen(res.get("op_gen") or {}, res.get("brief") or user)
             return
 
@@ -1756,6 +1818,12 @@ class MainWindow(QMainWindow):
             self._refresh_planner_pill(res.get("source"))
             return
 
+        # 澄清：把问题 + 可点选项渲染出来，用户点一下就带答案重新规划
+        clarify = res.get("clarify")
+        if clarify:
+            self._show_clarify(clarify, user, res)
+            return
+
         if not steps:
             reply = (res.get("reply") or res.get("note") or "").strip()
             # 大模型/解析器给了自然语言说明就用它，别再甩模板
@@ -1763,6 +1831,16 @@ class MainWindow(QMainWindow):
                               "· 对「图层名」做 500 米缓冲区\n"
                               "· 用「边界」裁剪「地块」\n"
                               "· 按「类型」融合后统计各类面积")
+            # 大模型**出过错**（超时/额度/返回不合法）但规则引擎兜住了：
+            # 要如实告诉用户「这次走的是规则引擎」，否则用户会以为
+            # 自然语言理解成功，下一次换个说法就又不灵了。
+            # 注意：只能用 llm_error 判定 —— note 既可能是错误，
+            # 也可能是模型给的正常回复，不能一概当成错误提示。
+            # reply 里通常已经带着错误原文（run_agent 把 note 拼进去了），
+            # 所以只在没包含时才补，避免同一句话说两遍。
+            err = (res.get("llm_error") or "").strip()
+            if err and res.get("source") != "llm" and err not in reply:
+                reply = f"（{err}）\n{reply}"
             self.chat.add_agent(reply)
             self._remember(user, reply)
             self._refresh_planner_pill(res.get("source"))

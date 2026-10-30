@@ -49,7 +49,9 @@ for _ in range(200):
         break
     time.sleep(0.03)
 snap = win.tasks.snapshot()
-check("两条任务都成功", [t["status"] for t in snap[:2]], ["succeeded", "succeeded"])
+# 不看顺序：snapshot 是按创建时间倒序的，两条任务谁先谁后不影响结论。
+statuses = sorted(t["status"] for t in snap[:2])
+check("两条任务都成功", statuses, ["succeeded", "succeeded"])
 check("生成两个新图层", len(win.store.layers) - before, 2)
 check("任务处理表已清理", len(win._task_handlers), 0)
 check("取消按钮隐藏", win.st_task_cancel.isHidden(), True)
@@ -60,7 +62,7 @@ win.on_send("对地块做 400 米缓冲区")
 # 第一条正在跑或已结束；取消尚未开始的最后一条
 time.sleep(0.05)
 app.processEvents()
-queued = [t for t in win.tasks._all.values() if t.status == "queued"]
+queued = win.tasks.pending_tasks()
 if queued:
     ok = win.tasks.cancel(queued[-1].id)
     check("取消排队任务", ok, True)
