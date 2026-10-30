@@ -197,21 +197,29 @@ QTextEdit#chatInput {
 }
 QTextEdit#chatInput:focus { border: none; }
 
-/* @ 图层补全弹窗 */
+/* @ 图层补全弹窗 —— 和应用主体同一套配色（暖白 + 橙强调） */
 QFrame#mentionPopup { background: transparent; }
 QFrame#mentionBox {
-    background: #ffffff; border: 1px solid #ddd8ca; border-radius: 10px;
+    background: #ffffff;
+    border: 1px solid #e0dbcd;
+    border-radius: 10px;
 }
+QWidget#mentionHead { background: transparent; }
+QLabel#mentionTitle {
+    font-size: 11px; font-weight: 600; color: #6f6c64; letter-spacing: .3px;
+}
+QLabel#mentionCount { font-size: 10px; color: #9a968c; }
+QWidget#mentionFoot {
+    background: #fbfaf6;
+    border-top: 1px solid #efece1;
+    border-bottom-left-radius: 9px;
+    border-bottom-right-radius: 9px;
+}
+QLabel#mentionHint { font-size: 10px; color: #9a968c; }
 QListWidget#mentionList {
-    border: none; background: transparent; outline: none; font-size: 12px;
+    border: none; background: transparent; outline: none;
 }
-QListWidget#mentionList::item {
-    padding: 4px 6px; border-radius: 6px; color: #43413c;
-}
-QListWidget#mentionList::item:selected {
-    background: #f0ece1; color: #1f1e1d;
-}
-QListWidget#mentionList::item:hover { background: #f5f2e9; }
+QListWidget#mentionList::item { border: none; }
 
 QFrame#userBubble {
     background: #f0ece1; border: 1px solid #e5e0d2; border-radius: 10px;

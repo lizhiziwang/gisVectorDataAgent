@@ -130,6 +130,50 @@ check("前缀优先", popup.current_name(), "小区_合并")
 popup.set_candidates(LAYERS, "zzzz")
 check("没有匹配就是 0", popup.count(), 0)
 
+print("[9b] 弹窗样式：标题、计数、提示")
+popup.set_candidates(LAYERS, "")
+check("标题", popup.title.text(), "选择图层")
+check("显示总数", "5" in popup.count_label.text(), True)
+popup.set_candidates(LAYERS, "小区")
+check("过滤时标题变了", popup.title.text(), "匹配图层")
+check("过滤时显示查询词", "小区" in popup.count_label.text(), True)
+check("有快捷键提示", "Enter" in popup.foot_hint.text(), True)
+check("每项有固定行高", popup.list.item(0).sizeHint().height(), 34)
+
+print("[9c] 自绘：几何色点 + 选中行高亮")
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor, QImage
+popup.set_candidates(LAYERS, "")
+popup.resize(292, 44 + 34 * 5 + 30)
+popup.show()
+app.processEvents()
+img = QImage(popup.size(), QImage.Format_ARGB32)
+img.fill(QColor("#ffffff"))
+popup.render(img)
+dots = set()
+for y in range(20, img.height() - 30):
+    for x in range(0, 60):
+        c = QColor(img.pixel(x, y)).name()
+        if c in ("#5b8def", "#6fa87a", "#d9a441"):
+            dots.add(c)
+check("画出了几何类型色点", len(dots) >= 1, True)
+check("点用的是几何类型的颜色", "#6fa87a" in dots, True)
+popup._current = 0
+popup.list.setCurrentRow(0)
+img2 = QImage(popup.size(), QImage.Format_ARGB32)
+img2.fill(QColor("#ffffff"))
+popup.render(img2)
+found_sel = found_accent = False
+for y in range(20, 60):
+    for x in range(0, img2.width()):
+        c = QColor(img2.pixel(x, y)).name()
+        if c == "#f3f0e8":
+            found_sel = True
+        if c == "#d97757":
+            found_accent = True
+check("选中行有浅底", found_sel, True)
+check("选中行有橙色强调条", found_accent, True)
+
 print("[10] 弹窗键盘操作")
 popup.set_candidates(LAYERS, "")
 first = popup.current_name()

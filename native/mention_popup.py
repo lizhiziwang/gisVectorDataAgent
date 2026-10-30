@@ -7,15 +7,52 @@
 · 确认后把光标停在图层名后面，可以接着打「 做 300 米缓冲区」。
 
 列表是浮在输入框上方的独立窗口，不占布局位置 —— 免得输入框被顶来顶去。
+
+样式跟应用主体一致（暖白底 + 橙色强调 + 细边框），
+不用 QListWidget 的默认项 —— 它只能塞一整行文本，
+图层名和元信息没法左右对齐，看起来像日志不像菜单。
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QPoint, Qt, Signal
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter, QPen
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
-                               QVBoxLayout, QWidget)
+                               QStyle, QStyledItemDelegate, QVBoxLayout, QWidget)
 
-from app.mentions import Mention
+#: 配色（跟 theme.py 保持一致）
+_C_BG = QColor("#ffffff")
+_C_BORDER = QColor("#e0dbcd")
+_C_ACCENT = QColor("#d97757")
+_C_ACCENT_SOFT = QColor("#f8f3ee")
+_C_TEXT = QColor("#1f1e1d")
+_C_MUTED = QColor("#8d897e")
+_C_HOVER = QColor("#f5f2e9")
+_C_SELECT = QColor("#f3f0e8")
+
+#: 单行高度
+_ROW_H = 34
+#: 图标圆点直径
+_DOT = 7
+
+
+class _RowDelegate(QStyledItemDelegate):
+    """画一行：几何色点 + 图层名 + 右侧元信息。
+
+    不用 QListWidget 默认绘制 —— 它只能塞一整行文本，
+    图层名和元信息没法左右对齐，看起来像日志不像菜单。
+    """
+
+    def __init__(self, popup: "MentionPopup"):
+        super().__init__(popup)
+        self.popup = popup
+
+    def paint(self, painter: QPainter, option, index) -> None:
+        name = index.data(Qt.UserRole) or index.data(Qt.DisplayRole) or ""
+        # 选中态两个来源：QListWidget 自己的 current row，
+        # 和我们自己记的 _current（键盘移动时用）。
+        selected = bool(option.state & QStyle.State_Selected) \
+            or index.row() == self.popup._current
+        self.popup._paint_row(painter, option.rect, str(name), selected)
 
 
 class MentionPopup(QFrame):
@@ -35,27 +72,61 @@ class MentionPopup(QFrame):
         self.setObjectName("mentionPopup")
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(6, 6, 6, 6)
+        outer.setContentsMargins(0, 0, 0, 0)
         self.box = QFrame()
         self.box.setObjectName("mentionBox")
         inner = QVBoxLayout(self.box)
-        inner.setContentsMargins(4, 4, 4, 4)
-        inner.setSpacing(2)
+        inner.setContentsMargins(0, 0, 0, 0)
+        inner.setSpacing(0)
 
+        # 头部：标题 + 计数
+        head = QWidget()
+        head.setObjectName("mentionHead")
+        hl = QHBoxLayout(head)
+        hl.setContentsMargins(12, 8, 12, 6)
+        hl.setSpacing(0)
         self.title = QLabel("选择图层")
-        self.title.setObjectName("tiny")
-        inner.addWidget(self.title)
+        self.title.setObjectName("mentionTitle")
+        hl.addWidget(self.title)
+        hl.addStretch(1)
+        self.count_label = QLabel("")
+        self.count_label.setObjectName("mentionCount")
+        hl.addWidget(self.count_label)
+        inner.addWidget(head)
 
+        # 列表
         self.list = QListWidget()
         self.list.setObjectName("mentionList")
         self.list.setFocusPolicy(Qt.NoFocus)
-        self.list.setFixedHeight(min(220, 34 * 8 + 12))
+        self.list.setFrameShape(QFrame.NoFrame)
+        self.list.setSpacing(0)
+        self.list.setUniformItemSizes(True)
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.list.setVerticalScrollMode(QListWidget.ScrollPerPixel)
+        self.list.setMouseTracking(True)
+        self.list.itemClicked.connect(self._on_item_clicked)
+        self._delegate = _RowDelegate(self)
+        self.list.setItemDelegate(self._delegate)
         inner.addWidget(self.list)
 
-        outer.addWidget(self.box)
-        self.setFixedWidth(300)
+        # 底部：快捷键提示
+        foot = QWidget()
+        foot.setObjectName("mentionFoot")
+        fl = QHBoxLayout(foot)
+        fl.setContentsMargins(12, 5, 12, 6)
+        fl.setSpacing(6)
+        self.foot_hint = QLabel("↑↓ 选择 · Enter 确认 · Esc 取消")
+        self.foot_hint.setObjectName("mentionHint")
+        fl.addWidget(self.foot_hint)
+        fl.addStretch(1)
+        inner.addWidget(foot)
 
-        self._items: list[tuple[str, str]] = []   # (显示名, 图层名)
+        outer.addWidget(self.box)
+        self.setFixedWidth(292)
+
+        #: 每项的元信息：图层名 → (几何类型, 要素数)
+        self._meta: dict[str, tuple[str, str]] = {}
+        self._items: list[str] = []     # 图层名列表
         self._current = 0
 
     # ------------------------------------------------------------------ 数据
@@ -63,7 +134,8 @@ class MentionPopup(QFrame):
         """设置候选图层。``layers`` 是 Layer 对象列表。"""
         self.list.clear()
         self._items = []
-        q = (query or "").lower()
+        self._meta = {}
+        q = (query or "").lower().strip()
         scored: list[tuple[int, object]] = []
         for lay in layers:
             name = getattr(lay, "name", "") or ""
@@ -76,32 +148,46 @@ class MentionPopup(QFrame):
             if q in low:
                 # 开头命中排前面
                 scored.append((0 if low.startswith(q) else 1, lay))
-            else:
+            elif all(ch in low for ch in q):
                 # 模糊：所有字符都在名字里（顺序不拘）
-                if all(ch in low for ch in q):
-                    scored.append((2, lay))
+                scored.append((2, lay))
         scored.sort(key=lambda t: (t[0], len(getattr(t[1], "name", ""))))
         for _rank, lay in scored[:8]:
             name = getattr(lay, "name", "")
-            meta = getattr(lay, "meta", None)
             geom = count = ""
+            meta = getattr(lay, "meta", None)
             if callable(meta):
                 try:
                     m = meta()
                     geom = m.get("geomType") or ""
-                    count = m.get("count")
+                    n = m.get("count")
+                    count = f"{n:,}" if isinstance(n, int) else ""
                 except Exception:
                     pass
-            sub = " · ".join(x for x in (geom, f"{count:,} 个要素" if count else "") if x)
-            item = QListWidgetItem(f"{name}" + (f"    {sub}" if sub else ""))
+            self._meta[name] = (geom, count)
+            item = QListWidgetItem(name)
             item.setData(Qt.UserRole, name)
+            item.setSizeHint(QSize(0, _ROW_H))
             self.list.addItem(item)
-            self._items.append((name, name))
+            self._items.append(name)
         self._current = 0
         if self.list.count():
             self.list.setCurrentRow(0)
-        self.title.setText(f"选择图层（{self.list.count()}）" if not q
-                           else f"匹配「{query}」（{self.list.count()}）")
+        self._update_title(query)
+
+    def _update_title(self, query: str) -> None:
+        n = self.list.count()
+        if query:
+            self.title.setText("匹配图层")
+            self.count_label.setText(f"{query} · {n}")
+        else:
+            self.title.setText("选择图层")
+            self.count_label.setText(f"{n} 个")
+
+    def _on_item_clicked(self, item: QListWidgetItem) -> None:
+        name = item.data(Qt.UserRole)
+        if name:
+            self.picked.emit(str(name))
 
     def count(self) -> int:
         return self.list.count()
@@ -110,7 +196,7 @@ class MentionPopup(QFrame):
         if not self._items:
             return ""
         idx = max(0, min(self._current, len(self._items) - 1))
-        return self._items[idx][1]
+        return self._items[idx]
 
     # ------------------------------------------------------------------ 键盘
     def move_selection(self, delta: int) -> None:
@@ -131,14 +217,62 @@ class MentionPopup(QFrame):
         else:
             self.dismissed.emit()
 
+    # ------------------------------------------------------------------ 绘制
+    def _paint_row(self, painter: QPainter, rect: QRect, name: str,
+                   selected: bool) -> None:
+        """画一行：左侧几何色点 + 图层名 + 右侧元信息。"""
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        if selected:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(_C_SELECT)
+            painter.drawRoundedRect(rect.adjusted(4, 1, -4, -1), 6, 6)
+            # 左侧强调条
+            painter.setBrush(_C_ACCENT)
+            painter.drawRoundedRect(QRect(rect.left() + 5, rect.top() + 8, 2,
+                                         rect.height() - 16), 1, 1)
+        geom, count = self._meta.get(name, ("", ""))
+        # 几何类型小圆点
+        dot_c = {"Point": QColor("#5b8def"), "LineString": QColor("#d9a441"),
+                 "Polygon": QColor("#6fa87a"), "MultiPolygon": QColor("#6fa87a")}.get(
+                     geom, QColor("#b6b1a3"))
+        cy = rect.center().y()
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(dot_c)
+        painter.drawEllipse(QRect(rect.left() + 14, cy - _DOT // 2, _DOT, _DOT))
+
+        # 图层名
+        f = painter.font()
+        f.setPointSizeF(f.pointSizeF() + 0.5)
+        if selected:
+            f.setBold(True)
+        painter.setFont(f)
+        painter.setPen(_C_TEXT if selected else QColor("#43413c"))
+        # 宽度不能算成负的 —— 窗口窄一点 drawText 会画歪
+        name_w = max(40, rect.width() - 28 - 74)
+        text_rect = QRect(rect.left() + 28, rect.top(), name_w, rect.height())
+        painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, name)
+
+        # 右侧元信息
+        painter.setFont(self.font())
+        painter.setPen(_C_MUTED)
+        meta_text = " · ".join(x for x in (geom, count) if x)
+        if meta_text:
+            painter.drawText(QRect(rect.right() - 76, rect.top(), 68, rect.height()),
+                             Qt.AlignVCenter | Qt.AlignRight, meta_text)
+        painter.restore()
+
     # ------------------------------------------------------------------ 定位
     def show_at(self, anchor: QWidget, cursor_rect: QPoint | None = None) -> None:
         """在输入框上方定位显示。"""
+        # 高度跟着候选数走 —— 2 个候选不该占 220px
+        h = 44 + _ROW_H * max(1, self.list.count()) + 30
+        self.setFixedHeight(h)
+        self.list.setFixedHeight(_ROW_H * max(1, self.list.count()))
         screen = QGuiApplication.screenAt(anchor.rect().center()) or QGuiApplication.primaryScreen()
         pos = anchor.mapToGlobal(QPoint(0, 0))
         if cursor_rect is not None:
             pos = anchor.mapToGlobal(cursor_rect)
-        h = self.sizeHint().height()
         y = pos.y() - h - 6
         if y < 0:                       # 上方放不下就翻到下方
             y = pos.y() + anchor.height() + 6
