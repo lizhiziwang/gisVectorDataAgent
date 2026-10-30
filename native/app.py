@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import atexit
+import os
 import shutil
 import time
 import traceback
@@ -21,7 +22,9 @@ from app.config import explain, is_ready, load_cfg, save_cfg
 from app.engine import Store
 from app.io_utils import export_layer as write_layer_file
 from app.io_utils import extract_zip, file_info, load_any
+from app.models import LayerRecord
 from app.samples import ensure_samples
+from app.storage import AgentStore
 from app.tool_registry import template_map
 
 from .chat import ChatPanel, Worker
@@ -217,12 +220,45 @@ class MainWindow(QMainWindow):
         self._cleanup_worker: Worker | None = None
         self._load_queue: list[Path] = []    # 待载入的文件队列（串行处理）
 
+        # 持久化：正常桌面运行落 data/agent.db；offscreen 测试/无头环境默认关闭，
+        # 避免测试脚本互相污染会话历史。GIS_AGENT_PERSIST=1 可强制开启（测试用）。
+        persist_env = os.environ.get("GIS_AGENT_PERSIST")
+        self.persist = (persist_env == "1") or (
+            persist_env != "0" and os.environ.get("QT_QPA_PLATFORM", "") != "offscreen")
+        self.agent_db: AgentStore | None = None
+        self.project_id = ""
+        self.session_id = ""
+        self._synced_layers: dict[str, tuple] = {}
+        if self.persist:
+            try:
+                self.agent_db = AgentStore()
+                project = self.agent_db.ensure_default_project()
+                self.project_id = project.id
+                session = self.agent_db.latest_session(project.id)
+                if session is None:
+                    session = self.agent_db.create_session(project.id, "新会话")
+                self.session_id = session.id
+                self.history = self.agent_db.latest_messages_text(self.session_id, 20)
+                saved = self.agent_db.session_state(self.session_id)
+                mem = saved.get("planner_memory") if isinstance(saved, dict) else None
+                if isinstance(mem, dict):
+                    self.planner.memory.update(mem)
+                    # 重启后图层没有恢复，指向旧图层 id 的指代会失效
+                    self.planner.memory["last_layer"] = None
+            except Exception:
+                self.persist = False
+                self.agent_db = None
+                self.history = []
+
         self.setStyleSheet(QSS)
         self._build()
         self._shortcuts()
         self._register_exit()
         self._refresh_planner_pill()
-        self._greet()
+        if self.persist and self.history:
+            self._restore_chat()
+        else:
+            self._greet()
         # 把 data/operators/ 里存过的自定义算子重新装回运行时
         try:
             installed = custom_ops.install_all()
@@ -252,6 +288,11 @@ class MainWindow(QMainWindow):
                     w.wait(5000)
             except Exception:
                 pass
+        try:
+            if getattr(self, "agent_db", None) is not None:
+                self.agent_db.close()
+        except Exception:
+            pass
 
     def closeEvent(self, e):  # noqa: N802
         """关窗时先停掉地图的渲染线程。
@@ -568,8 +609,10 @@ class MainWindow(QMainWindow):
             self.map.fit_all()
         self._refresh_legend()
         self.count_badge.setText(str(len(layers)))
-        total = sum(len(l.gdf) for l in layers)
+        # 用 meta 的缓存计数，不要 len(l.gdf)：后者会把磁盘换出的图层重新读回内存
+        total = sum(int(l.meta().get("count") or 0) for l in layers)
         self.st_feat.setText(f"要素 {total:,}")
+        self._sync_layer_registry()
 
     def _refresh_legend(self) -> None:
         while self.legend_layout.count():
@@ -1157,18 +1200,104 @@ class MainWindow(QMainWindow):
         self._worker.start()
 
     def clear_all(self) -> None:
-        self.store.layers.clear()
-        self.store._n = 0
+        # 保留旧会话（DB 里可追溯），当前窗口开一个新会话
+        if self.persist and self.agent_db is not None:
+            for lid in list(self._synced_layers):
+                try:
+                    self.agent_db.mark_layer_deleted(lid)
+                except Exception:
+                    pass
+            self._synced_layers.clear()
+            try:
+                session = self.agent_db.create_session(self.project_id, "新会话")
+                self.session_id = session.id
+            except Exception:
+                pass
+        self.store.clear()
         self.visible.clear()
         self.current_layer = None
         self.history.clear()
+        self.planner.memory.update({"last_tool": "", "last_args": {}, "last_layer": None,
+                                    "last_plan": [], "last_lines": []})
         self.map.drop_cache()
         self.chat.clear()
+        self._persist_state()
         self.refresh_layers()
         self._greet()
         self.set_status("已清空")
 
     # ================================================================== 对话
+    def _restore_chat(self) -> None:
+        """把上次会话的消息回填到对话面板（不重建步骤卡片，只保留文本）。"""
+        if not self.persist or self.agent_db is None:
+            self._greet()
+            return
+        try:
+            msgs = self.agent_db.list_messages(self.session_id, limit=20)
+        except Exception:
+            msgs = []
+        if not msgs:
+            self._greet()
+            return
+        for m in msgs:
+            txt = m.text()
+            if not txt:
+                continue
+            if m.role == "user":
+                self.chat.add_user(txt)
+            elif m.role == "assistant":
+                self.chat.add_agent(txt)
+        self._refresh_chips()
+        self.set_status(f"已恢复上次会话（{len(msgs)} 条消息）")
+
+    def _persist_state(self) -> None:
+        if not self.persist or self.agent_db is None:
+            return
+        try:
+            self.agent_db.save_session_state(
+                self.session_id, {"planner_memory": self.planner.memory})
+        except Exception:
+            pass
+
+    def _sync_layer_registry(self) -> None:
+        """把当前图层的元信息写入 project 层表；只写有变化的图层。"""
+        if not self.persist or self.agent_db is None:
+            return
+        current = set(self.store.layers)
+        for lid, lay in self.store.layers.items():
+            try:
+                meta = lay.meta()
+            except Exception:
+                continue
+            sig = (lay.name, meta.get("color"), meta.get("count"), meta.get("crs"),
+                   tuple(meta.get("fields") or []), getattr(lay, "cache_path", ""))
+            if self._synced_layers.get(lid) == sig:
+                continue
+            try:
+                self.agent_db.upsert_layer(LayerRecord(
+                    id=lid, project_id=self.project_id, name=lay.name,
+                    parent_id=getattr(lay, "parent", "") or "",
+                    op=getattr(lay, "op", "") or "",
+                    crs=str(meta.get("crs") or ""),
+                    geom_type=str(meta.get("geomType") or ""),
+                    feature_count=int(meta.get("count") or 0),
+                    bounds=list(meta.get("bounds") or []),
+                    fields=list(meta.get("fields") or []),
+                    cache_path=getattr(lay, "cache_path", "") or "",
+                    content_hash="",
+                    created_by_run="",
+                    created_at=float(getattr(lay, "created_at", time.time()))))
+                self._synced_layers[lid] = sig
+            except Exception:
+                pass
+        for lid in list(self._synced_layers):
+            if lid not in current:
+                try:
+                    self.agent_db.mark_layer_deleted(lid)
+                except Exception:
+                    pass
+                self._synced_layers.pop(lid, None)
+
     def _greet(self) -> None:
         self.chat.add_agent(
             "我是你的空间分析助手。数据拖进来后，直接用中文说需求就行，例如：\n"
@@ -1251,11 +1380,11 @@ class MainWindow(QMainWindow):
             self.chat.add_user(text)
             # 没数据时也可能是「你好」——先让闲聊逻辑接手，别一上来就催数据
             small = self.planner.chit_chat(text, has_data=False)
-            self.chat.add_agent(small or (
+            reply = small or (
                 "还没有数据。先把矢量文件拖进来（shp 压缩包 / GeoJSON / GPKG / KML / CSV），"
-                "或者点右上角「示例数据」先试一遍。"))
-            self.history.append({"role": "user", "content": text})
-            self.history.append({"role": "assistant", "content": small or ""})
+                "或者点右上角「示例数据」先试一遍。")
+            self.chat.add_agent(reply)
+            self._remember(text, reply)
             return
         self.chat.add_user(text)
         self.chat.add_typing()
@@ -1435,13 +1564,27 @@ class MainWindow(QMainWindow):
             self.set_status("设置已保存")
 
     def _remember(self, user: str, reply: str) -> None:
-        """记下这一轮对话，给大模型做多轮上下文（之前只读不写，等于没有记忆）。"""
+        """记下这一轮对话：内存 history 给模型，SQLite 给下次启动。"""
         if user:
             self.history.append({"role": "user", "content": user})
         if reply:
             self.history.append({"role": "assistant", "content": reply})
         if len(self.history) > 20:
             del self.history[:-20]
+        if self.persist and self.agent_db is not None:
+            try:
+                if user:
+                    self.agent_db.append_text(self.session_id, "user", user)
+                if reply:
+                    self.agent_db.append_text(self.session_id, "assistant", reply)
+                sess = self.agent_db.get_session(self.session_id)
+                if user and sess is not None and sess.title in ("新会话", "默认会话"):
+                    self.agent_db.touch_session(self.session_id, title=user[:30])
+                else:
+                    self.agent_db.touch_session(self.session_id)
+                self._persist_state()
+            except Exception:
+                pass
 
     def _refresh_planner_pill(self, source: str | None = None) -> None:
         cfg = load_cfg()
