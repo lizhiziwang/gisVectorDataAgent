@@ -188,7 +188,7 @@ input, textarea { font-family: inherit; }
 .mini:hover { background: #e8eefb; color: var(--accent); }
 .mini.off { color: #cbd5e1; }
 
-/* 算子库 */
+/* 工具库 */
 .tool-grid {
   display: grid; grid-template-columns: 1fr 1fr;
   gap: 6px; padding: 0 12px 14px; overflow-y: auto;

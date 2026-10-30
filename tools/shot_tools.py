@@ -1,4 +1,4 @@
-"""截左栏（图层 + 算子库分组）并打印分组几何，用来看分组排布是否合理。
+"""截左栏（图层 + 工具库分组）并打印分组几何，用来看分组排布是否合理。
 
 离屏平台（offscreen）在这台机器上 QFontDatabase.families() 为 0，中文全是豆腐块，
 所以这里用真 windows 平台 + WA_DontShowOnScreen：能拿到系统字体，又不会真的弹窗。
@@ -39,7 +39,7 @@ app.processEvents()
 
 # ---- 分组几何打印 ----
 gl = win.tool_grid
-print("== 算子库网格 ==", f"行数 {gl.rowCount()} 列数 {gl.columnCount()}", flush=True)
+print("== 工具库网格 ==", f"行数 {gl.rowCount()} 列数 {gl.columnCount()}", flush=True)
 for r in range(gl.rowCount()):
     cells = []
     for c in range(gl.columnCount()):

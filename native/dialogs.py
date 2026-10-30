@@ -621,7 +621,7 @@ class OperatorDialog(QDialog):
         root.addWidget(note)
 
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        btns.button(QDialogButtonBox.Ok).setText("保存并加入算子库")
+        btns.button(QDialogButtonBox.Ok).setText("保存并加入工具库")
         btns.button(QDialogButtonBox.Cancel).setText("取消")
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)

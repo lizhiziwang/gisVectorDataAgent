@@ -109,9 +109,9 @@ def _icon_pixmap(size: int) -> QPixmap:
     return pm
 
 
-# 算子库的分组（只影响展示顺序；不在这里的算子会落到「其它 / 我的算子」）
+# 工具库的分组（只影响展示顺序；不在这里的算子会落到「其它 / 我的算子」）
 TOOL_GROUPS = [
-    ("概览", ["describe"]),
+    ("概览", ["describe", "highlight"]),
     ("几何构造", ["buffer", "centroid", "convex_hull", "min_rect", "voronoi", "grid"]),
     ("叠加分析", ["clip", "intersect", "union", "erase"]),
     ("邻近与连接", ["sjoin", "nearest", "bbox_select"]),
@@ -556,7 +556,7 @@ class MainWindow(QMainWindow):
 
         head2 = QHBoxLayout()
         head2.setContentsMargins(14, 10, 12, 6)
-        t2 = QLabel("算子库")
+        t2 = QLabel("工具库")
         t2.setObjectName("panelTitle")
         head2.addWidget(t2)
         self.tool_badge = QLabel("22")
@@ -566,7 +566,7 @@ class MainWindow(QMainWindow):
         self.new_op_btn = QPushButton("＋ 新算子")
         self.new_op_btn.setObjectName("chip")
         self.new_op_btn.setCursor(Qt.PointingHandCursor)
-        self.new_op_btn.setToolTip("用一段文字描述算法，让大模型生成一个新算子并加入算子库")
+        self.new_op_btn.setToolTip("用一段文字描述算法，让大模型生成一个新算子并加入工具库")
         self.new_op_btn.clicked.connect(self.prompt_new_operator)
         head2.addWidget(self.new_op_btn)
         vl.addLayout(head2)
@@ -1438,9 +1438,9 @@ class MainWindow(QMainWindow):
         self.chat.set_suggestions(SUGGESTIONS)
 
     def _refresh_tools(self) -> None:
-        """算子库：按用途分组展示（同一组两列排开）。
+        """工具库：按用途分组展示（同一组两列排开）。
 
-        25 个算子平铺在一个网格里很难扫读，按「概览 / 几何构造 / 叠加分析 /
+        26 个算子平铺在一个网格里很难扫读，按「概览 / 几何构造 / 叠加分析 /
         邻近与连接 / 属性与统计 / 整理 / 我的算子」分组，组内仍可两列并排。
         """
         while self.tool_grid.count():
@@ -2084,7 +2084,7 @@ class MainWindow(QMainWindow):
 
     # ================================================================== 自定义算子
     def prompt_new_operator(self) -> None:
-        """算子库右上角「＋ 新算子」：输入一段算法描述。"""
+        """工具库右上角「＋ 新算子」：输入一段算法描述。"""
         if not is_ready(load_cfg()):
             QMessageBox.information(
                 self, "需要大模型",
@@ -2139,7 +2139,7 @@ class MainWindow(QMainWindow):
         self._refresh_tools()
         params = "、".join(spec.get("params") or {}) or "layer"
         self.chat.add_agent(
-            f"已加入算子库：「{spec['title']}」（{spec['name']}）。\n"
+            f"已加入工具库：「{spec['title']}」（{spec['name']}）。\n"
             f"参数：{params}。\n"
             f"直接说需求就能用它，比如「对地块做{spec['title']}」。")
         self.set_status(f"新算子已就绪：{spec['title']}")

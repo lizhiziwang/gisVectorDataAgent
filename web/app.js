@@ -14,6 +14,7 @@
 
   const TEMPLATES = {
     describe: '检查「{L}」的数据质量',
+    highlight: '在地图上高亮显示「{L}」',
     buffer: '对「{L}」做 500 米缓冲区',
     clip: '用「{O}」裁剪「{L}」',
     intersect: '「{L}」与「{O}」求交',
@@ -24,10 +25,13 @@
     simplify: '简化「{L}」容差 10 米',
     centroid: '取「{L}」的质心',
     convex_hull: '生成「{L}」的凸包',
+    min_rect: '生成「{L}」的最小外接矩形',
+    shape_metrics: '计算「{L}」的形状指标',
     voronoi: '对「{L}」生成泰森多边形',
     grid: '在「{L}」范围生成 1 公里渔网',
     sjoin: '把「{O}」的属性空间连接到「{L}」',
     nearest: '为「{L}」查找最近的「{O}」',
+    bbox_select: '框选「{L}」经度 104~104.05、纬度 30.58~30.62 的范围',
     filter: '筛选「{L}」中面积大于 10000 的要素',
     field_calc: '在「{L}」新增字段 密度 = 人口 / 面积',
     area_stats: '按用地类型统计「{L}」的面积',
@@ -395,7 +399,7 @@
     }), 0);
   }
 
-  /* ------------------------------ 算子库 ------------------------------ */
+  /* ------------------------------ 工具库 ------------------------------ */
   async function renderTools() {
     const r = await api('/api/suggestions');
     $('#toolGrid').innerHTML = '';

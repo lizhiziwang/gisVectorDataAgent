@@ -31,7 +31,7 @@ TOOL_LABEL = label_map()
 def register_tool_spec(name: str, title: str, desc: str, params: dict | None = None) -> None:
     """把自定义算子登记进工具表（大模型提示词 + 中文名 + 校验）。
 
-    注册后它和内置算子走同一套契约：模型能规划它，界面算子库能看到它，
+    注册后它和内置算子走同一套契约：模型能规划它，界面工具库能看到它，
     参数也会经过统一的类型校验。
     """
     if not name:
