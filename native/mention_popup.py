@@ -70,7 +70,14 @@ class MentionPopup(QFrame):
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(None)          # 顶层窗口，才能浮在输入框上面
-        self.setWindowFlags(Qt.Popup | Qt.FramelessWindowHint)
+        self.setWindowFlags(Qt.Popup | Qt.FramelessWindowHint
+                            | Qt.WindowDoesNotAcceptFocus)
+        # 关键：显示时**不要抢焦点**。
+        # Qt.Popup 默认会激活自己，那键盘事件就跑到弹窗去了，
+        # 输入框收不到回车 —— 表现为「按回车选不中图层」。
+        # 焦点必须留在输入框上，弹窗只负责显示和鼠标点击。
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setFocusPolicy(Qt.NoFocus)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setObjectName("mentionPopup")
         # 关键：这是**独立的顶层窗口**，不会继承主窗口的样式表
@@ -232,6 +239,29 @@ class MentionPopup(QFrame):
             self.picked.emit(name)
         else:
             self.dismissed.emit()
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        """兜底：万一弹窗还是拿到了焦点，也能用键盘选。
+
+        正常情况下焦点在输入框上（WA_ShowWithoutActivating），
+        这里的按键走的是输入框的事件过滤器。
+        但不同平台/窗口管理器对 Popup 的激活处理不完全一样，
+        这里再兜一层，保证「回车能选图层」在任何情况下都成立。
+        """
+        key = event.key()
+        if key in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Tab):
+            self.accept()
+            return
+        if key == Qt.Key_Escape:
+            self.dismissed.emit()
+            return
+        if key == Qt.Key_Up:
+            self.move_selection(-1)
+            return
+        if key == Qt.Key_Down:
+            self.move_selection(1)
+            return
+        super().keyPressEvent(event)
 
     # ------------------------------------------------------------------ 绘制
     def _apply_mask(self) -> None:

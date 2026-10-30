@@ -255,6 +255,49 @@ type_text(panel2, "@")
 check("不弹", panel2._mention_popup is None
       or not panel2._mention_popup.isVisible(), True)
 
+print("[12b] 回车能选中图层（弹窗不能抢焦点）")
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QKeyEvent
+
+popup_obj = panel._mention_popup
+check("弹窗显示时不抢焦点",
+      popup_obj.testAttribute(Qt.WA_ShowWithoutActivating), True)
+check("弹窗不接收焦点",
+      bool(popup_obj.windowFlags() & Qt.WindowDoesNotAcceptFocus), True)
+check("弹窗焦点策略是 NoFocus", popup_obj.focusPolicy() == Qt.NoFocus, True)
+
+type_text(panel, "@小区")
+check("弹窗开着", panel._mention_popup.isVisible(), True)
+ev = QKeyEvent(QKeyEvent.KeyPress, Qt.Key_Return, Qt.NoModifier)
+app.sendEvent(panel.input, ev)
+app.processEvents()
+check("回车后填入了图层名", panel.input.toPlainText(), "@小区")
+check("回车后弹窗关掉了", not panel._mention_popup.isVisible(), True)
+check("光标停在名字后面", panel.input.textCursor().position(), len("@小区"))
+
+print("[12c] 弹窗自己也能处理按键（焦点万一跑过去时的兜底）")
+popup2 = MentionPopup()
+popup2.set_candidates(LAYERS, "")
+got = []
+popup2.picked.connect(got.append)
+popup2.dismissed.connect(lambda: got.append("__dismissed__"))
+app.sendEvent(popup2, QKeyEvent(QKeyEvent.KeyPress, Qt.Key_Return, Qt.NoModifier))
+check("回车 → 选中第一项", got, ["小区"])
+got.clear()
+popup2._current = 1
+app.sendEvent(popup2, QKeyEvent(QKeyEvent.KeyPress, Qt.Key_Return, Qt.NoModifier))
+# 无查询时按名字长度排序：小区 / 地铁站 / 小区_合并 / …
+check("回车 → 选中当前项", got, ["地铁站"])
+got.clear()
+app.sendEvent(popup2, QKeyEvent(QKeyEvent.KeyPress, Qt.Key_Escape, Qt.NoModifier))
+check("ESC → 关闭", got, ["__dismissed__"])
+got.clear()
+popup2._current = 0
+app.sendEvent(popup2, QKeyEvent(QKeyEvent.KeyPress, Qt.Key_Down, Qt.NoModifier))
+check("↓ → 移到第二项", popup2.current_name(), "地铁站")
+app.sendEvent(popup2, QKeyEvent(QKeyEvent.KeyPress, Qt.Key_Up, Qt.NoModifier))
+check("↑ → 移回第一项", popup2.current_name(), "小区")
+
 print("[13] 规划器：规则引擎认得被提及的图层")
 from app.agent import Planner
 

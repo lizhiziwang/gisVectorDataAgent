@@ -384,6 +384,33 @@ class ChatPanel(QWidget):
                 return True
         return super().eventFilter(obj, event)
 
+    def _app_key_filter(self, obj, event) -> bool:
+        """应用级兜底：@ 弹窗开着时，回车/ESC/↑↓ 一律归它管。
+
+        输入框上的事件过滤器只在焦点在输入框时管用。
+        万一焦点跑到别处（Popup 抢焦点、用户点了别的地方），
+        回车就变成「发消息」而不是「选图层」——
+        这里在应用层面再兜一次，保证行为一致。
+        """
+        from PySide6.QtCore import QEvent
+        if (self._mention_popup is None or not self._mention_popup.isVisible()
+                or event.type() != QEvent.KeyPress):
+            return False
+        key = event.key()
+        if key in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Tab):
+            self._mention_popup.accept()
+            return True
+        if key == Qt.Key_Escape:
+            self._close_mention_popup()
+            return True
+        if key == Qt.Key_Up:
+            self._mention_popup.move_selection(-1)
+            return True
+        if key == Qt.Key_Down:
+            self._mention_popup.move_selection(1)
+            return True
+        return False
+
     def _set_input(self, text: str) -> None:
         self.input.setPlainText(text)
         cur = self.input.textCursor()
@@ -408,6 +435,11 @@ class ChatPanel(QWidget):
             self._mention_popup = MentionPopup()
             self._mention_popup.picked.connect(self._on_mention_picked)
             self._mention_popup.dismissed.connect(self._close_mention_popup)
+            # 应用级兜底：焦点不在输入框时，回车也要能选图层
+            from PySide6.QtWidgets import QApplication
+            app = QApplication.instance()
+            if app is not None:
+                app.installEventFilter(self)
         return self._mention_popup
 
     def _on_input_changed(self) -> None:
