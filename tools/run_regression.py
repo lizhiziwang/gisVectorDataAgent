@@ -41,6 +41,8 @@ ORDER = [
     "test_memory_phase3.py",
     "test_api_formats.py",
     "test_conn_test.py",
+    "test_mentions.py",
+    "test_mentions_desktop.py",
     "test_multitask.py",
     "test_runtime_phase2.py",
     "test_memory_ui.py",

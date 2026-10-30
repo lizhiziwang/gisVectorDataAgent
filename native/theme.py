@@ -197,6 +197,22 @@ QTextEdit#chatInput {
 }
 QTextEdit#chatInput:focus { border: none; }
 
+/* @ 图层补全弹窗 */
+QFrame#mentionPopup { background: transparent; }
+QFrame#mentionBox {
+    background: #ffffff; border: 1px solid #ddd8ca; border-radius: 10px;
+}
+QListWidget#mentionList {
+    border: none; background: transparent; outline: none; font-size: 12px;
+}
+QListWidget#mentionList::item {
+    padding: 4px 6px; border-radius: 6px; color: #43413c;
+}
+QListWidget#mentionList::item:selected {
+    background: #f0ece1; color: #1f1e1d;
+}
+QListWidget#mentionList::item:hover { background: #f5f2e9; }
+
 QFrame#userBubble {
     background: #f0ece1; border: 1px solid #e5e0d2; border-radius: 10px;
 }

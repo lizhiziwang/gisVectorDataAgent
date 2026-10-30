@@ -25,6 +25,8 @@ from app.io_utils import export_layer as write_layer_file
 from app.io_utils import extract_zip, file_info, load_any
 from app.models import LayerRecord
 from app.memory import MemoryManager
+from app.mentions import (ambiguity_question, mentions_note, not_found_note,
+                          parse_mentions, resolve_mentions, strip_mentions)
 from app.runtime import (AgentRuntime, PRIORITY_CHAT, PRIORITY_EXPORT, PRIORITY_IMPORT,
                          PRIORITY_OPGEN, TaskScheduler, recover_interrupted_runs)
 from app.samples import ensure_samples
@@ -1528,6 +1530,40 @@ class MainWindow(QMainWindow):
         if sel_note:
             # 让规划器/大模型知道现在有一层「只含选中的要素」
             text = f"（当前图层只包含我选中的 {sel_note} 个要素，下面的操作都作用于它）{text}"
+
+        # ---------------------------------------------------------- @ 图层提及
+        # 「对 @小区 做缓冲区」：@ 是**显式**指定，优先于当前选中图层。
+        # 名字写错或指代不明 → 直接问用户，别猜。
+        mention_ctx = ""
+        mentions = resolve_mentions(parse_mentions(text), self.store)
+        if mentions:
+            amb = ambiguity_question(mentions)
+            if amb is not None:
+                # 有歧义 → 走澄清，让用户点选项
+                self._pending_clarify = {
+                    "question": amb["question"],
+                    "options": amb["options"],
+                    "origin": text,
+                }
+                self.chat.add_clarify(amb["question"], amb["options"],
+                                      self._on_clarify_picked)
+                return
+            good = [m for m in mentions if m.resolved]
+            if good:
+                # 明确指定的图层优先当「当前图层」
+                current = good[0].layer_id
+                # @ 标记要去掉（模型看到 @ 会当成特殊 token），
+                # 但名字要留着 —— 规则引擎还得靠名字认图层。
+                text = strip_mentions(text, mentions)
+                # 单独告诉模型「用户点名了哪些图层」，它才不会换成相近的图层
+                mention_ctx = mentions_note(mentions)
+            else:
+                # 全都没解析到：告诉用户，然后继续按原文走（可能是别的话题）
+                text = strip_mentions(text, mentions)
+                bad = not_found_note(mentions)
+                if bad:
+                    self.chat.add_agent(bad)
+                    return
         # 澄清轮次：把上一轮的问题和这次的回答一起带给规划器，
         # 否则模型看到「道路」两个字，不知道用户到底想干什么。
         clarify_ctx = self._clarify_answer
@@ -1546,7 +1582,8 @@ class MainWindow(QMainWindow):
             res = run_agent(self.store, self.planner, text, current, cfg,
                             self.history, use_llm=is_ready(cfg),
                             cancel_token=token, memory_context=mem_text,
-                            clarify_context=clarify_ctx)
+                            clarify_context=clarify_ctx,
+                            mention_context=mention_ctx)
             res["user"] = text
             res["source"] = res.get("planner") or "rule"
             # 模型请求写新算子 → 真的去写，然后把代码交给用户确认

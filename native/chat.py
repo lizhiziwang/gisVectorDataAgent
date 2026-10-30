@@ -234,6 +234,10 @@ class ChatPanel(QWidget):
         self._typing: QFrame | None = None
         self._hist: list[str] = []      # 发过的指令，↑/↓ 翻（shell 手感）
         self._hist_pos = -1
+        #: @ 补全弹窗：懒创建
+        self._mention_popup = None
+        #: 当前 @ 的位置（-1 表示没有）
+        self._mention_at = -1
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -321,9 +325,10 @@ class ChatPanel(QWidget):
         box.setSpacing(6)
         self.input = QTextEdit()
         self.input.setObjectName("chatInput")
-        self.input.setPlaceholderText("描述你要做的空间分析…")
+        self.input.setPlaceholderText("描述你要做的空间分析…（用 @ 指定图层）")
         self.input.setFixedHeight(44)
         self.input.installEventFilter(self)
+        self.input.textChanged.connect(self._on_input_changed)
         box.addWidget(self.input, 1)
         self.send_btn = QPushButton()
         self.send_btn.setObjectName("send")
@@ -345,6 +350,20 @@ class ChatPanel(QWidget):
     def eventFilter(self, obj, event):  # noqa: N802
         from PySide6.QtCore import QEvent
         if obj is self.input and event.type() == QEvent.KeyPress:
+            # @ 补全弹窗开着时，方向键/回车/ESC 都归它管
+            if self._mention_popup is not None and self._mention_popup.isVisible():
+                if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Tab):
+                    self._mention_popup.accept()
+                    return True
+                if event.key() == Qt.Key_Escape:
+                    self._close_mention_popup()
+                    return True
+                if event.key() == Qt.Key_Up:
+                    self._mention_popup.move_selection(-1)
+                    return True
+                if event.key() == Qt.Key_Down:
+                    self._mention_popup.move_selection(1)
+                    return True
             if event.key() in (Qt.Key_Return, Qt.Key_Enter) and not (event.modifiers() & Qt.ShiftModifier):
                 self._emit_send()
                 return True
@@ -370,6 +389,72 @@ class ChatPanel(QWidget):
         cur = self.input.textCursor()
         cur.movePosition(cur.MoveOperation.End)
         self.input.setTextCursor(cur)
+
+    # -------------------------------------------------------------- @ 补全
+    def _mention_layers(self) -> list:
+        """当前可用图层（供补全列表用）。"""
+        store = getattr(self._win, "store", None)
+        if store is None:
+            return []
+        try:
+            return list(store.layers.values())
+        except Exception:
+            return []
+
+    def _mention_popup_obj(self):
+        """懒创建补全弹窗（第一次用到时才建）。"""
+        if self._mention_popup is None:
+            from .mention_popup import MentionPopup
+            self._mention_popup = MentionPopup()
+            self._mention_popup.picked.connect(self._on_mention_picked)
+            self._mention_popup.dismissed.connect(self._close_mention_popup)
+        return self._mention_popup
+
+    def _on_input_changed(self) -> None:
+        """输入变化时，判断要不要弹 @ 补全。"""
+        cur = self.input.textCursor()
+        if not cur.hasSelection():
+            pos = cur.position()
+            upto = self.input.toPlainText()[:pos]
+            # 光标前最近的 @，中间不能有空格（否则 @ 只是普通字符）
+            at = upto.rfind("@")
+            if at >= 0:
+                between = upto[at + 1:]
+                if " " not in between and "\n" not in between and len(between) <= 40:
+                    query = between
+                    layers = self._mention_layers()
+                    if layers:
+                        popup = self._mention_popup_obj()
+                        popup.set_candidates(layers, query)
+                        if popup.count():
+                            self._mention_at = at
+                            rect = self.input.cursorRect()
+                            popup.show_at(self.input, rect.topLeft())
+                            return
+        self._close_mention_popup()
+
+    def _close_mention_popup(self) -> None:
+        if self._mention_popup is not None and self._mention_popup.isVisible():
+            self._mention_popup.hide()
+        self._mention_at = -1
+
+    def _on_mention_picked(self, name: str) -> None:
+        """选中了一个图层：把 @查询词 换成 @图层名。"""
+        at = self._mention_at
+        self._close_mention_popup()
+        if at < 0:
+            return
+        text = self.input.toPlainText()
+        cur = self.input.textCursor()
+        pos = cur.position()
+        # 从 @ 一直换到光标处
+        new_text = text[:at] + "@" + name + text[pos:]
+        self.input.setPlainText(new_text)
+        # 光标停在图层名后面
+        new_cur = self.input.textCursor()
+        new_cur.setPosition(min(at + 1 + len(name), len(new_text)))
+        self.input.setTextCursor(new_cur)
+        self.input.setFocus()
 
     def _emit_send(self) -> None:
         text = self.input.toPlainText().strip()
