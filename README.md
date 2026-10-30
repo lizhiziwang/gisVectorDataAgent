@@ -53,9 +53,9 @@ fastapi、uvicorn、pywebview 可以不装。
 | 属性与统计 | 属性筛选、字段计算、面积/长度统计、形状指标 |
 | 整理 | 融合、图层合并、去重、几何简化、投影转换、几何修复、拆分多部件 |
 
-### 自定义算子（按文字描述生成）
+### 自定义工具（按文字描述生成）
 
-工具库里点「＋ 新算子」，用一段中文描述算法（例如「统计每个地块面内道路的总长度和条数」），
+工具库里点「＋ 新建工具」，用一段中文描述算法（例如「统计每个地块面内道路的总长度和条数」），
 大模型会写一个 `def op(gdf, args)` 函数：先弹预览给你看代码和试跑结果，确认后才入库。
 
 - **契约**：`op(gdf, args) -> (GeoDataFrame 或 None, 说明)`；可用 `pd / np / gpd / shapely`
@@ -220,12 +220,12 @@ fastapi、uvicorn、pywebview 可以不装。
 
 | 能力 | 代码 |
 |---|---|
-| 规划 / 澄清 / 新算子请求的提示词与解析 | [app/agent.py](app/agent.py) `Planner.llm_plan` |
+| 规划 / 澄清 / 新工具请求的提示词与解析 | [app/agent.py](app/agent.py) `Planner.llm_plan` |
 | 执行失败后的修复回灌 | `app/agent.py` `Planner.llm_repair` |
 | Agent 主循环（规划→执行→观察→修复） | `app/agent.py` `run_agent` |
 | 澄清选项的界面渲染 | [native/chat.py](native/chat.py) `ChatPanel.add_clarify` |
 | 澄清闭环的桌面端接线 | [native/app.py](native/app.py) `_show_clarify` / `_on_clarify_picked` |
-| 新算子：生成 → 预览 → 确认 → 入库 | `native/app.py` `_handle_operator_gen` + `native/dialogs.py` `OperatorDialog` |
+| 新工具：生成 → 预览 → 确认 → 入库 | `native/app.py` `_handle_operator_gen` + `native/dialogs.py` `OperatorDialog` |
 
 ### Agent 闭环（本次优化重点）
 
@@ -447,6 +447,8 @@ gis-agent/
 ```
 
 ## 扩展一个新算子
+
+这是开发者视角（写代码加算子），和界面上「＋ 新建工具」（让大模型写）不是一回事。
 
 1. 在 `app/engine.py` 写 `def _my_op(store, layer, ...) -> Result`，返回 `Result(ok, message, new_layer, warnings, data)`；
 2. 注册到 `OPERATIONS`；

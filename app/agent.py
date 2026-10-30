@@ -565,29 +565,44 @@ class Planner:
         return errors
 
     # ---------------- 规则解析
-    # ---------------- 自定义算子生成
+    # ---------------- 自定义工具生成
     @staticmethod
     def wants_new_operator(text: str) -> bool:
-        """判断用户是不是在要求「造一个新算子」而不是用现成算子。"""
+        """判断用户是不是在要求「造一个新工具」而不是用现成算子。
+
+        「算子」「工具」两种叫法都要认 —— 界面里叫「工具库」，
+        用户嘴里也可能还是说「算子」。
+        """
         if not text:
             return False
         t = text.strip()
         pats = (
-            r"(写|做|造|生成|新建|新增|创建|实现|定义|加|添加)\s*(一|一个|个)?\s*(新)?\s*(的)?\s*(算子|operator)",
-            r"自定义算子", r"自定义一个?(算子|工具|函数)",
+            r"(写|做|造|生成|新建|新增|创建|实现|定义|加|添加)\s*(一|一个|个)?\s*(新)?\s*(的)?\s*(算子|工具|operator)",
+            r"(自定义|我的)\s*(一|一个|个)?\s*(算子|工具|operator)",
             r"(帮我|给我)?(实现|写)(一)?个?(算法|函数|工具)",
             r"(把|将).{0,30}(写成|做成|封装成).{0,10}(算子|工具)",
+            # 光秃秃一句「新算子 / 新工具」也是这个意思（没有动词）
+            r"^\s*(新|自定义)\s*(算子|工具)\s*$",
         )
         return any(re.search(p, t, re.I) for p in pats)
 
     @staticmethod
     def extract_operator_brief(text: str) -> str:
-        """从「写一个算子：xxx」里把算法描述抠出来，抠不到就用整句。"""
+        """从「写一个工具：xxx」里把算法描述抠出来，抠不到就用整句。
+
+        注意「生成算子：算面积」这种冒号前面还带动词的情况 ——
+        冒号后才是真正的算法描述，别把「生成算子：」也喂给模型。
+        """
         t = (text or "").strip()
         m = re.search(r"[:：]\s*(.+)$", t, re.S)
-        if m and len(m.group(1).strip()) >= 4:
-            return m.group(1).strip()
-        m = re.search(r"(?:算子|operator)\s*(?:叫|名为|名字是)?\s*[「\"'“]?([^」\"'”]{2,20})[」\"'”]?", t)
+        if m:
+            tail = m.group(1).strip()
+            # 中文信息密度高，3 个字（如「算面积」）就是一句完整的算法描述，
+            # 所以中文门槛按 3 字算，英文按 4 字符算。
+            need = 3 if re.search(r"[\u4e00-\u9fa5]", tail) else 4
+            if len(tail) >= need:
+                return tail
+        m = re.search(r"(?:算子|工具|operator)\s*(?:叫|名为|名字是)?\s*[「\"'“]?([^」\"'”]{2,20})[」\"'”]?", t)
         return t
 
     def _schema_text(self, lay) -> str:
@@ -1430,7 +1445,7 @@ def run_agent(store: Store, planner: Planner, text: str, current: str | None,
             brief = str((new_op or {}).get("brief") or "").strip()
             if brief:
                 return {"reply": out.get("reply") or
-                                 "现有算子做不了这件事，我可以新写一个算子来实现。",
+                                 "现有算子做不了这件事，我可以新写一个工具来实现。",
                         "steps": [], "lines": [], "planner": "llm", "note": "",
                         "clarify": None, "new_operator": brief,
                         "layers": [l.meta() for l in store.layers.values()]}

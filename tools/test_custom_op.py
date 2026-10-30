@@ -95,4 +95,26 @@ custom_ops.remove(spec_saved["name"])
 OPERATIONS.pop(spec_saved["name"], None)
 check("清理", (custom_ops.OPS_DIR / f"{spec_saved['name']}.json").exists(), False)
 
+print("[8] 「新建工具」的各种说法都要能识别")
+from app.agent import Planner
+
+for t in ["新建工具", "写一个工具", "帮我实现一个工具", "新工具", "新算子",
+          "自定义工具", "自定义算子", "新增算子", "新建一个工具",
+          "把这段代码封装成一个工具", "生成工具：统计每个面内道路长度"]:
+    check(f"认得：{t}", Planner.wants_new_operator(t), True)
+
+print("[9] 普通分析指令不能被误判成要造工具")
+for t in ["高亮显示小区", "对地块做 500 米缓冲区", "筛选面积大于 10000 的要素",
+          "用边界裁剪地块", "统计用地类型面积"]:
+    check(f"不误判：{t}", Planner.wants_new_operator(t), False)
+
+print("[10] 算法描述要从「生成工具：xxx」里抠出来")
+check("中文短描述",
+      Planner.extract_operator_brief("生成算子：算面积"), "算面积")
+check("长描述",
+      Planner.extract_operator_brief("生成工具：统计每个面内道路的总长度和条数"),
+      "统计每个面内道路的总长度和条数")
+check("没有冒号就整句",
+      Planner.extract_operator_brief("写一个工具"), "写一个工具")
+
 print("\n结论:", "PASS" if not fails else f"FAIL {fails}")

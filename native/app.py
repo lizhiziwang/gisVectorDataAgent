@@ -109,7 +109,7 @@ def _icon_pixmap(size: int) -> QPixmap:
     return pm
 
 
-# 工具库的分组（只影响展示顺序；不在这里的算子会落到「其它 / 我的算子」）
+# 工具库的分组（只影响展示顺序；不在这里的算子会落到「其它 / 我的工具」）
 TOOL_GROUPS = [
     ("概览", ["describe", "highlight"]),
     ("几何构造", ["buffer", "centroid", "convex_hull", "min_rect", "voronoi", "grid"]),
@@ -304,7 +304,7 @@ class MainWindow(QMainWindow):
         try:
             installed = custom_ops.install_all()
             if installed:
-                self.chat.add_agent("已载入 " + str(len(installed)) + " 个自定义算子："
+                self.chat.add_agent("已载入 " + str(len(installed)) + " 个自定义工具："
                                     + "、".join("「" + s["title"] + "」" for s in installed))
         except Exception:
             pass
@@ -563,10 +563,10 @@ class MainWindow(QMainWindow):
         self.tool_badge.setObjectName("badge")
         head2.addWidget(self.tool_badge)
         head2.addStretch(1)
-        self.new_op_btn = QPushButton("＋ 新算子")
+        self.new_op_btn = QPushButton("＋ 新建工具")
         self.new_op_btn.setObjectName("chip")
         self.new_op_btn.setCursor(Qt.PointingHandCursor)
-        self.new_op_btn.setToolTip("用一段文字描述算法，让大模型生成一个新算子并加入工具库")
+        self.new_op_btn.setToolTip("用一段文字描述算法，让大模型生成一个新工具并加入工具库")
         self.new_op_btn.clicked.connect(self.prompt_new_operator)
         head2.addWidget(self.new_op_btn)
         vl.addLayout(head2)
@@ -1441,7 +1441,7 @@ class MainWindow(QMainWindow):
         """工具库：按用途分组展示（同一组两列排开）。
 
         26 个算子平铺在一个网格里很难扫读，按「概览 / 几何构造 / 叠加分析 /
-        邻近与连接 / 属性与统计 / 整理 / 我的算子」分组，组内仍可两列并排。
+        邻近与连接 / 属性与统计 / 整理 / 我的工具」分组，组内仍可两列并排。
         """
         while self.tool_grid.count():
             it = self.tool_grid.takeAt(0)
@@ -1487,7 +1487,7 @@ class MainWindow(QMainWindow):
         custom = [n for n in OPERATIONS
                   if n not in grouped and getattr(OPERATIONS[n], "__name__", "").startswith("custom_")]
         other = [n for n in OPERATIONS if n not in grouped and n not in custom]
-        groups.append(("我的算子", custom))
+        groups.append(("我的工具", custom))
         if other:
             groups.append(("其它", other))
         return [(t, ns) for t, ns in groups if ns]
@@ -1705,7 +1705,7 @@ class MainWindow(QMainWindow):
         if kind == "agent" and user:
             self.on_send(user)
         elif kind == "opgen":
-            self._run_operator_gen(user or "生成算子")
+            self._run_operator_gen(user or "生成工具")
         else:
             self.set_status("这个任务不能直接重试，请重新操作一次")
 
@@ -2084,20 +2084,20 @@ class MainWindow(QMainWindow):
 
     # ================================================================== 自定义算子
     def prompt_new_operator(self) -> None:
-        """工具库右上角「＋ 新算子」：输入一段算法描述。"""
+        """工具库右上角「＋ 新建工具」：输入一段算法描述。"""
         if not is_ready(load_cfg()):
             QMessageBox.information(
                 self, "需要大模型",
-                "按描述生成算子需要接入大模型：\n先到「模型设置」填好 API Key（默认用 DeepSeek）。")
+                "按描述生成工具需要接入大模型：\n先到「模型设置」填好 API Key（默认用 DeepSeek）。")
             return
         text, ok = QInputDialog.getMultiLineText(
-            self, "用文字描述一个算子",
+            self, "用文字描述一个工具",
             "说明要算什么、参数是什么。例如：\n"
             "统计每个面内道路的总长度和条数，一个新图层输出这些字段。",
             "")
         if not ok or not text.strip():
             return
-        self.chat.add_user("生成算子：" + text.strip())
+        self.chat.add_user("生成工具：" + text.strip())
         self._run_operator_gen(text.strip())
 
     def _run_operator_gen(self, brief: str) -> None:
@@ -2108,26 +2108,26 @@ class MainWindow(QMainWindow):
                     "brief": brief, "user": "", "steps": [], "lines": [],
                     "source": "gen", "note": ""}
 
-        task = self.runtime.submit_run(job, kind="opgen", label="生成算子",
+        task = self.runtime.submit_run(job, kind="opgen", label="生成工具",
                                        priority=PRIORITY_OPGEN)
-        self._task_handlers[task.id] = {"kind": "opgen", "user": "生成算子"}
+        self._task_handlers[task.id] = {"kind": "opgen", "user": "生成工具"}
         self._task_retry[task.id] = {"kind": "opgen", "user": brief}
         self._update_task_ui()
 
     def _handle_operator_gen(self, res: dict, brief: str) -> None:
-        """展示生成的算子：代码可改，确认后落盘并注册。"""
+        """展示生成的工具：代码可改，确认后落盘并注册。"""
         if res.get("error"):
             msg = res["error"]
             raw = res.get("raw")
-            self.chat.add_agent("没能生成算子：" + msg + ("\n\n模型原始输出：\n" + raw if raw else ""))
+            self.chat.add_agent("没能生成工具：" + msg + ("\n\n模型原始输出：\n" + raw if raw else ""))
             return
         spec = res.get("spec") or {}
         if not spec:
-            self.chat.add_agent("没能生成算子：模型没有返回代码。")
+            self.chat.add_agent("没能生成工具：模型没有返回代码。")
             return
         dlg = OperatorDialog(spec, self)
         if dlg.exec() != QDialog.Accepted:
-            self.chat.add_agent("已取消，算子没有保存。")
+            self.chat.add_agent("已取消，工具没有保存。")
             return
         spec = dlg.value()
         try:
@@ -2142,7 +2142,7 @@ class MainWindow(QMainWindow):
             f"已加入工具库：「{spec['title']}」（{spec['name']}）。\n"
             f"参数：{params}。\n"
             f"直接说需求就能用它，比如「对地块做{spec['title']}」。")
-        self.set_status(f"新算子已就绪：{spec['title']}")
+        self.set_status(f"新工具已就绪：{spec['title']}")
 
 
 

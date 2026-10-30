@@ -554,13 +554,13 @@ class ImportDialog(QDialog):
 
 
 class OperatorDialog(QDialog):
-    """预览「按文字描述生成的算子」：看得到代码、试跑结果，再决定要不要入库。"""
+    """预览「按文字描述生成的工具」：看得到代码、试跑结果，再决定要不要入库。"""
 
     def __init__(self, spec: dict, parent=None):
         super().__init__(parent)
         self.spec = dict(spec or {})
-        title = self.spec.get("title") or self.spec.get("name") or "新算子"
-        self.setWindowTitle(f"新算子预览 · {title}")
+        title = self.spec.get("title") or self.spec.get("name") or "新工具"
+        self.setWindowTitle(f"新工具预览 · {title}")
         self.resize(720, 620)
 
         root = QVBoxLayout(self)
@@ -597,7 +597,7 @@ class OperatorDialog(QDialog):
             tl.setStyleSheet(f"color:{color};font-size:11px;")
             root.addWidget(tl)
 
-        lab = QLabel("算子代码（可编辑）")
+        lab = QLabel("工具代码（可编辑）")
         lab.setStyleSheet("font-size:11px;color:#43413c;font-weight:600;")
         root.addWidget(lab)
 
