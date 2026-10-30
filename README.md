@@ -105,11 +105,29 @@ fastapi、uvicorn、pywebview 可以不装。
 1. **规则引擎（默认，离线可用）**
    内置中文指令解析器：图层名模糊匹配、单位与数字抽取、多条指令按"然后 / 再 / ；"拆句，并把上一步的输出自动串给下一步（流水线）。
 2. **大模型规划（可选，但推荐）**
-   「模型设置」里填任意 OpenAI 兼容接口（DeepSeek / 通义千问 / OpenAI / 本地 Ollama），Agent 会把图层清单、字段、算子参数 schema 一起发给模型，拿回结构化 JSON 计划再执行。接口超时或返回不合法时**自动回退**规则引擎（连续失败会静默 60 秒，避免每条指令都卡住）。执行失败会把错误和当前 schema 回灌给模型，最多自动修复 2 次。
+   「模型设置」里填任意大模型接口，Agent 会把图层清单、字段、算子参数 schema 一起发给模型，拿回结构化 JSON 计划再执行。接口超时或返回不合法时**自动回退**规则引擎（连续失败会静默 60 秒，避免每条指令都卡住）。执行失败会把错误和当前 schema 回灌给模型，最多自动修复 2 次。
    Key 只存在本机 `data/settings.json`（原子写 + 尽量收紧权限）。
 
 **接了大模型之后，自然语言才是真正自由的。** 规则引擎只认模板句式（「对 X 做 500 米缓冲区」），
 而大模型能把「帮我看看每个小区周边 300 米内有没有地铁站」翻译成算子参数。
+
+### 支持的 API 格式
+
+设置窗口里可以切换接口格式 —— 不同厂商的 URL、鉴权头、请求体、响应结构都不一样，
+`app/api_formats.py` 把这些差异收敛成适配器：
+
+| 格式 | 端点 | 鉴权 | 响应取值 |
+|---|---|---|---|
+| OpenAI Chat Completions（默认，兼容面最广） | `{base}/chat/completions` | `Authorization: Bearer` | `choices[0].message.content` |
+| OpenAI Responses | `{base}/responses` | `Authorization: Bearer` | `output[].content[].text` |
+| Anthropic Messages（Claude） | `{base}/messages` | `x-api-key` + `anthropic-version` | `content[].text` |
+| Google Gemini | `{base}/models/{model}:generateContent` | `x-goog-api-key` | `candidates[].content.parts[].text` |
+| Ollama 原生 | `{base}/api/chat` | 可无鉴权 | `message.content` |
+
+- 预设按钮会**同时**改好地址、模型和格式（DeepSeek / 通义千问 / OpenAI / Ollama / Claude / Gemini）。
+- 底下有**实时预览**：显示「当前设置会发成什么样」的 POST 地址和请求头，填错当场就能看出来。
+- **测试连接**按钮发一个最小请求，验证地址/密钥/格式对不对，不用来回试。
+- **高级**里能改端点路径（支持 `{model}` 占位）和附加请求头，用来对接自建网关或私有代理。
 
 ### 大模型驱动的完整闭环
 
@@ -308,7 +326,8 @@ gis-agent/
 ├─ app/         与界面无关的内核：图层仓库与 25 个算子（engine.py）、两级规划器与执行器
 │               （agent.py）、算子契约与参数校验（tool_registry.py）、自定义算子（custom_ops.py）、
 │               矢量读写（io_utils.py）、会话与记忆持久化（storage.py / models.py）、
-│               任务调度与事件流（runtime.py）、记忆提取与检索（memory.py）
+│               任务调度与事件流（runtime.py）、记忆提取与检索（memory.py）、
+│               大模型接口格式适配（api_formats.py）、配置读写（config.py）
 ├─ web/         网页版前端（本分支暂缓维护，桌面端优先）
 ├─ tools/       验证与性能工具：verify_render（完备性 + 像素比对）、perf_*（耗时分解）、
 │               test_*（回归）、run_regression.py（跑全部回归）、smoke_app（整机冒烟）

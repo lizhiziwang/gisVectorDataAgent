@@ -15,6 +15,7 @@ import urllib.request
 import urllib.error
 from typing import Any
 
+from . import api_formats
 from .engine import OPERATIONS, Store, Result
 from .runtime import CancelToken
 from .tool_registry import (REGISTRY, Param, ToolSpec, groups as registry_groups,
@@ -571,8 +572,11 @@ class Planner:
 
     def gen_operator(self, description: str, current: str | None, cfg: dict) -> dict:
         """按算法描述生成一个算子：返回 {spec} 或 {error}。"""
-        if not cfg.get("api_key") or not cfg.get("base_url"):
-            return {"error": "生成算子需要接入大模型。先在「模型设置」里填上 API Key 和接口地址。"}
+        fmt = (cfg.get("api_format") or "openai_chat").strip() or "openai_chat"
+        # Ollama 不需要 key；其他格式没 key 就没法鉴权
+        if not cfg.get("base_url") or (not cfg.get("api_key") and fmt != "ollama"):
+            return {"error": "生成算子需要接入大模型。先在「模型设置」里填上接口地址"
+                             + ("（Ollama 除外）" if fmt == "ollama" else "和 API Key") + "。"}
         lay = self.store.get(current) or next(iter(self.store.layers.values()), None)
         schema = self._schema_text(lay)
         sys_prompt = (
@@ -909,32 +913,35 @@ class Planner:
                   max_tokens: int = 1600) -> tuple[str, str] | dict:
         """发一次请求，返回 (content, finish_reason) 或 {"__error__": ...}。
 
+        · 请求怎么拼、响应怎么取，交给 `app.api_formats`（支持 OpenAI /
+          Anthropic / Gemini / Ollama 四种格式）；
         · 429/5xx 做短退避重试（很多兼容接口会偶发 502）；
         · 只有最终失败才写 `_llm_fail_at`，避免一次 429 让后面 60 秒都不用模型；
         · JSON mode 不支持时退回普通模式。
         """
-        url = cfg["base_url"].rstrip("/") + "/chat/completions"
-        payload = {"model": cfg.get("model") or "deepseek-chat", "messages": msgs,
-                   "temperature": 0.1, "max_tokens": int(max_tokens)}
-        if json_mode:
-            payload["response_format"] = {"type": "json_object"}
-        body = json.dumps(payload, ensure_ascii=False).encode()
-        req = urllib.request.Request(url, data=body, headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {cfg['api_key']}",
-        })
+        fmt = (cfg.get("api_format") or "openai_chat").strip() or "openai_chat"
+        try:
+            url, headers, payload = api_formats.build_request(cfg, msgs, json_mode, max_tokens)
+        except Exception as e:  # noqa: BLE001 - 配置写错不该炸掉整个 Agent
+            self._llm_fail_at = time.time()
+            return {"__error__": f"接口格式配置有误：{e}", "__status__": 0}
+        body = api_formats.dumps(payload)
+        req = urllib.request.Request(url, data=body, headers=headers)
         last = ""
         for attempt in range(3):
             try:
                 with urllib.request.urlopen(req, timeout=45) as r:
                     data = json.loads(r.read().decode())
-                ch = data["choices"][0]
+                try:
+                    content, finish = api_formats.parse_response(fmt, data)
+                except Exception as e:  # noqa: BLE001
+                    return {"__error__": f"响应格式不对（{fmt}）：{e}", "__status__": 0}
                 usage = data.get("usage") or {}
                 if usage:
                     log.info("LLM usage model=%s prompt=%s completion=%s",
                              cfg.get("model"), usage.get("prompt_tokens"),
                              usage.get("completion_tokens"))
-                return ch["message"]["content"] or "", ch.get("finish_reason") or ""
+                return content, finish
             except urllib.error.HTTPError as e:
                 detail = ""
                 try:
@@ -980,7 +987,12 @@ class Planner:
     def llm_plan(self, text: str, current: str | None, cfg: dict, history: list[dict],
                  memory_context: str = "",
                  clarify_context: dict | None = None) -> dict | None:
-        if not cfg.get("api_key") or not cfg.get("base_url"):
+        if not cfg.get("base_url"):
+            return None
+        # 本地 Ollama、某些自建网关不需要 key —— 不能因为没填 key 就当不可用。
+        # 但 base_url 必须在，否则连发往哪都不知道。
+        fmt = (cfg.get("api_format") or "openai_chat").strip() or "openai_chat"
+        if not cfg.get("api_key") and fmt not in ("ollama",):
             return None
         if time.time() - self._llm_fail_at < 60:
             return {"error": ""}   # 刚失败过，先安静地走规则引擎

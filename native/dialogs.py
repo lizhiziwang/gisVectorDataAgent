@@ -3,10 +3,12 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFrame,
-                               QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton,
-                               QScrollArea, QTableWidget, QTableWidgetItem, QVBoxLayout,
-                               QWidget)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+                               QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
+                               QPushButton, QScrollArea, QTableWidget, QTableWidgetItem,
+                               QVBoxLayout, QWidget)
+
+from app import api_formats
 
 from .format import fmt_num
 
@@ -164,30 +166,56 @@ class TableDialog(QDialog):
 
 
 class SettingsDialog(QDialog):
-    """大模型设置：任意 OpenAI 兼容接口。"""
+    """大模型设置：接口地址 / 密钥 / 模型 / **API 格式**。
+
+    API 格式决定请求怎么拼、响应怎么取（见 `app/api_formats.py`）：
+    OpenAI Chat Completions、OpenAI Responses、Anthropic Messages、
+    Gemini generateContent、Ollama 原生各有各的 URL、请求头和响应结构。
+    选好格式后还能手动覆盖端点路径和请求头，用来对接自建网关。
+    """
 
     PRESETS = {
-        "DeepSeek": ("https://api.deepseek.com/v1", "deepseek-chat"),
-        "通义千问": ("https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus"),
-        "OpenAI": ("https://api.openai.com/v1", "gpt-4o-mini"),
-        "本地 Ollama": ("http://localhost:11434/v1", "qwen2.5:7b"),
+        "DeepSeek": ("https://api.deepseek.com/v1", "deepseek-chat", "openai_chat"),
+        "通义千问": ("https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus",
+                     "openai_chat"),
+        "OpenAI": ("https://api.openai.com/v1", "gpt-4o-mini", "openai_chat"),
+        "本地 Ollama": ("http://localhost:11434/v1", "qwen2.5:7b", "ollama"),
+        "Claude": ("https://api.anthropic.com/v1", "claude-sonnet-4-20250514", "anthropic"),
+        "Gemini": ("https://generativelanguage.googleapis.com/v1beta", "gemini-2.0-flash",
+                   "gemini"),
     }
 
     def __init__(self, cfg: dict, parent=None):
         super().__init__(parent)
         self.setWindowTitle("模型设置")
-        self.setMinimumWidth(460)
+        self.setMinimumWidth(520)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 14, 16, 14)
-        root.setSpacing(10)
+        root.setSpacing(9)
 
-        tip = QLabel("规则引擎已能理解常见中文指令，离线即可用。接入任意 <b>OpenAI 兼容</b>"
-                     "接口后，可用更自由的口语表达；接口异常会自动回退规则引擎。")
+        tip = QLabel("规则引擎已能理解常见中文指令，离线即可用。接入任意大模型接口后，"
+                     "可用更自由的口语表达；接口异常会自动回退规则引擎。")
         tip.setWordWrap(True)
         tip.setObjectName("muted")
         root.addWidget(tip)
 
+        # ---------------------------------------------------------- 接口格式
+        root.addWidget(self._lab("接口格式（决定请求怎么发、响应怎么读）"))
+        self.fmt = QComboBox()
+        for label in api_formats.FORMATS:
+            self.fmt.addItem(label, api_formats.FORMATS[label])
+        cur = (cfg.get("api_format") or api_formats.DEFAULT_FORMAT).strip()
+        idx = self.fmt.findData(cur)
+        self.fmt.setCurrentIndex(idx if idx >= 0 else 0)
+        root.addWidget(self.fmt)
+
+        self.fmt_desc = QLabel("")
+        self.fmt_desc.setWordWrap(True)
+        self.fmt_desc.setObjectName("tiny")
+        root.addWidget(self.fmt_desc)
+
+        # ---------------------------------------------------------- Base URL
         root.addWidget(self._lab("接口地址 Base URL"))
         self.base = QLineEdit(cfg.get("base_url", ""))
         self.base.setPlaceholderText("https://api.deepseek.com/v1")
@@ -195,14 +223,15 @@ class SettingsDialog(QDialog):
 
         row = QHBoxLayout()
         row.setSpacing(6)
-        for name, (url, model) in self.PRESETS.items():
+        for name, (url, model, fmt) in self.PRESETS.items():
             b = QPushButton(name)
             b.setObjectName("chip")
-            b.clicked.connect(lambda _=False, u=url, m=model: self._preset(u, m))
+            b.clicked.connect(lambda _=False, u=url, m=model, f=fmt: self._preset(u, m, f))
             row.addWidget(b)
         row.addStretch(1)
         root.addLayout(row)
 
+        # ---------------------------------------------------------- 模型 / Key
         root.addWidget(self._lab("模型名称"))
         self.model = QLineEdit(cfg.get("model", ""))
         self.model.setPlaceholderText("deepseek-chat")
@@ -213,6 +242,52 @@ class SettingsDialog(QDialog):
         self.key.setEchoMode(QLineEdit.Password)
         self.key.setPlaceholderText("sk-...")
         root.addWidget(self.key)
+
+        # ---------------------------------------------------------- 自定义覆盖
+        self.adv = QCheckBox("高级：自定义端点路径与请求头（对接自建网关）")
+        ov = cfg.get("api_overrides") or {}
+        self.adv.setChecked(bool(ov))
+        root.addWidget(self.adv)
+
+        self.adv_box = QWidget()
+        av = QVBoxLayout(self.adv_box)
+        av.setContentsMargins(10, 0, 0, 0)
+        av.setSpacing(6)
+
+        av.addWidget(self._lab("端点路径（留空用默认；可用 {model} 占位）"))
+        self.ov_path = QLineEdit(str(ov.get("path") or ""))
+        self.ov_path.setPlaceholderText("/chat/completions")
+        av.addWidget(self.ov_path)
+
+        av.addWidget(self._lab("附加请求头（每行一条：名字: 值）"))
+        self.ov_headers = QPlainTextEdit()
+        self.ov_headers.setPlaceholderText("X-Api-Key: xxx")
+        self.ov_headers.setMaximumHeight(64)
+        for k, v in (ov.get("headers") or {}).items():
+            self.ov_headers.appendPlainText(f"{k}: {v}")
+        av.addWidget(self.ov_headers)
+        self.adv_box.setVisible(bool(ov))
+        root.addWidget(self.adv_box)
+        #: 高级区是否展开（对话框没 show 时 isVisible 恒为 False，
+        #: 测试和外部都要读这个状态，所以单独留一个标记）
+        self._adv_open = bool(ov)
+
+        # ---------------------------------------------------------- 预览 / 测试
+        self.preview = QLabel("")
+        self.preview.setWordWrap(True)
+        self.preview.setObjectName("tiny")
+        root.addWidget(self.preview)
+
+        brow = QHBoxLayout()
+        brow.setSpacing(6)
+        self.btn_test = QPushButton("测试连接")
+        self.btn_test.setObjectName("chip")
+        self.btn_test.clicked.connect(self._test)
+        brow.addWidget(self.btn_test)
+        self.test_result = QLabel("")
+        self.test_result.setObjectName("tiny")
+        brow.addWidget(self.test_result, 1)
+        root.addLayout(brow)
 
         self.enabled = QCheckBox("启用大模型规划（失败自动回退规则引擎）")
         self.enabled.setChecked(bool(cfg.get("enabled")))
@@ -229,25 +304,92 @@ class SettingsDialog(QDialog):
         btns.rejected.connect(self.reject)
         root.addWidget(btns)
 
+        self.fmt.currentIndexChanged.connect(self._refresh_preview)
+        self.adv.toggled.connect(self._on_adv_toggled)
+        self.base.textChanged.connect(self._refresh_preview)
+        self.model.textChanged.connect(self._refresh_preview)
+        self._refresh_preview()
+
+    @property
+    def adv_open(self) -> bool:
+        """高级区（自定义端点/请求头）是否展开。"""
+        return self._adv_open
+
+    def _on_adv_toggled(self, on: bool) -> None:
+        self._adv_open = bool(on)
+        self.adv_box.setVisible(bool(on))
+
     @staticmethod
     def _lab(text: str) -> QLabel:
         lb = QLabel(text)
         lb.setStyleSheet("font-size:11px;color:#43413c;font-weight:600;")
         return lb
 
-    def _preset(self, url: str, model: str) -> None:
+    def _preset(self, url: str, model: str, fmt: str) -> None:
         self.base.setText(url)
         self.model.setText(model)
+        idx = self.fmt.findData(fmt)
+        if idx >= 0:
+            self.fmt.setCurrentIndex(idx)
         self.enabled.setChecked(True)
         if not self.key.text() and "11434" in url:
             self.key.setText("ollama")
 
+    def _refresh_preview(self) -> None:
+        """显示「当前设置会发成什么样」，省得存完才知道填错了。"""
+        fmt = self.fmt.currentData() or api_formats.DEFAULT_FORMAT
+        self.fmt_desc.setText(api_formats.describe(fmt))
+        try:
+            cfg = self.value()
+            url, headers, payload = api_formats.build_request(
+                cfg, [{"role": "user", "content": "hi"}], False, 100)
+            keys = ", ".join(sorted(k for k in headers if k != "Content-Type"))
+            self.preview.setText(f"将请求：POST {url}\n请求头：{keys or '（无）'}")
+        except Exception as e:  # noqa: BLE001 - 预览失败不该挡住设置
+            self.preview.setText(f"（预览失败：{e}）")
+
+    def _test(self) -> None:
+        """发一个最小请求，验证地址/密钥/格式对不对。"""
+        self.test_result.setText("正在测试…")
+        QApplication.processEvents()
+        try:
+            from app.agent import Planner
+            from app.engine import Store
+            p = Planner(Store())
+            out = p._call_llm(self.value(), [{"role": "user", "content": "回复「好」两个字"}],
+                              False, max_tokens=32)
+        except Exception as e:  # noqa: BLE001
+            self.test_result.setText(f"测试失败：{e}")
+            return
+        if isinstance(out, dict):
+            self.test_result.setText(f"测试失败：{out.get('__error__', '未知错误')}")
+            return
+        content = (out[0] or "").strip()
+        self.test_result.setText(f"测试成功：{content[:40]}" if content else "测试成功（空回复）")
+
     def value(self) -> dict:
+        overrides: dict = {}
+        path = self.ov_path.text().strip()
+        if path:
+            overrides["path"] = path
+        headers = {}
+        for line in self.ov_headers.toPlainText().splitlines():
+            line = line.strip()
+            if not line or ":" not in line:
+                continue
+            k, v = line.split(":", 1)
+            k = k.strip()
+            if k:
+                headers[k] = v.strip()
+        if headers:
+            overrides["headers"] = headers
         return {
             "base_url": self.base.text().strip(),
             "model": self.model.text().strip(),
             "api_key": self.key.text().strip(),
             "enabled": self.enabled.isChecked(),
+            "api_format": self.fmt.currentData() or api_formats.DEFAULT_FORMAT,
+            "api_overrides": overrides,
         }
 
 

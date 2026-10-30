@@ -6,6 +6,8 @@ import os
 import re
 from pathlib import Path
 
+from . import api_formats
+
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 CONFIG = DATA / "settings.json"
@@ -20,24 +22,46 @@ DEFAULTS = {
     "api_key": os.environ.get("LLM_API_KEY", ""),
     "model": os.environ.get("LLM_MODEL", ""),
     "enabled": bool(os.environ.get("LLM_API_KEY")),
+    # 接口格式：openai_chat / openai_response / anthropic / gemini / ollama
+    "api_format": os.environ.get("LLM_API_FORMAT", "") or "openai_chat",
+    # 自定义覆盖：{"path": "/v1/chat/completions", "headers": {...}, "body": {...}}
+    "api_overrides": {},
 }
 
 
-def _fix_base(base: str) -> str:
-    """把用户填的地址整理成「可直接拼 /chat/completions」的形式。
+def _fix_base(base: str, fmt: str = "openai_chat") -> str:
+    """把用户填的地址整理成「可直接拼端点路径」的形式。
 
     · 末尾多余斜杠去掉；
     · 有人会把完整的 …/chat/completions 贴进来 → 去掉；
     · 只填了域名（https://api.deepseek.com）→ 补成 /v1，
       否则请求会打到 …/chat/completions（DeepSeek 要的是 …/v1/chat/completions）。
+
+    端点路径因格式而异：OpenAI 系是 /chat/completions，Anthropic 是 /messages，
+    Gemini 是 /models/{model}:generateContent，Ollama 是 /api/chat。
+    按错格式去截断会把用户的地址改坏，所以这里按格式分别处理。
     """
     b = (base or "").strip().rstrip("/")
     if not b:
         return ""
-    if b.endswith("/chat/completions"):
-        b = b[: -len("/chat/completions")].rstrip("/")
-    if re.fullmatch(r"https?://[^/]+", b):
-        b += "/v1"
+    fmt = (fmt or "openai_chat").strip() or "openai_chat"
+    if fmt == "openai_chat":
+        if b.endswith("/chat/completions"):
+            b = b[: -len("/chat/completions")].rstrip("/")
+        if re.fullmatch(r"https?://[^/]+", b):
+            b += "/v1"
+    elif fmt == "openai_response":
+        if b.endswith("/responses"):
+            b = b[: -len("/responses")].rstrip("/")
+    elif fmt == "anthropic":
+        if b.endswith("/messages"):
+            b = b[: -len("/messages")].rstrip("/")
+    elif fmt == "gemini":
+        # Gemini 的 base 通常是 https://generativelanguage.googleapis.com/v1beta
+        b = re.sub(r"/models/[^/]+:generateContent$", "", b).rstrip("/")
+    elif fmt == "ollama":
+        if b.endswith("/api/chat"):
+            b = b[: -len("/api/chat")].rstrip("/")
     return b
 
 
@@ -50,8 +74,29 @@ def normalize(cfg: dict) -> dict:
     out = dict(cfg or {})
     key = (out.get("api_key") or "").strip()
     out["api_key"] = key
-    out["base_url"] = _fix_base(out.get("base_url") or "")
+    fmt = (out.get("api_format") or "").strip() or "openai_chat"
+    if fmt not in api_formats.FORMAT_NAMES:
+        fmt = "openai_chat"
+    out["api_format"] = fmt
+    out["base_url"] = _fix_base(out.get("base_url") or "", fmt)
     out["model"] = (out.get("model") or "").strip()
+    # 自定义覆盖：只留 dict，且把空值去掉
+    ov = out.get("api_overrides")
+    if not isinstance(ov, dict):
+        ov = {}
+    clean = {}
+    path = str(ov.get("path") or "").strip()
+    if path:
+        clean["path"] = path
+    for key2 in ("headers", "body"):
+        v = ov.get(key2)
+        if isinstance(v, dict) and v:
+            clean[key2] = {str(k): val for k, val in v.items() if k}
+    out["api_overrides"] = clean
+    # 补默认值：
+    # · 填了 key → 默认按 DeepSeek 补地址和模型（多数人只贴 key 就想能用）；
+    # · Ollama 不需要 key → 只要选了 ollama 格式且没填地址，就给本地默认地址，
+    #   别让用户以为「没填 key = 不可用」。
     if key:
         if not out["base_url"]:
             out["base_url"] = DEFAULT_BASE
@@ -61,6 +106,11 @@ def normalize(cfg: dict) -> dict:
         out.setdefault("enabled", True)
         if out.get("enabled") is None:
             out["enabled"] = True
+    elif fmt == "ollama":
+        if not out["base_url"]:
+            out["base_url"] = "http://localhost:11434"
+        if not out["model"]:
+            out["model"] = "qwen2.5:7b"
     return out
 
 
@@ -92,17 +142,26 @@ def save_cfg(cfg: dict) -> None:
 
 
 def is_ready(cfg: dict) -> bool:
-    """三项齐备才算真正可用，避免界面误显示"已接入"。"""
+    """配置齐备才算真正可用，避免界面误显示"已接入"。
+
+    Ollama 这类本地服务不需要 API Key，所以对 ollama 格式只要求地址和模型。
+    """
     cfg = normalize(cfg)
-    return bool(cfg.get("enabled") and cfg.get("api_key") and cfg.get("base_url"))
+    if not (cfg.get("enabled") and cfg.get("base_url")):
+        return False
+    if cfg.get("api_format") == "ollama":
+        return bool(cfg.get("model"))
+    return bool(cfg.get("api_key"))
 
 
 def explain(cfg: dict) -> str:
     """一句话说明当前状态，用来做界面提示（不泄露 key）。"""
     cfg = normalize(cfg)
-    if not cfg.get("api_key"):
+    fmt = cfg.get("api_format") or "openai_chat"
+    if not cfg.get("api_key") and fmt != "ollama":
         return "未配置 API Key"
     if not cfg.get("enabled"):
         return "已配置 Key，但「启用大模型规划」没勾选"
     host = re.sub(r"^https?://", "", cfg.get("base_url") or "").split("/")[0]
-    return f"已接入 {cfg.get('model')} @ {host}"
+    name = api_formats.FORMAT_NAMES.get(fmt, "OpenAI")
+    return f"已接入 {cfg.get('model')} @ {host}（{name}）"
