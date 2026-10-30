@@ -626,7 +626,7 @@ class Planner:
         fmt = (cfg.get("api_format") or "openai_chat").strip() or "openai_chat"
         # Ollama 不需要 key；其他格式没 key 就没法鉴权
         if not cfg.get("base_url") or (not cfg.get("api_key") and fmt != "ollama"):
-            return {"error": "生成算子需要接入大模型。先在「模型设置」里填上接口地址"
+            return {"error": "生成工具需要接入大模型。先在「模型设置」里填上接口地址"
                              + ("（Ollama 除外）" if fmt == "ollama" else "和 API Key") + "。"}
         lay = self.store.get(current) or next(iter(self.store.layers.values()), None)
         schema = self._schema_text(lay)
@@ -643,46 +643,107 @@ class Planner:
             "    # 返回 (新的 GeoDataFrame 或 None, 一句话中文说明)。\n"
             "可用：pd、np、gpd、shapely、metric(gdf)、to_wgs(gdf, like)。\n"
             "禁止：import、while 循环、文件/网络/系统调用、访问 __ 开头的属性。\n"
+            "**绝对不要写 import 语句** —— 需要的库（pd / np / gpd / shapely）\n"
+            "已经在运行环境里直接可用，直接用名字就行，例如 `gdf.to_crs('EPSG:4326')`。\n"
             "要求：\n"
             "1. 用向量化写法（shapely 数组接口、geopandas 列运算），不要逐要素 for 循环做大计算；\n"
             "2. 返回的 GeoDataFrame 要保留几何列，坐标系与入参一致；\n"
             "3. 结果为空时返回 (None, 说明) 或空图层并在说明里讲清楚，不要抛异常；\n"
             "4. 参数尽量少，默认值写进 args.get 的第二个参数。\n"
+            "5. **算子只处理内存里的图层**。如果用户要的是「读写文件 / 转文件格式 /"
+            "下载上传 / 调网络接口」这类事情，那不是算子能做的，"
+            "不要硬写 —— 在 desc 里写清为什么做不了，代码给一个只做数据变换的版本，"
+            "并在 desc 末尾用一行「注意：文件格式转换请用界面里的导出功能」说明。\n"
             "只输出 JSON：{\"name\":\"英文蛇形名\",\"title\":\"中文名(不超过8字)\","
             "\"desc\":\"一句话说明\",\"params\":{\"参数名\":\"说明\"},"
             "\"code\":\"完整的 python 代码\"}"
         )
-        msgs = [{"role": "system", "content": sys_prompt},
-                {"role": "user", "content": description}]
-        out = self._call_llm(cfg, msgs, json_mode=True)
-        if isinstance(out, dict):
-            return {"error": f"大模型接口调用失败：{out.get('__error__', '')}"}
-        content, finish = out
-        parsed = _parse_json_payload(content)
-        if not parsed or not (parsed.get("code") or "").strip():
-            return {"error": "模型没有给出可用的算子代码。", "raw": (content or "")[:400]}
-        spec = {
-            "name": parsed.get("name") or parsed.get("title") or "custom_op",
-            "title": parsed.get("title") or parsed.get("name") or "自定义算子",
-            "desc": parsed.get("desc") or "",
-            "params": parsed.get("params") or {"layer": "图层名"},
-            "code": parsed.get("code") or "",
-        }
+        base_msgs = [{"role": "system", "content": sys_prompt},
+                     {"role": "user", "content": description}]
         from . import custom_ops
-        try:
-            custom_ops.check_code(spec["code"])
-        except custom_ops.OperatorError as e:
-            return {"error": f"生成的代码没通过安全检查：{e}", "spec": spec}
-        # 拿前若干个要素试跑一次，把可能的运行期错误提前暴露
-        try:
-            if lay is not None and len(lay.gdf):
-                sample = lay.gdf.head(200).copy()
-                o, msg = custom_ops.run_op(spec, sample, {})
-                spec["_trial"] = {"ok": True, "msg": msg or "",
-                                  "rows": 0 if o is None else len(o)}
-        except Exception as e:
-            spec["_trial"] = {"ok": False, "msg": str(e)}
-        return {"spec": spec}
+
+        last_err = ""
+        spec: dict = {}
+        # 模型经常不听「禁止 import」这一条 —— 与其把错误原样甩给用户，
+        # 不如把具体的违规点回灌给它让它自己改（总共试 3 次）。
+        for attempt in range(3):
+            msgs = list(base_msgs)
+            if attempt:
+                # 带上上一版的代码，让模型对着自己的代码改（比空着改更容易收敛）
+                msgs.append({"role": "assistant",
+                             "content": spec.get("code") or "（上一版没有给出代码）"})
+                msgs.append({"role": "user", "content":
+                             f"上一版没通过安全检查：{last_err}\n"
+                             "请重写 code 字段，只输出 JSON。\n"
+                             "要点：\n"
+                             "· 不要写任何 import 语句（库已经预先注入，直接用 pd / np / gpd / shapely）；\n"
+                             "· 不要用 while 循环（用向量化写法或 for 循环 + list 推导）；\n"
+                             "· 不要访问 __ 开头的属性；\n"
+                             "· 不要读写文件或访问网络。"})
+            out = self._call_llm(cfg, msgs, json_mode=True,
+                                 max_tokens=2200 if attempt == 0 else 3200)
+            if isinstance(out, dict):
+                return {"error": f"大模型接口调用失败：{out.get('__error__', '')}"}
+            content, finish = out
+            parsed = _parse_json_payload(content)
+            if not parsed or not (parsed.get("code") or "").strip():
+                last_err = "模型没有给出可用的工具代码。"
+                spec = {}
+                continue
+            spec = {
+                "name": parsed.get("name") or parsed.get("title") or "custom_op",
+                "title": parsed.get("title") or parsed.get("name") or "自定义工具",
+                "desc": parsed.get("desc") or "",
+                "params": parsed.get("params") or {"layer": "图层名"},
+                "code": parsed.get("code") or "",
+            }
+            try:
+                custom_ops.check_code(spec["code"])
+            except custom_ops.OperatorError as e:
+                last_err = str(e)
+                continue        # 把违规点回灌给模型让它改
+            # 拿前若干个要素试跑一次，把可能的运行期错误提前暴露
+            try:
+                if lay is not None and len(lay.gdf):
+                    sample = lay.gdf.head(200).copy()
+                    o, msg = custom_ops.run_op(spec, sample, {})
+                    spec["_trial"] = {"ok": True, "msg": msg or "",
+                                      "rows": 0 if o is None else len(o)}
+            except Exception as e:
+                spec["_trial"] = {"ok": False, "msg": str(e)}
+            return {"spec": spec}
+
+        # 改了两轮还不行：别只丢一句「没通过安全检查」——
+        # 把代码给用户看，并说清哪一行违规、怎么改。
+        detail = ""
+        if spec.get("code"):
+            try:
+                custom_ops.check_code(spec["code"])
+            except custom_ops.OperatorError as e:
+                detail = str(e)
+        # 按违规内容给一句「具体怎么改」，而不是光说「没通过检查」
+        hints = (
+            ("import", "去掉 import 语句 —— pd / np / gpd / shapely 已经在运行环境里"
+                       "直接可用，写名字就行；"),
+            ("while", "改成向量化写法，或者用 for + list 推导；"),
+            ("class", "不要定义 class，把逻辑直接写在 def op 里；"),
+            ("to_file", "算子不能写文件 —— 导出请用图层右键菜单的「导出」；"),
+            ("to_csv", "算子不能写文件 —— 导出请用图层右键菜单的「导出」；"),
+            ("read_", "算子不能读文件 —— 只能处理已经载入的图层；"),
+            ("__", "不能访问 __ 开头的内部属性；"),
+        )
+        hint = ""
+        for key, text in hints:
+            if key in (detail or ""):
+                hint = text
+                break
+        msg = f"生成的代码没通过安全检查：{detail}。" if detail else "生成的代码没通过安全检查。"
+        if hint:
+            msg += f"\n{hint}"
+        if spec.get("code"):
+            msg += "\n\n生成出来的代码如下，你可以自己改掉问题再保存：\n```python\n" \
+                   + spec["code"][:1500] + "\n```"
+        return {"error": msg, "spec": spec}
 
     def rule_plan(self, text: str, current: str | None) -> list[dict]:
         """按分句解析，并把上一句产出自动接入下一句（流水线串联）。

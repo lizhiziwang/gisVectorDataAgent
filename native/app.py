@@ -2116,13 +2116,16 @@ class MainWindow(QMainWindow):
 
     def _handle_operator_gen(self, res: dict, brief: str) -> None:
         """展示生成的工具：代码可改，确认后落盘并注册。"""
+        spec = res.get("spec") or {}
         if res.get("error"):
             msg = res["error"]
             raw = res.get("raw")
             self.chat.add_agent("没能生成工具：" + msg + ("\n\n模型原始输出：\n" + raw if raw else ""))
-            return
-        spec = res.get("spec") or {}
-        if not spec:
+            # 代码已经生成出来了，只是没过安全检查 —— 那就让用户看到并改，
+            # 总比丢一句「没通过检查」就结束强。
+            if not spec.get("code"):
+                return
+        elif not spec:
             self.chat.add_agent("没能生成工具：模型没有返回代码。")
             return
         dlg = OperatorDialog(spec, self)

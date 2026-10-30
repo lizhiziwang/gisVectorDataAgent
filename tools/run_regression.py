@@ -44,6 +44,7 @@ ORDER = [
     "test_api_formats.py",
     "test_conn_test.py",
     "test_llm_parse_fail.py",
+    "test_opgen_retry.py",
     "test_mentions.py",
     "test_mentions_desktop.py",
     "test_highlight.py",
