@@ -158,6 +158,9 @@ class Store:
                  memory_budget_mb: int | None = None) -> None:
         self.layers: dict[str, Layer] = {}
         self._n = 0
+        #: 地图高亮：图层 id → (要素序号列表, 颜色)
+        #: 只存序号不存几何 —— 渲染时按序号去图层里取。
+        self.highlights: dict[str, tuple[list[int], str]] = {}
         env_dir = os.environ.get("GIS_AGENT_CACHE_DIR")
         self.cache_dir = Path(cache_dir or env_dir or (ROOT / "data" / "cache"))
         self.memory_budget_mb = float(memory_budget_mb if memory_budget_mb is not None
@@ -196,6 +199,23 @@ class Store:
             pass
         self._trim_memory(keep={lid})
         return lay
+
+    # ------------------------------------------------------------------ 高亮
+    def set_highlight(self, layer_id: str, indices: list[int],
+                      color: str = "#d97757") -> None:
+        """记下要在地图上高亮的要素序号。"""
+        self.highlights[layer_id] = ([int(i) for i in indices], color or "#d97757")
+
+    def clear_highlight(self, layer_id: str | None = None) -> None:
+        """清掉高亮；不给 layer_id 就全清。"""
+        if layer_id is None:
+            self.highlights.clear()
+        else:
+            self.highlights.pop(layer_id, None)
+
+    def get_highlight(self, layer_id: str) -> tuple[list[int], str]:
+        """取某图层的高亮：(要素序号列表, 颜色)。没有就是空。"""
+        return self.highlights.get(layer_id, ([], "#d97757"))
 
     def _memory_mb(self, deep: bool = True) -> float:
         total = 0
@@ -475,6 +495,43 @@ def op_describe(store: Store, layer: str | None = None) -> Result:
     if length:
         msg += f" 总长度约 {length/1000:.3f} km。"
     return Result(True, msg, None, warns, data)
+
+
+def op_highlight(store: Store, layer, expression=None, color="#d97757") -> Result:
+    """在地图上高亮显示要素。
+
+    这是个「只读」算子：不产出新图层，只把符合条件的要素位置
+    记在 store 的高亮集合里，桌面端渲染时画强调样式。
+
+    高亮的是**要素序号**，不是几何 —— 渲染时直接用序号定位，
+    免得把几何复制一份占内存。
+    """
+    lay = store.resolve(layer)
+    g, warns = prepare_layer(lay.gdf)
+    expr = (expression or "").strip()
+    if expr:
+        e = _normalize_expr(expr)
+        e = _coerce_text_literals(g, e)
+        try:
+            mask = g.eval(e, engine="python")
+            idx = [int(i) for i in g.index[mask.astype(bool)]]
+        except Exception as ex:
+            raise ValueError(f"属性表达式无法执行：{expression}（{ex}）。"
+                             "示例：人口 > 10000 and 类型 == '住宅'")
+        msg = f"在地图上高亮显示「{lay.name}」中满足「{expr}」的 {len(idx)} 个要素。"
+        if not idx and len(g):
+            msg += ("（没有要素符合条件，检查一下字段名和取值？"
+                    "文本字段要用引号，如 code == '001'）")
+    else:
+        idx = list(range(len(g)))
+        msg = f"在地图上高亮显示「{lay.name}」的全部 {len(idx)} 个要素。"
+    if not len(g):
+        msg = f"图层「{lay.name}」没有要素，没什么可高亮的。"
+    # 高亮集合挂在 store 上，渲染时按 layer_id 取
+    store.set_highlight(lay.id, idx, color=color)
+    return Result(True, msg, None, warns,
+                  {"layer_id": lay.id, "count": len(idx),
+                   "expression": expr, "color": color})
 
 
 def _buffer(store: Store, layer, distance=500, unit="m", quad_segs=16, dissolve=False, name=None) -> Result:
@@ -1175,6 +1232,7 @@ def make_custom_operator(spec: dict) -> Callable:
 
 OPERATIONS: dict[str, Callable] = {
     "describe": op_describe,
+    "highlight": op_highlight,
     "buffer": _buffer,
     "clip": _clip,
     "intersect": _intersect,

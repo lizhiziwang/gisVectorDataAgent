@@ -397,8 +397,13 @@ class SettingsDialog(QDialog):
                 res = conn_test.test_connection(cfg)
             except Exception as e:  # noqa: BLE001
                 res = conn_test.TestResult(False, f"测试出错：{e}")
-            # 回到主线程再改界面
-            self._test_done.emit(res)
+            # 回到主线程再改界面。
+            # 窗口可能已经关了 —— emit 到一个已析构的 C++ 对象会崩
+            # （退出时偶发 0xC0000409 就是这么来的），所以先确认还活着。
+            try:
+                self._test_done.emit(res)
+            except RuntimeError:
+                pass       # 窗口已销毁，结果没人要了
 
         self._test_thread = threading.Thread(target=work, daemon=True,
                                              name="llm-conn-test")
@@ -430,6 +435,21 @@ class SettingsDialog(QDialog):
         else:
             self.test_result.setText(f"✗ {res.message}")
         self.test_detail = res.detail
+
+    def closeEvent(self, e):  # noqa: N802
+        """关窗口时把后台测试收尾。
+
+        线程是 daemon 的，但 daemon 线程在解释器退出时被杀，
+        如果它正卡在 emit 上，就会留下半个状态 —— 表现为
+        退出时偶发 0xC0000409（STATUS_STACK_BUFFER_OVERRUN）。
+        这里先标记取消，再给它一点时间自己收工。
+        """
+        if self._test_cancel is not None:
+            self._test_cancel.set()
+        t = self._test_thread
+        if t is not None and t.is_alive():
+            t.join(timeout=1.0)
+        super().closeEvent(e)
         if res.detail:
             self.test_detail_label.setText(res.detail)
             self.test_detail_label.setVisible(True)

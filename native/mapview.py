@@ -490,6 +490,9 @@ class MapView(QWidget):
         self._sel_layer: str | None = None      # 框选的目标图层，由主窗口同步过来
         self._band: tuple | None = None         # 正在拖的选框（屏幕坐标）
         self._hl: tuple | None = None           # 持久高亮（属性表点行），和 hover 分开
+        #: 算子高亮：{图层 id: (要素下标数组, 颜色)}。和 _hl 分开画，
+        #: 因为 _hl 是「正在看的单个要素」，这个是「一批被高亮的要素」。
+        self._hl_set: dict[str, tuple[np.ndarray, str]] = {}
         self._last_partial_frame = 0.0
 
         # 帧缓存
@@ -1885,6 +1888,30 @@ class MapView(QWidget):
         self._hl = None
         self.update()
 
+    def set_highlight_set(self, layer_id: str, indices, color: str = "#d97757") -> None:
+        """高亮一批要素（highlight 算子的结果）。
+
+        只记下标，几何在绘制时现取 —— 免得复制一份几何占内存。
+        """
+        if indices is None:
+            self._hl_set.pop(layer_id, None)
+        else:
+            idx = np.asarray(list(indices), dtype=np.int64)
+            self._hl_set[layer_id] = (idx, color or "#d97757")
+        self.update()
+
+    def clear_highlight_set(self, layer_id: str | None = None) -> None:
+        """清掉算子高亮；不给 layer_id 就全清。"""
+        if layer_id is None:
+            self._hl_set.clear()
+        else:
+            self._hl_set.pop(layer_id, None)
+        self.update()
+
+    def highlight_set_count(self) -> int:
+        """当前高亮的要素总数（给状态栏显示）。"""
+        return int(sum(len(v[0]) for v in self._hl_set.values()))
+
     def zoom_to_feature(self, layer_id: str, pos_idx: int, pad: float = 0.35) -> None:
         lay = next((l for l in self.layers if l.id == layer_id), None)
         c = self._cache.get(layer_id)
@@ -2013,6 +2040,7 @@ class MapView(QWidget):
         # 经纬网画在帧缓存**之上**，这样缩放平移时网格始终对齐屏幕
         self._draw_grid(p)
         self._draw_selection(p)
+        self._draw_highlight_set(p)
         self._draw_highlight(p)
         self._draw_hover(p)
         self._draw_band(p)
@@ -2076,6 +2104,62 @@ class MapView(QWidget):
         p.setPen(pen)
         p.drawPath(path)
         p.restore()
+
+    def _draw_highlight_set(self, p: QPainter) -> None:
+        """算子高亮：一批要素用强调色描边 + 淡填充画出来。
+
+        和 _draw_highlight（属性表点行的单个要素）分开：
+        那个更重（双圈），这个是「一批命中要素」的轻量样式。
+        """
+        if not self._hl_set:
+            return
+        for lid, (idx, color) in self._hl_set.items():
+            if len(idx) == 0:
+                continue
+            c = self._cache.get(lid)
+            if c is None or c.geoms is None:
+                continue
+            n = len(c.geoms)
+            sel = idx[(idx >= 0) & (idx < n)]
+            if len(sel) == 0:
+                continue
+            base = QColor(color or "#d97757")
+            fill = QColor(base)
+            fill.setAlpha(70)
+            pen_color = QColor(base)
+            pen_color.setAlpha(235)
+
+            p.save()
+            p.translate(self.tx, self.ty)
+            p.scale(self.scale, self.scale)
+            # cosmetic：画笔在世界坐标变换下，非 cosmetic 的宽度会
+            # 随缩放变成上千万像素，把视口糊成一块实色。
+            pen = QPen(pen_color)
+            pen.setWidthF(2.2)
+            pen.setCosmetic(True)
+            pen.setJoinStyle(Qt.RoundJoin)
+            p.setPen(pen)
+            p.setBrush(QBrush(fill))
+            point_pts = []
+            for i in sel:
+                geom = c.geoms[int(i)]
+                if geom is None or geom.is_empty:
+                    continue
+                path = self._geom_path(geom)
+                if path is None:          # 点要素：留到屏幕坐标下画
+                    point_pts.append(geom)
+                    continue
+                p.drawPath(path)
+            p.restore()
+            # 点要素必须在屏幕坐标下画（不能套世界坐标变换）
+            if point_pts:
+                p.save()
+                p.setBrush(QBrush(fill))
+                p.setPen(QPen(pen_color, 1))
+                for geom in point_pts:
+                    pt = self.lonlat_to_screen(geom.x, geom.y)
+                    p.drawEllipse(pt, 4.5, 4.5)
+                p.restore()
 
     def _draw_band(self, p: QPainter) -> None:
         if self._band is None:

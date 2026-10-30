@@ -208,6 +208,14 @@ def _layer(desc: str = "图层名") -> Param:
 
 def _build_builtins() -> dict[str, ToolSpec]:
     specs = [
+        ToolSpec("highlight", "高亮显示", "概览",
+                  "在地图上高亮显示要素：不改数据，只画强调样式。"
+                  "expression 为空表示高亮全部要素；给了表达式就高亮满足条件的要素",
+                  {"layer": _layer(),
+                   "expression": _p("expression", "string", "筛选表达式，可为空（高亮全部）", False),
+                   "color": _p("color", "string", "高亮颜色", False, "#d97757")},
+                  "在地图上高亮显示「{L}」中面积大于 10000 的要素",
+                  output="none"),
         ToolSpec("describe", "数据体检", "概览",
                  "数据体检：要素数、几何类型、坐标系、字段清单、总面积/长度",
                  {"layer": _layer()},

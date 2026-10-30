@@ -227,6 +227,42 @@ def extract_new_operator(parsed: dict) -> dict | None:
     return {"brief": brief, "reason": str(op.get("reason") or "").strip()}
 
 
+def _salvage_reply(raw: str) -> str:
+    """从模型没按格式返回的原话里，尽量捞出一句能看懂的话。
+
+    场景：模型返回了 JSON，但里面没有 plan/reply/clarify（字段名不对，
+    或者内容本身就不是计划）。直接扔掉太可惜 —— 模型可能已经用自然
+    语言说清楚了要做的事，那就是最好的回复。
+
+    规则：
+    · 是纯 JSON → 没什么可捞的（返回空）；
+    · 是自然语言 → 直接用；
+    · 是 JSON 但字段名不认识 → 看能不能在里面找到像回复的字符串字段。
+    """
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    # 1) 纯自然语言：直接用
+    if not text.startswith("{") and not text.startswith("["):
+        return text[:400]
+    # 2) 是 JSON：看看有没有能当回复用的字符串字段
+    parsed = _parse_json_payload(text)
+    if isinstance(parsed, dict):
+        for k in ("reply", "message", "answer", "note", "response",
+                  "说明", "回复", "描述", "summary", "explanation"):
+            v = parsed.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()[:400]
+        # 3) 嵌套一层（有些模型会包 {"result": {...}}）
+        for v in parsed.values():
+            if isinstance(v, dict):
+                for k in ("reply", "message", "answer", "note", "说明", "回复"):
+                    s = v.get(k)
+                    if isinstance(s, str) and s.strip():
+                        return s.strip()[:400]
+    return ""
+
+
 def normalize_plan(parsed: dict) -> tuple[list[dict], str]:
     """把模型给的步骤整理成 {tool, args} —— 这是执行器唯一认的格式。
 
@@ -816,6 +852,12 @@ class Planner:
         if re.search(r"合并|拼合|合到一起|merge|拼接|追加", low):
             return S("merge", layers=ids or ["all"])
 
+        # ---- 高亮显示（必须早于属性筛选：句式很像，都是「条件 + 图层」）
+        #      「高亮显示面积大于 10000 的要素」→ 高亮全部 + 条件
+        if re.search(r"高亮|突出显示|凸显|标亮|闪烁|闪一下|highlight|闪", low):
+            expr = self._build_expr(c, tgt)
+            return S("highlight", layer=tgt, expression=expr)
+
         # ---- 属性筛选（必须早于"面积统计"，否则"筛选面积大于X"会被误判）
         if re.search(r"筛选|过滤|选出|找出|只要|保留|查询|filter", low):
             expr = self._build_expr(c, tgt)
@@ -892,10 +934,13 @@ class Planner:
         ops = [(r">=|大于等于|不小于|不少于", ">="), (r"<=|小于等于|不大于|不超过", "<="),
                (r">|大于|超过|高于|多于", ">"), (r"<|小于|低于|少于|不足", "<"),
                (r"==|＝|等于|是", "==")]
+        # 用户嘴里的字段名和真实字段名经常对不上（「面积」↔ area_m2/area）。
+        # 先把中文说法翻译成真实字段名，再照常匹配。
+        c2, _alias = self._apply_field_aliases(c, lid, fields)
         for f in fields:
-            if f not in c:
+            if f not in c2:
                 continue
-            tail = c.split(f, 1)[1]
+            tail = c2.split(f, 1)[1]
             for pat, op in ops:
                 m = re.match(r"\s*(?:" + pat + r")\s*['\"]?([\u4e00-\u9fa5A-Za-z0-9_.\-]+)['\"]?", tail)
                 if m:
@@ -903,10 +948,38 @@ class Planner:
                     q = f"'{val}'" if re.search(r"[\u4e00-\u9fa5]", val) else val
                     return f"{f} {op} {q}"
         # 直接给出表达式
-        m = re.search(r"([\u4e00-\u9fa5A-Za-z_]\w*)\s*(>=|<=|>|<|==)\s*['\"]?([\w\u4e00-\u9fa5.]+)['\"]?", c)
+        m = re.search(r"([\u4e00-\u9fa5A-Za-z_]\w*)\s*(>=|<=|>|<|==)\s*['\"]?([\w\u4e00-\u9fa5.]+)['\"]?", c2)
         if m:
             return f"{m.group(1)} {m.group(2)} {m.group(3)}"
         return None
+
+    #: 用户口语里的字段名 -> 可能的真实字段名（按顺序尝试）
+    _FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+        "面积": ("area_m2", "area", "Area", "AREA", "面积", "shape_area"),
+        "周长": ("perim_m", "perimeter", "length", "周长", "Shape_Leng"),
+        "长度": ("length", "perim_m", "Shape_Leng", "长度"),
+        "人口": ("population", "pop", "人口", "POPULATION"),
+        "名称": ("name", "名称", "Name", "NAME", "title"),
+        "类型": ("type", "kind", "类型", "TYPE", "class"),
+        "等级": ("level", "grade", "等级", "LEVEL"),
+        "编号": ("id", "code", "编号", "ID", "CODE"),
+    }
+
+    def _apply_field_aliases(self, c: str, lid: str | None,
+                             fields: list[str]) -> tuple[str, str | None]:
+        """把「面积」这类中文说法换成图层里真实存在的字段名。
+
+        返回 (替换后的句子, 用到的真实字段名)。
+        """
+        if not fields:
+            return c, None
+        for zh, cands in self._FIELD_ALIASES.items():
+            if zh not in c:
+                continue
+            for cand in cands:
+                if cand in fields and cand != zh:
+                    return c.replace(zh, cand), cand
+        return c, None
 
     # ---------------- LLM 解析
     def _call_llm(self, cfg: dict, msgs: list[dict], json_mode: bool,
@@ -1092,10 +1165,19 @@ class Planner:
         for attempt in range(3):
             msgs = list(base_msgs)
             if attempt:
+                # 重试时要**具体**告诉模型上次错在哪，
+                # 光说「只输出 JSON」它还会犯同样的错。
                 msgs.append({"role": "assistant", "content": last_err[:1200] or "(上一条不是合法 JSON)"})
                 msgs.append({"role": "user", "content":
-                             "只输出那一个 JSON 对象。plan 为空就只输出 clarify 或 reply；"
-                             "不要任何其他文字。"})
+                             "上一条不符合要求。重新回答，并且：\n"
+                             "1. 只输出一个 JSON 对象，不要 markdown 代码块、不要任何解释文字；\n"
+                             "2. 对象里必须有 plan 字段（数组）—— "
+                             "要做的事写在 plan 里，没有要做的就写 []，"
+                             "同时用 reply 说一句话；\n"
+                             "3. 每个步骤对象只写 tool 和 args 两个字段，"
+                             "例如 {\"tool\":\"buffer\",\"args\":{\"layer\":\"小区\",\"distance\":500}}；\n"
+                             "4. plan 为空但需要用户补充信息时，用 "
+                             "{\"clarify\":{\"question\":\"...\",\"options\":[\"...\"]}}。"})
             out = self._call_llm(cfg, msgs, json_mode=True,
                                  max_tokens=2200 if attempt == 0 else 3200)
             if isinstance(out, dict):           # 网络/接口错误
@@ -1116,11 +1198,17 @@ class Planner:
                 continue
             last_err = content
 
-        # 两次都没拿到结构化结果：把模型原话当回复展示，总比一句“解析失败”有用
-        words = (last_err or "").strip()
-        if words and not words.startswith("{"):
-            return {"plan": [], "reply": words[:400]}
-        return {"error": "大模型返回的内容解析不出步骤，已回退规则引擎。"}
+        # 三次都没拿到结构化结果。
+        # 关键：**别只说「解析失败」** —— 那是死胡同，用户不知道该干嘛。
+        # 模型原话里往往有信息（它可能只是想解释，或者说了要做的事），
+        # 能提取就提取；提不出来也要给一句能指导下一步的话。
+        raw = (last_err or "").strip()
+        reply = _salvage_reply(raw)
+        if reply:
+            return {"plan": [], "reply": reply}
+        return {"error": ("大模型没能给出可执行的结构化结果，已回退规则引擎。"
+                          "可以试试说得更具体些，比如「对「小区」做 300 米缓冲区」；"
+                          "如果反复出现，去设置里点「测试连接」确认模型配置是否正常。")}
 
     def llm_repair(self, text: str, executed: list[dict], failed_step: dict,
                    error: str, cfg: dict, history: list[dict]) -> list[dict] | None:

@@ -26,6 +26,8 @@ GUI_TESTS = {
     "test_scroll.py", "test_step_buttons.py", "test_ux_batch.py",
     "test_ux_more.py", "test_visible.py", "test_agent_v2.py",
     "test_task_center.py", "test_clarify_flow.py", "test_settings_dialog.py",
+    "test_mentions_desktop.py", "test_highlight_desktop.py",
+    "test_highlight_agent.py",
 }
 
 #: 需要外部服务（真实 LLM 接口）的测试，跳过。
@@ -41,8 +43,12 @@ ORDER = [
     "test_memory_phase3.py",
     "test_api_formats.py",
     "test_conn_test.py",
+    "test_llm_parse_fail.py",
     "test_mentions.py",
     "test_mentions_desktop.py",
+    "test_highlight.py",
+    "test_highlight_desktop.py",
+    "test_highlight_agent.py",
     "test_multitask.py",
     "test_runtime_phase2.py",
     "test_memory_ui.py",

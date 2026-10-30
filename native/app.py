@@ -1897,12 +1897,29 @@ class MainWindow(QMainWindow):
                 self._push_undo({"kind": "add", "lids": [lid for lid, _ in acts], "layers": acts})
             self.current_layer = created[-1]["id"]
         self.refresh_layers()
+        # highlight 算子只改 store 里的高亮集合，不产新图层 ——
+        # 这里把集合同步到地图，让用户真的看到高亮。
+        self._sync_highlight_to_map()
         if created:
             self.map.fit_layer(created[-1]["id"])
             self.set_status(f"完成 {len(steps)} 步，生成 {len(created)} 个图层")
         else:
-            self.set_status(f"完成 {len(steps)} 步")
+            n = self.map.highlight_set_count()
+            if n:
+                self.set_status(f"完成 {len(steps)} 步，高亮 {n} 个要素")
+            else:
+                self.set_status(f"完成 {len(steps)} 步")
         self._refresh_planner_pill(res.get("source"))
+
+    def _sync_highlight_to_map(self) -> None:
+        """把 store 里的高亮集合同步到地图视图。"""
+        try:
+            self.map.clear_highlight_set()
+            for lid, (idx, color) in (self.store.highlights or {}).items():
+                if idx:
+                    self.map.set_highlight_set(lid, idx, color)
+        except Exception:
+            pass
 
     def _record_run_steps(self, res: dict, steps: list[dict]) -> None:
         """把这次运行的步骤写进 DB（steps 表 + step.finished 事件）。
