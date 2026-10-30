@@ -910,7 +910,8 @@ class Planner:
 
     # ---------------- LLM 解析
     def _call_llm(self, cfg: dict, msgs: list[dict], json_mode: bool,
-                  max_tokens: int = 1600) -> tuple[str, str] | dict:
+                  max_tokens: int = 1600, timeout: int = 45,
+                  attempts: int = 3) -> tuple[str, str] | dict:
         """发一次请求，返回 (content, finish_reason) 或 {"__error__": ...}。
 
         · 请求怎么拼、响应怎么取，交给 `app.api_formats`（支持 OpenAI /
@@ -918,6 +919,9 @@ class Planner:
         · 429/5xx 做短退避重试（很多兼容接口会偶发 502）；
         · 只有最终失败才写 `_llm_fail_at`，避免一次 429 让后面 60 秒都不用模型；
         · JSON mode 不支持时退回普通模式。
+
+        ``timeout`` / ``attempts`` 给「测试连接」用：
+        连通性检查要的是**快速**反馈，超时 45 秒 × 重试 3 次会把界面冻住两分钟。
         """
         fmt = (cfg.get("api_format") or "openai_chat").strip() or "openai_chat"
         try:
@@ -927,10 +931,11 @@ class Planner:
             return {"__error__": f"接口格式配置有误：{e}", "__status__": 0}
         body = api_formats.dumps(payload)
         req = urllib.request.Request(url, data=body, headers=headers)
+        attempts = max(1, int(attempts))
         last = ""
-        for attempt in range(3):
+        for attempt in range(attempts):
             try:
-                with urllib.request.urlopen(req, timeout=45) as r:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
                     data = json.loads(r.read().decode())
                 try:
                     content, finish = api_formats.parse_response(fmt, data)
@@ -950,8 +955,9 @@ class Planner:
                     pass
                 if json_mode and e.code in (400, 404, 422):
                     # 服务端不支持 response_format：退回普通 JSON 文本模式
-                    return self._call_llm(cfg, msgs, json_mode=False, max_tokens=max_tokens)
-                if e.code in (429, 500, 502, 503, 504) and attempt < 2:
+                    return self._call_llm(cfg, msgs, json_mode=False, max_tokens=max_tokens,
+                                          timeout=timeout, attempts=attempts)
+                if e.code in (429, 500, 502, 503, 504) and attempt < attempts - 1:
                     time.sleep(1.2 * (attempt + 1))
                     continue
                 self._llm_fail_at = time.time()
@@ -959,7 +965,7 @@ class Planner:
                         "__status__": int(e.code)}
             except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
                 last = str(e)
-                if attempt < 2:
+                if attempt < attempts - 1:
                     time.sleep(0.8 * (attempt + 1))
                     continue
                 self._llm_fail_at = time.time()

@@ -1,7 +1,9 @@
 """对话框：属性表、模型设置、多图层选择、关于。"""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+import threading
+
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
@@ -9,6 +11,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDia
                                QVBoxLayout, QWidget)
 
 from app import api_formats
+from app import conn_test
 
 from .format import fmt_num
 
@@ -172,7 +175,13 @@ class SettingsDialog(QDialog):
     OpenAI Chat Completions、OpenAI Responses、Anthropic Messages、
     Gemini generateContent、Ollama 原生各有各的 URL、请求头和响应结构。
     选好格式后还能手动覆盖端点路径和请求头，用来对接自建网关。
+
+    「测试连接」在后台线程里发一个最小请求，验证地址 / Key / 模型 / 格式对不对；
+    失败时按状态码给出**具体是什么问题、怎么改**，而不是甩一段原始 JSON。
     """
+
+    #: 后台线程的结果回到主线程
+    _test_done = Signal(object)
 
     PRESETS = {
         "DeepSeek": ("https://api.deepseek.com/v1", "deepseek-chat", "openai_chat"),
@@ -189,6 +198,9 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("模型设置")
         self.setMinimumWidth(520)
+        #: 正在跑测试的线程 / 取消标志
+        self._test_thread: threading.Thread | None = None
+        self._test_cancel: threading.Event | None = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 14, 16, 14)
@@ -282,12 +294,29 @@ class SettingsDialog(QDialog):
         brow.setSpacing(6)
         self.btn_test = QPushButton("测试连接")
         self.btn_test.setObjectName("chip")
+        self.btn_test.setToolTip("发一个最小请求，验证地址 / Key / 模型 / 格式对不对")
         self.btn_test.clicked.connect(self._test)
         brow.addWidget(self.btn_test)
+        self.btn_test_cancel = QPushButton("取消")
+        self.btn_test_cancel.setObjectName("chip")
+        self.btn_test_cancel.setToolTip("停止正在进行的测试")
+        self.btn_test_cancel.clicked.connect(self._cancel_test)
+        self.btn_test_cancel.hide()
+        brow.addWidget(self.btn_test_cancel)
         self.test_result = QLabel("")
+        self.test_result.setWordWrap(True)
         self.test_result.setObjectName("tiny")
         brow.addWidget(self.test_result, 1)
         root.addLayout(brow)
+
+        # 测试结果的详细说明（建议怎么改 / 模型回了什么）
+        self.test_detail_label = QLabel("")
+        self.test_detail_label.setWordWrap(True)
+        self.test_detail_label.setObjectName("tiny")
+        self.test_detail_label.hide()
+        root.addWidget(self.test_detail_label)
+        #: 上次测试的详细说明（外部可读）
+        self.test_detail = ""
 
         self.enabled = QCheckBox("启用大模型规划（失败自动回退规则引擎）")
         self.enabled.setChecked(bool(cfg.get("enabled")))
@@ -308,6 +337,7 @@ class SettingsDialog(QDialog):
         self.adv.toggled.connect(self._on_adv_toggled)
         self.base.textChanged.connect(self._refresh_preview)
         self.model.textChanged.connect(self._refresh_preview)
+        self._test_done.connect(self._on_test_done)
         self._refresh_preview()
 
     @property
@@ -349,23 +379,60 @@ class SettingsDialog(QDialog):
             self.preview.setText(f"（预览失败：{e}）")
 
     def _test(self) -> None:
-        """发一个最小请求，验证地址/密钥/格式对不对。"""
+        """测试连接。
+
+        请求放到后台线程跑：主线程被 HTTP 阻塞住的话，界面会整块冻住
+        （超时 12 秒起，网关不通时更久），窗口拖不动、关不掉。
+        """
+        if self._test_thread is not None and self._test_thread.isRunning():
+            return
+        cfg = self.value()
+        self._test_cancel = threading.Event()
+        self.btn_test.setEnabled(False)
+        self.btn_test_cancel.show()
         self.test_result.setText("正在测试…")
-        QApplication.processEvents()
-        try:
-            from app.agent import Planner
-            from app.engine import Store
-            p = Planner(Store())
-            out = p._call_llm(self.value(), [{"role": "user", "content": "回复「好」两个字"}],
-                              False, max_tokens=32)
-        except Exception as e:  # noqa: BLE001
-            self.test_result.setText(f"测试失败：{e}")
-            return
-        if isinstance(out, dict):
-            self.test_result.setText(f"测试失败：{out.get('__error__', '未知错误')}")
-            return
-        content = (out[0] or "").strip()
-        self.test_result.setText(f"测试成功：{content[:40]}" if content else "测试成功（空回复）")
+
+        def work():
+            try:
+                res = conn_test.test_connection(cfg)
+            except Exception as e:  # noqa: BLE001
+                res = conn_test.TestResult(False, f"测试出错：{e}")
+            # 回到主线程再改界面
+            self._test_done.emit(res)
+
+        self._test_thread = threading.Thread(target=work, daemon=True,
+                                             name="llm-conn-test")
+        self._test_thread.start()
+
+    def _cancel_test(self) -> None:
+        """请求取消正在进行的测试。
+
+        urllib 的 urlopen 不能中途打断，但我们可以不让结果更新界面 ——
+        用户至少能关掉窗口，不用干等。
+        """
+        if self._test_cancel is not None:
+            self._test_cancel.set()
+        self.test_result.setText("已取消测试")
+        self._test_finish_ui()
+
+    def _test_finish_ui(self) -> None:
+        self.btn_test.setEnabled(True)
+        self.btn_test_cancel.hide()
+
+    def _on_test_done(self, res) -> None:
+        """后台线程的结果回到主线程。"""
+        if self._test_cancel is not None and self._test_cancel.is_set():
+            return                      # 用户已取消，别再覆盖提示
+        self._test_finish_ui()
+        if res.ok:
+            self.test_result.setText(f"✓ {res.message}"
+                                     + (f"（{res.elapsed:.1f} 秒）" if res.elapsed else ""))
+        else:
+            self.test_result.setText(f"✗ {res.message}")
+        self.test_detail = res.detail
+        if res.detail:
+            self.test_detail_label.setText(res.detail)
+            self.test_detail_label.setVisible(True)
 
     def value(self) -> dict:
         overrides: dict = {}

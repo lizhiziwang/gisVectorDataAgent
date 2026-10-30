@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -93,7 +94,30 @@ def boom(*a, **kw):
 import urllib.request
 urllib.request.urlopen = boom
 d4._test()
-check("测试失败有提示", "失败" in d4.test_result.text(), True)
+# 按钮在后台线程里跑，UI 不能被冻住
+check("点了立刻返回（界面没冻住）", d4.btn_test.isEnabled(), False)
+for _ in range(200):
+    app.processEvents()
+    time.sleep(0.02)
+    if d4._test_thread is None or not d4._test_thread.is_alive():
+        break
+app.processEvents()
+check("测试失败有提示", "✗" in d4.test_result.text(), True)
+check("提示是人话不是异常", "HTTPError" not in d4.test_result.text(), True)
+check("按钮恢复可用", d4.btn_test.isEnabled(), True)
+check("取消按钮已隐藏", d4.btn_test_cancel.isVisible(), False)
+
+print("[8] 缺配置时也能测（不发请求，直接说缺什么）")
+d5 = SettingsDialog({"api_key": "", "base_url": "", "model": "", "enabled": True})
+d5._test()
+for _ in range(200):
+    app.processEvents()
+    time.sleep(0.02)
+    if d5._test_thread is None or not d5._test_thread.is_alive():
+        break
+app.processEvents()
+check("提示缺地址或缺 Key", "✗" in d5.test_result.text(), True)
+check("有具体说明", bool(d5.test_detail), True)
 
 print("\n结论:", "PASS" if not fails else f"FAIL {fails}")
 sys.exit(0 if not fails else 1)
