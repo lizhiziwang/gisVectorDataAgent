@@ -14,6 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ.setdefault("GIS_AGENT_CONFIRM_STEPS", "0")
 os.environ["GIS_AGENT_PERSIST"] = "0"
 
 import geopandas as gpd
@@ -102,7 +103,10 @@ def wait_idle(win, timeout=8.0):
     while time.time() - t0 < timeout:
         app.processEvents()
         snap = win.tasks.snapshot()
-        if not [t for t in snap if t.get("status") in ("queued", "running", "waiting")]:
+        active = [t for t in snap if t.get("status") in ("queued", "running", "waiting")]
+        # 任务状态先变 succeeded、done 事件随后才到；必须等 handler 清掉，
+        # 否则会在 `_on_plan_done` 之前检查 _pending_clarify（测试竞态）。
+        if not active and not win._task_handlers:
             return True
         time.sleep(0.02)
     return False

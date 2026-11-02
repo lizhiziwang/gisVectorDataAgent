@@ -38,19 +38,17 @@ while time.perf_counter() - t0 < 40:
 app.processEvents()
 
 # ---- 分组几何打印 ----
-gl = win.tool_grid
-print("== 工具库网格 ==", f"行数 {gl.rowCount()} 列数 {gl.columnCount()}", flush=True)
-for r in range(gl.rowCount()):
-    cells = []
-    for c in range(gl.columnCount()):
-        it = gl.itemAtPosition(r, c)
-        if it is None or it.widget() is None:
-            cells.append("·")
-            continue
-        w = it.widget()
-        txt = w.text() if isinstance(w, (QLabel, QPushButton)) else w.objectName()
-        cells.append(f"{txt}({w.width()}x{w.height()})")
-    print(f"  row{r:>2}: " + " | ".join(cells), flush=True)
+print("== 工具库两级分类 ==", flush=True)
+for i in range(win.tool_box.count()):
+    it = win.tool_box.itemAt(i)
+    sec = it.widget() if it else None
+    if sec is None or not hasattr(sec, "header"):
+        continue
+    print(f"  {sec.header.text()}  高 {sec.height()}  hint {sec.sizeHint().height()}", flush=True)
+    for j in range(sec.body_layout.count()):
+        gs = sec.body_layout.itemAt(j).widget()
+        if gs is not None and hasattr(gs, "header"):
+            print(f"    {gs.header.text()}  高 {gs.height()}", flush=True)
 
 print(f"\n算子数 badge = {win.tool_badge.text()}", flush=True)
 host = win.tool_host

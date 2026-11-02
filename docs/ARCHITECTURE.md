@@ -21,11 +21,16 @@ gis-agent/
 ├── preview.png              README 首图
 │
 ├── app/                     与界面无关的「引擎层」：数据、算子、规划、IO
-│   ├── engine.py            Store（图层仓库）+ Layer + 25 个算子的真实实现 + Result
+│   ├── engine.py            Store（图层仓库）+ Layer + 26 个矢量算子 + Result
+│   ├── raster.py            RasterLayer（鸭子类型图层）+ rasterio 读窗口 / 拉伸
+│   ├── raster_ops.py        8 个通用栅格算子（体检/裁剪/重投影/重采样/计算/分区统计/镶嵌/转矢量）
+│   ├── raster_clip_worker.py 栅格裁剪子进程（隔离 GDAL/GIL，主界面不冻结）
+│   ├── skills.py            Agent 技能卡解析 / 启停 / 规划提示词上下文
 │   ├── agent.py             两级规划器（规则 / 大模型）+ Agent 闭环 + 计划预检 + 算子签名表
 │   ├── tool_registry.py     算子契约单一事实源：参数 schema / 模板 / 分组 / 校验
 │   ├── custom_ops.py        自定义算子：AST 白名单校验、受限执行、落盘与装载
 │   ├── io_utils.py          读写矢量数据：编码择优、zip 解压、导出 4 种格式
+│   ├── gdb.py               Esri FileGDB（.gdb）读取：pyopenfilegdb → GeoDataFrame
 │   ├── samples.py           生成 4 个示例图层（成都某片区）
 │   ├── config.py            模型设置（Base URL / Key / Model）的规范化与解释
 │   ├── util.py              JSON 安全化（NaN/Inf/时间/numpy 标量 → JSON 友好）
@@ -33,8 +38,15 @@ gis-agent/
 │
 ├── native/                  纯 Qt 桌面界面（QWidget + QPainter，无 WebView）
 │   ├── app.py               主窗口：三栏布局、图层面板、算子面板、状态栏、撤销栈、载入队列
-│   ├── mapview.py           自绘地图 + 渲染管线（渲染集、渲染线程、缓存、拾取、选区）
-│   ├── chat.py              对话面板：气泡、步骤卡片、输入容器、指令历史、贴底滚动
+│   ├── mapview.py           自绘地图 + 矢量渲染管线（渲染集、渲染线程、缓存、拾取、选区）
+│   ├── compare.py           地图对比容器（左右/上下分屏、卷帘、透明度、闪烁、视图同步）
+│   ├── agent_settings.py    Agent 设置窗口（技能管理 / 每步确认开关 / 模型设置入口）
+│   ├── rasterview.py        独立栅格渲染管线（RasterViewPort / 线程 / 缓存 / 拉伸）
+│   ├── proj.py              两条管线共用的 Web Mercator 投影函数
+│   ├── chat.py              对话面板：对话/轨迹、任务胶囊、工具状态、模型选择器、统计、计划卡、步骤卡片
+│   ├── workspace.py         左栏工作区：gis-agent → 未分组 → 会话 / 会话图层引用
+│   ├── pyramid.py           栅格 overview 检测 + GDAL C API 生成 .ovr（QThread 进度）
+│   ├── taskcenter.py        地图顶部任务通知（TaskNotice）+ 旧面板测试用 TaskCenter
 │   ├── dialogs.py           属性表（分页/排序/筛选）、模型设置、多图层导入、算子确认
 │   ├── theme.py             全局 QSS（暖白底 + 陶土橙，参照 Claude Code 桌面端）
 │   ├── format.py            数值/单位/字段中文名格式化
@@ -52,6 +64,9 @@ gis-agent/
 │   ├── perf_roads.py        道路绘制微基准（笔宽、端帽、抗锯齿对比）
 │   ├── perf_backend.py      CPU 光栅 vs OpenGL 逐图层对比
 │   ├── smoke_app.py         整机冒烟：真启动、真载入、截图、关闭
+│   ├── test_raster.py       栅格载入/混合渲染/显隐/缩放端到端
+│   ├── test_raster_ops.py   8 个通用栅格算子与规则规划/$prev 回归
+│   ├── test_gdb.py          FileGDB 多要素类导入 / ZIP / 桌面端接线
 │   ├── shot_window.py       整窗截图（真字体路径，用于 README 配图）
 │   ├── shot_tools.py        左栏截图 + 分组几何打印
 │   ├── make_icon_assets.py  由绘制代码生成 icon.png / icon.ico
@@ -68,9 +83,9 @@ gis-agent/
 ```
    native/  ──────┐
    (Qt 界面)      ├──►  app/  ──►  geo 生态
-   web/     ──────┘     (引擎)     (geopandas / shapely / pyproj)
+   web/     ──────┘     (引擎)     (geopandas / shapely / pyproj / rasterio / pyopenfilegdb)
                           │
-                          └──►  data/  （运行时产生：上传数据、设置、自定义算子）
+                          └──►  data/  （运行时产生：上传数据、设置、自定义算子、栅格派生结果）
 ```
 
 `app/` 里**不出现任何 Qt 或 FastAPI 的 import**——这是刻意的：桌面版和网页版共用同一套算子与规划逻辑，
@@ -81,10 +96,16 @@ gis-agent/
 ## 2. 数据模型
 
 ```python
-Layer(id, name, gdf, color, op, source, parent)   # 一个图层 = 一份 GeoDataFrame + 元信息
-Store.layers: dict[str, Layer]                    # 有序字典，顺序即渲染顺序
+Layer(id, name, gdf, color, op, source, parent)   # 一个矢量图层 = GeoDataFrame + 元信息
+RasterLayer(id, name, info, color, op, source)    # 一个栅格图层 = 元信息 + 文件路径（不预读像素）
+Store.layers: dict[str, Layer | RasterLayer]      # 有序字典，顺序即渲染顺序
 Result(ok, message, layer=None, warnings=[], data={})   # 每个算子的返回
 ```
+
+`RasterLayer` 是**鸭子类型**：字段形状对齐 `Layer`，但访问 `.gdf` 会抛中文
+`RasterError`——这样图层面板/缩放/显隐/导出不用分叉，而误用矢量算子时
+在校验期就得到「这是栅格，不能用矢量算子」的明确提示。栅格算子的结果会写回
+`data/cache/R*.tif`，登记成新的 `RasterLayer`，`Store.remove/clear` 负责清理。
 
 `Layer.gdf` 是懒加载属性：大图层可被 `Store` 按内存预算换出到 `data/cache/`，
 内存里只保留 `meta`（count/bounds/fields）；下次访问时从 GeoParquet/GPKG 读回。
@@ -147,19 +168,21 @@ Result(ok, message, layer=None, warnings=[], data={})   # 每个算子的返回
 ### 3.4 线程模型
 
 ```
-GUI 线程                    Worker(QThread)              常驻渲染线程
-─────────                   ─────────────────            ──────────────
+GUI 线程                    Worker(QThread)              渲染线程 / 合成线程
+─────────                   ─────────────────            ────────────────────
 事件循环 / 绘制             解析数据、跑算子             画各图层到 QImage
   │                            │                            │
-  ├─ 10ms 一片地构建路径        ├─ gpd.read_file            ├─ 队列只留最新一帧
-  ├─ 合成图层图                ├─ run_agent                 ├─ epoch 不符直接丢弃
-  └─ paintEvent 画帧           └─ 结果回主线程              └─ 每层画完先回传
+  ├─ 10ms 一片地构建路径        ├─ gpd.read_file            ├─ 渲染线程：队列只留最新一帧
+  ├─ paintEvent 画整帧          ├─ run_agent                 ├─ 合成线程：QImage 叠层
+  └─ 只接合成好的 QImage        └─ 结果回主线程              └─ epoch 不符直接丢弃
 ```
 
 为什么这么分：
 
 - 解析 shapefile 与空间运算都**长时间持有 GIL**，必须离开 GUI 线程，否则界面直接冻住；
 - 渲染单独一条**常驻**线程（不是每次新建），队列只保留最新一帧，连续缩放时旧帧自动作废；
+- 图层合成也放到**独立合成线程**：多张大 QImage 的 `drawImage` 不再占用 UI 事件循环，
+  主线程只做一次整帧贴图；
 - 构建路径却留在 GUI 线程、按 10ms 分片——因为 QPainterPath 的创建很轻、但要访问共享数据，
   分片后界面在「准备渲染数据」阶段依然能响应。
 
@@ -223,14 +246,21 @@ run_agent(): 逐步执行，产出步骤卡片数据
 
 ---
 
-## 5. 算子体系（`app/engine.py`）
+## 5. 算子体系（`app/engine.py` + `app/raster_ops.py`）
 
 - 签名统一：`op(store, layer, **args) -> Result`，第一个参数是 `Store`（便于跨图层操作）；
+- **矢量算子**在 `engine.py`，**栅格算子**在 `raster_ops.py`；两边共用 `Result` 和
+  `Store`，但 `raster_ops` 顶层不 import rasterio（启动不加载 GDAL，执行时才惰性导入）；
 - **CRS 策略**：距离/面积运算前把几何投到 **CGCS2000 3 度带**（按数据中心经度选带，EPSG:4534–4554），
   境外退回 UTM；结果字段统一带 `_m` / `_m2` 后缀；
 - **几何有效性**：入口处 `make_valid` 并计数（>2 万要素的图层跳过逐个校验）；
 - **文本型 ID**：Shapefile 的 `osm_id` 是字符串，表达式里写数字会自动补引号，
   否则 `osm_id == 4814005` 会静默筛出 0 条；
+- **栅格结果落盘**：裁剪/重投影/重采样/计算/镶嵌的结果写到 `data/cache/R*.tif`，
+  用 `read_info()` 只读头信息登记成 `RasterLayer`；`cache_path` 指向派生文件，
+  `Store.remove/clear` 会清理，原始影像不动；
+- **栅格算子按窗口/块处理**：裁剪读窗口、重投影按输出块、计算按 1024² 块、
+  分区统计按要素 `geometry_window`，不会把大影像整幅读进内存；
 - **自定义算子**：`custom_ops.py` 先用 AST 白名单拦截 `import / while / exec / read_pickle / to_file` 等，
   再在受限命名空间里跑；先拿前 200 个要素试跑，确认后才落盘到 `data/operators/`，
   重启自动装回，与内置算子同权（工具表、提示词、工具库三处同步可见）。
@@ -256,6 +286,8 @@ run_agent(): 逐步执行，产出步骤卡片数据
 
 ```bash
 .venv\Scripts\python.exe tools\test_agent_v2.py     # 工具契约/引擎/多轮/自定义算子安全
+.venv\Scripts\python.exe tools\test_raster_ops.py   # 8 个栅格算子 + 规则规划 + $prev
+.venv\Scripts\python.exe tools\test_raster.py       # 栅格载入/混合渲染/显隐/缩放
 .venv\Scripts\python.exe tools\test_agent_llm.py    # 假 LLM：校验修复/执行修复/澄清/reply
 .venv\Scripts\python.exe tools\smoke_web.py         # 真起 uvicorn：示例/多轮/多文件上传/导出
 .venv\Scripts\python.exe tools\verify_render.py     # 完备性 + 像素比对（最该看的）
@@ -271,8 +303,10 @@ run_agent(): 逐步执行，产出步骤卡片数据
 
 ## 8. 扩展指引
 
-**加一个算子**：在 `engine.py` 写 `_my_op(store, layer, ...) -> Result` 并注册进 `OPERATIONS`，
-再到 `agent.py` 的 `TOOL_SPECS` / `TOOL_LABEL` 补签名与中文名，工具库按钮、大模型提示词、规则引擎三处自动可见。
+**加一个算子**：矢量算子在 `engine.py` 写 `_my_op(store, layer, ...) -> Result`，栅格算子在
+`raster_ops.py` 写同名签名并加入它的 `OPERATIONS`；然后在 `tool_registry.py` 加 `ToolSpec`
+（参数 schema / 模板 / 分组 / 中文名），工具库按钮、大模型提示词、规则校验三处自动可见。
+栅格算子记得只在函数体里 import rasterio，保持启动惰性。
 
 **加一个渲染特性**：先想清楚它属于哪一层——几何构建（`_build_*`）、绘制（`_paint_layer`）、
 还是交互叠加（`_draw_*`，画在屏幕坐标系）。要改画笔，记得世界坐标下必须 cosmetic。
@@ -286,5 +320,8 @@ run_agent(): 逐步执行，产出步骤卡片数据
 
 - 载入 77 万要素约 20 秒，其中 15 秒是 `pyogrio` 解析 shapefile，不是渲染；
 - 放大级别的 1 秒左右主要在几何构建（每个顶点一次 `path.lineTo`）与简化，属于每级只付一次的成本；
-- 单机单会话，图层存内存，关窗即清空（需要留存就导出 GeoJSON/GPKG）；
+- 单机单会话，图层存内存，关窗即清空（需要留存就导出 GeoJSON/GPKG）；栅格派生结果写
+  `data/cache/R*.tif`，随图层删除/清空清理；
+- 栅格工具覆盖体检/裁剪/重投影/重采样/计算/分区统计/镶嵌/转矢量，但没有栅格属性表、
+  没有伪彩色/拉伸面板；网页版没有栅格管线与栅格工具；
 - 网页版功能是桌面版的子集，且没有渲染线程与缓存分层，大图层体验明显弱于桌面版。

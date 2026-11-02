@@ -4,9 +4,9 @@
 qgsmaprendererparalleljob.cpp / qgsvectorlayerrenderer.cpp / qgssimplifymethod.h）：
 
 1. **每个图层一个渲染任务（LayerRenderJob）**
-   `_LayerJob` 各自画到**自己的一张 QImage** 上，主线程 `_compose()` 按渲染顺序
-   叠加 —— 同 `QgsMapRendererParallelJob::prepareJobs()` + `composeImage()`；
-   一层画完就能先上屏（对应 `renderingLayersFinished`）。
+   `_LayerJob` 各自画到**自己的一张 QImage** 上，常驻合成线程 `_ComposeWorker`
+   按渲染顺序叠成整帧 —— 同 `QgsMapRendererParallelJob::prepareJobs()` + `composeImage()`；
+   UI 线程只接整帧，不再逐层 drawImage。
 2. **常驻渲染线程 + 最新任务优先**
    线程不随任务销毁重建；提交新任务时只替换队列里的待办，正在跑的旧任务
    标记 cancelled 后在**图层间隙**收工 —— 同 `feedback()->cancel()` 的非阻塞取消。
@@ -42,10 +42,17 @@ from PySide6.QtGui import (QBrush, QColor, QFont, QImage, QLinearGradient, QPain
                            QPainterPath, QPen, QPixmap, QPolygonF)
 from PySide6.QtWidgets import QApplication, QWidget
 
+from .proj import project, unproject
+from .rasterview import RasterPipeline, RasterViewPort
+
 # --- 渲染参数（对照 QGIS 的默认值）-----------------------------------------
 BUILD_BUDGET_S = 0.010       # 每个事件循环片段的几何构建预算
 RENDER_DEBOUNCE_MS = 160     # 手势停下多久后重绘帧缓存
 PAN_RERENDER_RATIO = 0.3     # 平移超过视口的这个比例就重绘，避免露出空白边
+#: 但比例阈值在大窗口下太大了：900 px 宽的视口要拖 270 px 才重绘，
+#: 小幅拖拽永远等不到，右/下就留下一圈空边。所以再加一个绝对上限：
+#: 「露出的空白边超过这么多像素就重绘」，两者取小。
+PAN_RERENDER_PX = 72
 
 # 简化容差：QGIS 的 QgsSimplifyMethod 用「像素」为单位，这里取 0.8 像素。
 SIMPLIFY_PX = 0.8
@@ -76,21 +83,6 @@ LOD_KEEP_SETS = 3            # 每个图层保留几套（来回缩放直接复�
 LINE_THIN_MPP = 45.0         # 每像素地面米数超过这个值（约 1:17 万）一律画 1px
 
 LINE_WIDE_PX = 1.6           # 放大后道路的观感宽度
-
-
-def project(lon: float, lat: float) -> tuple[float, float]:
-    """经纬度 → 归一化 Web Mercator [0,1]。"""
-    x = (lon + 180.0) / 360.0
-    s = math.sin(max(-85.05, min(85.05, lat)) * math.pi / 180.0)
-    y = 0.5 - math.log((1 + s) / (1 - s)) / (4 * math.pi)
-    return x, y
-
-
-def unproject(x: float, y: float) -> tuple[float, float]:
-    lon = x * 360.0 - 180.0
-    n = math.pi - 2 * math.pi * y
-    lat = (180.0 / math.pi) * math.atan(0.5 * (math.exp(n) - math.exp(-n)))
-    return lon, lat
 
 
 def hex_alpha(hex_color: str, alpha: float) -> QColor:
@@ -320,6 +312,95 @@ class _LayerJob:
         self.completed = False
 
 
+class _ComposeJob:
+    """一次离屏合成请求（图层图 + 视口 + 显隐 + 顺序）。"""
+
+    __slots__ = ("epoch", "sig", "view", "dpr", "w", "h",
+                 "raster_items", "vec_items", "mode")
+
+    def __init__(self, epoch, sig, view, dpr, w, h, raster_items, vec_items,
+                 mode: str):
+        self.epoch = epoch
+        self.sig = sig
+        self.view = view
+        self.dpr = dpr
+        self.w = w
+        self.h = h
+        self.raster_items = raster_items   # [(QImage, own_view)]
+        self.vec_items = vec_items         # [(QImage, own_view)]
+        self.mode = mode                   # force / auto / first
+
+
+def _compose_job_image(job: _ComposeJob) -> QImage | None:
+    """在渲染线程里把已完成的图层图叠成一帧（不碰 QPixmap / 控件）。"""
+    img = QImage(max(1, job.w), max(1, job.h), QImage.Format_ARGB32_Premultiplied)
+    img.setDevicePixelRatio(job.dpr)
+    img.fill(Qt.transparent)
+    p = QPainter(img)
+    try:
+        for rimg, own in job.raster_items:
+            if rimg is None:
+                continue
+            try:
+                MapView._blit_view_image(p, rimg, own, job.view, job.dpr,
+                                         device_size=True)
+            except Exception:  # noqa: BLE001
+                pass
+        for vimg, own in job.vec_items:
+            if vimg is None:
+                continue
+            try:
+                MapView._blit_view_image(p, vimg, own, job.view, job.dpr,
+                                         device_size=False)
+            except Exception:  # noqa: BLE001
+                pass
+    finally:
+        p.end()
+    return img
+
+
+class _ComposeWorker(QThread):
+    """常驻合成线程：只负责把图层 QImage 叠成整帧，UI 线程只做一次贴图。
+
+    合成往往要处理 2~3 张 3000×1800 的 ARGB 图；以前在 UI 线程里做，
+    拖拽大栅格时会和事件循环抢时间。这里用 QImage（可跨线程绘制）离屏
+    合成，完成后把整帧交回主线程。
+    """
+
+    ready = Signal(object, object)     # _ComposeJob, QImage
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._lock = threading.Lock()
+        self._latest: _ComposeJob | None = None
+        self._wake = threading.Event()
+        self._stop = False
+
+    def submit(self, job: _ComposeJob) -> None:
+        with self._lock:
+            self._latest = job
+        self._wake.set()
+
+    def stop(self) -> None:
+        self._stop = True
+        self._wake.set()
+
+    def run(self) -> None:
+        while True:
+            self._wake.wait(0.2)
+            if self._stop:
+                return
+            with self._lock:
+                job = self._latest
+                self._latest = None
+            self._wake.clear()
+            if job is None:
+                continue
+            img = _compose_job_image(job)
+            if img is not None:
+                self.ready.emit(job, img)
+
+
 class _RenderJob:
     """一次渲染任务（对应 QGIS 的 QgsMapRendererJob / ParallelJob）。
 
@@ -511,6 +592,9 @@ class MapView(QWidget):
 
         # 图层图像（对应 QGIS 的 LayerRenderJob.img + QgsMapRendererCache）
         self._layer_imgs: dict[str, QImage] = {}   # 当前世代各图层的图
+        #: 图层 id → 这张图是**按哪个视口**渲的 (scale, tx, ty, w, h)。
+        #: 合成时用它把过期图挪到正确位置，见 `_blit_view_image`。
+        self._layer_views: dict[str, tuple] = {}
         self._img_cache: dict[str, tuple] = {}     # lid -> (cacheKey, QImage)
         self._img_keys: dict[str, tuple] = {}      # lid -> 本次请求算出的 cacheKey
         # 合成缓冲：整帧画完才整体上屏（对应 QgsMapRendererParallelJob 结束换图）
@@ -518,12 +602,33 @@ class MapView(QWidget):
         self._pending_sig: tuple | None = None
         self._pending_view: tuple | None = None
         self._pending_epoch = -1
+        #: 矢量侧是否正在重算（已提交 job、还没拿到整帧）。
+        #: 栅格管线是异步的，它完成时可能矢量 job 还在跑；那时候 `_layer_imgs`
+        #: 只是一套「缓存命中的子集」，拿它合成会把正在重画的矢量层整个抹掉。
+        #: 所以栅格回调能不能上屏，要先问这个标志。
+        self._vec_busy = False
 
         # 常驻渲染线程（最新任务优先）
         self._worker = _RenderWorker(self)
         self._worker.layerReady.connect(self._on_layer_ready)
         self._worker.frameReady.connect(self._on_frame_ready)
         self._worker.start()
+
+        # 离屏合成线程：UI 线程不再逐层 drawImage，只接整帧
+        self._compose_worker = _ComposeWorker(self)
+        self._compose_worker.ready.connect(self._on_compose_ready)
+        self._compose_worker.start()
+
+        # --- 栅格管线（完全独立的一条：自己的线程 / 缓存 / 世代号）
+        # 见 native/rasterview.py。矢量管线这边只做两件事：
+        #   1. 合成时先把栅格图铺在最底下；2. 视图变化时通知它重新请求。
+        self._vec_layers: list = []          # 参与矢量渲染链的图层
+        self._raster_layers: list = []       # 栅格图层（不进 _cache / 渲染集）
+        self._raster_imgs: dict[str, QImage] = {}
+        self._raster = RasterPipeline(self)
+        self._raster.on_layer = self._on_raster_layer
+        self._raster.on_frame = self._on_raster_frame
+
         app = QApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self.shutdown)
@@ -535,23 +640,49 @@ class MapView(QWidget):
 
     def shutdown(self) -> None:
         """退出前停掉渲染线程，避免 QThread 还在跑就被销毁（会崩进程）。"""
+        raster = getattr(self, "_raster", None)
+        if raster is not None:
+            try:
+                raster.shutdown()
+            except Exception:
+                pass
         worker = getattr(self, "_worker", None)
-        if worker is None:
-            return
-        try:
-            if worker.isRunning():
-                worker.stop()
-                worker.wait(3000)
-        except Exception:
-            pass
+        if worker is not None:
+            try:
+                if worker.isRunning():
+                    worker.stop()
+                    worker.wait(3000)
+            except Exception:
+                pass
+        compose = getattr(self, "_compose_worker", None)
+        if compose is not None:
+            try:
+                if compose.isRunning():
+                    compose.stop()
+                    compose.wait(2000)
+            except Exception:
+                pass
 
     def __del__(self):  # noqa: D105
         # 兜底：非正常退出（没有走 closeEvent）时也尽量把线程停掉
+        try:
+            raster = getattr(self, "_raster", None)
+            if raster is not None:
+                raster.shutdown()
+        except Exception:
+            pass
         try:
             worker = getattr(self, "_worker", None)
             if worker is not None and worker.isRunning():
                 worker.stop()
                 worker.wait(1500)
+        except Exception:
+            pass
+        try:
+            compose = getattr(self, "_compose_worker", None)
+            if compose is not None and compose.isRunning():
+                compose.stop()
+                compose.wait(1000)
         except Exception:
             pass
 
@@ -563,15 +694,28 @@ class MapView(QWidget):
     def set_layers(self, layers: list) -> None:
         had = bool(self.layers)
         self.layers = layers
-        keep = {l.id for l in layers}
+        # 栅格和矢量分流：栅格**不**建 _LayerCache，于是矢量那套
+        # 「渲染集 / 构建分片 / 视口筛要素」全部天然跳过它（它们的循环都
+        # 以 `_cache.get(id) is None` 开头）。这条分界线是两条管线的接缝。
+        self._vec_layers = [l for l in layers if not getattr(l, "is_raster", False)]
+        self._raster_layers = [l for l in layers if getattr(l, "is_raster", False)]
+        keep = {l.id for l in self._vec_layers}
         for lid in list(self._cache):
             if lid not in keep:
                 self._cache.pop(lid, None)
                 self._img_cache.pop(lid, None)
                 self._layer_imgs.pop(lid, None)
-        for lay in layers:
+                self._layer_views.pop(lid, None)
+        for lay in self._vec_layers:
             if lay.id not in self._cache:
                 self._cache[lay.id] = _LayerCache()
+        # 栅格管线自己维护缓存：换图层集合时同步过去
+        self._raster.set_layers(self._raster_layers)
+        self._raster.set_visible(self.visible)
+        alive = {l.id for l in self._raster_layers}
+        for lid in list(self._raster_imgs):
+            if lid not in alive:
+                self._raster_imgs.pop(lid, None)
         self._invalidate_frame()
         if not had and layers:
             self.fit_all()
@@ -583,10 +727,12 @@ class MapView(QWidget):
             self._cache.pop(layer_id, None)
             self._img_cache.pop(layer_id, None)
             self._layer_imgs.pop(layer_id, None)
+            self._layer_views.pop(layer_id, None)
         else:
             self._cache.clear()
             self._img_cache.clear()
             self._layer_imgs.clear()
+            self._layer_views.clear()
         self._invalidate_frame()
 
     def invalidate(self) -> None:
@@ -620,13 +766,32 @@ class MapView(QWidget):
     def screen_to_lonlat(self, px: float, py: float) -> tuple[float, float]:
         return unproject((px - self.tx) / self.scale, (py - self.ty) / self.scale)
 
+    @staticmethod
+    def _layer_bounds(lay):
+        """图层的经纬度范围。矢量取 gdf，栅格取元信息（两条管线共用的唯一入口）。"""
+        if getattr(lay, "is_raster", False):
+            return lay.info.bounds
+        gdf = lay.gdf
+        b = gdf.total_bounds
+        # GDB / Shapefile 常常是投影坐标（如 CGCS2000 3 度带，单位米）。
+        # fit_all() 要的是经纬度；直接拿米制 bounds 会让视口飞到经度几千万度。
+        crs = getattr(gdf, "crs", None)
+        try:
+            if crs is not None and crs.to_epsg() != 4326:
+                from pyproj import Transformer
+                t = Transformer.from_crs(crs, 4326, always_xy=True)
+                return t.transform_bounds(*b, densify_pts=21)
+        except Exception:
+            pass
+        return b
+
     def fit_all(self) -> None:
         b = None
         for lay in self.layers:
             if not self.visible.get(lay.id, True):
                 continue
             try:
-                lb = lay.gdf.total_bounds
+                lb = self._layer_bounds(lay)
             except Exception:
                 continue
             if lb is None or len(lb) != 4 or not all(map(math.isfinite, lb)):
@@ -643,12 +808,17 @@ class MapView(QWidget):
         if lay is None:
             return
         try:
-            b = lay.gdf.total_bounds
+            b = self._layer_bounds(lay)
             self.fit_bounds(b[0], b[1], b[2], b[3], pad=0.15)
         except Exception:
             pass
 
     def fit_bounds(self, x0: float, y0: float, x1: float, y1: float, pad: float = 0.1) -> None:
+        # 必须转成 Python float：调用方常直接传 gdf.total_bounds 里的
+        # numpy.float64，算出来的 scale/tx/ty 也会是 numpy 标量。它一旦流进
+        # `_blit_view_image`，`abs(s/s0 - 1) > 1e-9` 就是 numpy.bool_，
+        # QPainter.setRenderHint() 不接受（见那个函数的注释）。
+        x0, y0, x1, y1 = float(x0), float(y0), float(x1), float(y1)
         if not all(map(math.isfinite, (x0, y0, x1, y1))):
             return
         px0, py0 = project(x0, y1)
@@ -656,23 +826,24 @@ class MapView(QWidget):
         bw = max(abs(px1 - px0), 1e-9)
         bh = max(abs(py1 - py0), 1e-9)
         s = min(self.width() / bw, self.height() / bh) * (1 - pad * 2)
-        self.scale = min(max(s, 60.0), 4e7)
+        self.scale = float(min(max(s, 60.0), 4e7))
         cx, cy = (px0 + px1) / 2, (py0 + py1) / 2
-        self.tx = self.width() / 2 - cx * self.scale
-        self.ty = self.height() / 2 - cy * self.scale
+        self.tx = float(self.width() / 2 - cx * self.scale)
+        self.ty = float(self.height() / 2 - cy * self.scale)
         self._invalidate_frame()
         self._kick_build()
         self.viewChanged.emit()
         self.update()
 
     def zoom_at(self, factor: float, px: float | None = None, py: float | None = None) -> None:
-        px = self.width() / 2 if px is None else px
-        py = self.height() / 2 if py is None else py
+        px = self.width() / 2 if px is None else float(px)
+        py = self.height() / 2 if py is None else float(py)
         wx = (px - self.tx) / self.scale
         wy = (py - self.ty) / self.scale
-        self.scale = min(max(self.scale * factor, 40.0), 6e7)
-        self.tx = px - wx * self.scale
-        self.ty = py - wy * self.scale
+        # 同样保持 Python float（原因见 fit_bounds）
+        self.scale = float(min(max(self.scale * factor, 40.0), 6e7))
+        self.tx = float(px - wx * self.scale)
+        self.ty = float(py - wy * self.scale)
         self._invalidate_frame()
         self._kick_build()
         self.viewChanged.emit()
@@ -680,6 +851,26 @@ class MapView(QWidget):
 
     def zoom_by(self, dz: float) -> None:
         self.zoom_at(2 ** dz)
+
+    def set_view(self, scale: float, tx: float, ty: float) -> None:
+        """把视图设成另一张地图的 scale/tx/ty（双视图同步用，不再套 fit）。"""
+        try:
+            s = float(scale)
+            x = float(tx)
+            y = float(ty)
+        except (TypeError, ValueError):
+            return
+        if (abs(s - float(self.scale)) <= 1e-12
+                and abs(x - float(self.tx)) <= 1e-9
+                and abs(y - float(self.ty)) <= 1e-9):
+            return
+        self.scale = s
+        self.tx = x
+        self.ty = y
+        self._invalidate_frame()
+        self._kick_build()
+        self.viewChanged.emit()
+        self.update()
 
     def resizeEvent(self, e):  # noqa: N802
         super().resizeEvent(e)
@@ -711,6 +902,36 @@ class MapView(QWidget):
         _, _, _, w, h = self._frame_view
         return w == self.width() and h == self.height()
 
+    def _pan_gap_too_wide(self) -> bool:
+        """拖拽中要不要重新渲染：判据是「露出的空白边有多宽」。
+
+        平移期间画面是把整帧当位图偏移贴上去的（`paintEvent`），偏移多少就露多少
+        空白。所以阈值按**像素**算，而不是只按视口比例：900 px 宽的窗口用
+        `0.3 × 视口 = 270 px` 做阈值的话，小幅拖拽永远等不到重绘，右/下就留一圈
+        空边。这里取 `min(视口 × 比例, PAN_RERENDER_PX)`，大窗口下也能在几十像素内
+        补齐；小窗口下比例阈值本来就更严格，行为不变。
+        """
+        if self._frame_view is None:
+            return False
+        w_gap = min(self.width() * PAN_RERENDER_RATIO, PAN_RERENDER_PX)
+        h_gap = min(self.height() * PAN_RERENDER_RATIO, PAN_RERENDER_PX)
+        return (abs(self.tx - self._frame_view[1]) > w_gap
+                or abs(self.ty - self._frame_view[2]) > h_gap)
+
+    def _end_pan(self) -> None:
+        """拖拽结束：不管移了几个像素，都按新视口重画一次。
+
+        拖拽中为了跟手只做位图偏移，边缘会留下空白；松手后人不再动，
+        正是补齐的最好时机。不加这条，小幅拖拽（没到重绘阈值）会一直留着空边，
+        直到下一次缩放才消失。
+        """
+        if self._frame_view is None:
+            return
+        if (abs(self.tx - self._frame_view[1]) >= 0.5
+                or abs(self.ty - self._frame_view[2]) >= 0.5
+                or abs(self.scale - self._frame_view[0]) > 1e-9):
+            self._invalidate_frame(0)
+
     def _render_frame(self) -> None:
         """渲染定时器回调：发起一次渲染（对应 QgsMapRendererJob::start()）。"""
         self._start_render()
@@ -725,27 +946,44 @@ class MapView(QWidget):
         """
         if self.width() < 10 or self.height() < 10:
             return
+        # 从这里到函数结束，矢量图都可能被换掉：期间禁止栅格回调上屏
+        self._vec_busy = True
+        # 栅格管线先走一步：它是独立的线程和缓存，成败都不影响下面的矢量流程。
+        # 这里必须兜住异常 —— 「栅格坏了」绝不能变成「矢量也不画了」。
+        try:
+            self._request_raster()
+        except Exception:  # noqa: BLE001
+            pass
         self._kick_build()
         snapshot = self._make_snapshot()
         if snapshot is None:
-            # 两种「没有东西可画」要区别对待：
-            # · 还有可见图层，只是几何还没构建好 → 继续显示旧帧，别闪白；
-            # · **一个可见图层都没有**（用户把图层全隐藏了）→ 必须合成一张空帧，
-            #   否则旧帧会一直留在屏幕上，「显示 / 隐藏」看起来就像没生效。
-            if any(self.visible.get(l.id, True) for l in self.layers):
+            # 三种「没有东西可画」要区别对待：
+            # · 还有可见矢量图层，几何正在构建 → 继续显示旧帧，别闪白；
+            # · **一个可见矢量图层都没有**（用户把图层全隐藏了，或者只有栅格）
+            #   → 必须合成一张空帧，否则旧帧会一直留在屏幕上，
+            #   「显示 / 隐藏」看起来就像没生效；
+            # · 有可见矢量图层、但**没有在飞的构建、也没有可用渲染集**
+            #   → 视口已经平移到数据范围之外（或者这一级缩放下筛不出要素），
+            #     同样必须出空帧；否则用户把地图拖到没数据的地方，屏幕上还是
+            #     原来那块内容，看着就像「拖不动」。
+            #   注意这里只看**矢量**图层：栅格没有渲染集，混进来会误判成「还在准备」。
+            if (any(self.visible.get(l.id, True) for l in self._vec_layers)
+                    and self._build_pending()):
                 return
             self._epoch += 1
             epoch = self._epoch
             self._layer_imgs = {}
-            self._compose(self._scene_sig(),
-                          (self.scale, self.tx, self.ty, self.width(), self.height()),
-                          epoch)
-            self._promote_pending(epoch, self._pending_view, self._pending_sig)
-            self.update()
+            self._layer_views = {}
+            self._vec_busy = False
+            self._compose_async(
+                self._scene_sig(),
+                (self.scale, self.tx, self.ty, self.width(), self.height()),
+                epoch, "force")
             return
         self._epoch += 1
         epoch = self._epoch
         dpr = self._device_pixel_ratio()
+        view_now = (self.scale, self.tx, self.ty, self.width(), self.height())
         jobs: list[_LayerJob] = []
         reuse: dict[str, QImage] = {}
         for snap in snapshot["layers"]:
@@ -762,14 +1000,17 @@ class MapView(QWidget):
                 jobs.append(_LayerJob(lay.id, snap))
                 self._img_keys[lay.id] = key
         if not jobs:
+            self._vec_busy = False
             return
         if all(j.snap is None for j in jobs):
             # 全命中缓存 → 直接合成上屏，不用渲染线程
             self._layer_imgs = dict(reuse)
-            self._compose(self._scene_sig(),
-                          (self.scale, self.tx, self.ty, self.width(), self.height()),
-                          epoch)
-            self._promote_pending(epoch, self._pending_view, self._pending_sig)
+            self._layer_views = {lid: view_now for lid in reuse}
+            self._vec_busy = False
+            self._compose_async(
+                self._scene_sig(),
+                (self.scale, self.tx, self.ty, self.width(), self.height()),
+                epoch, "force")
             self._rendered_geo_rev = self._geo_rev
             return
         # 没命中的图层用缓存里已有的旧图先顶着（避免合成时缺块闪白）
@@ -784,6 +1025,58 @@ class MapView(QWidget):
         # 提交给常驻渲染线程：队列只保留最新一次，不会堆积成「管线堵住」
         self._worker.submit(job)
 
+    # ------------------------------------------------------------- 栅格管线接线
+    def _request_raster(self) -> None:
+        """把当前视口交给栅格管线（对应 QgsRasterViewPort 的填充）。
+
+        只做三件事：算视口经纬度范围、算设备像素尺寸、交出去。
+        重采样/拉伸/读窗口全在 rasterview + app.raster 里，这边不掺和。
+        """
+        if not self._raster_layers:
+            self._raster_imgs = {}
+            return
+        dpr = self._device_pixel_ratio()
+        vp = RasterViewPort(
+            extent=self._view_lonlat_rect(),
+            width=max(1, int(self.width() * dpr)),
+            height=max(1, int(self.height() * dpr)),
+            scale=float(self.scale), tx=float(self.tx), ty=float(self.ty), dpr=dpr,
+            world=self._view_world_rect(),
+        )
+        self._raster.set_visible(self.visible)
+        self._raster.request(vp)
+
+    def _on_raster_layer(self, lid: str, img) -> None:
+        """某个栅格图层画好了：存起来并立刻合成上屏（栅格可能比矢量先完成）。"""
+        self._raster_imgs[lid] = img
+        # 矢量还在整帧重算时，图层图只存着，等矢量帧完成后一起合成，
+        # 避免每个栅格图层都触发一次全屏合成、和矢量抢 UI 时间。
+        if self._vec_busy and self._frame is not None:
+            return
+        self._recompose_now()
+
+    def _on_raster_frame(self) -> None:
+        if self._vec_busy and self._frame is not None:
+            return
+        self._recompose_now()
+
+    def _recompose_now(self) -> None:
+        """用当前视口参数重新合成一次（栅格管线的独立触发点）。
+
+        不复用矢量 job 的 sig/view —— 栅格的完成时刻和矢量任务没有关系，
+        可能矢量还在建几何、栅格已经画完了，这时也得让用户看到栅格。
+
+        但**能不能上屏**要分开判断：矢量 job 还在跑的时候，`_layer_imgs` 只是
+        「缓存命中的那几层」，拿它合成会把正在重画的矢量层整片抹掉，
+        屏幕上就是「矢量闪一下没了 → 又回来」。所以那种情况只更新 `_pending`
+        不上屏，等矢量的整帧回来时一起上（`_on_frame_ready`）。
+        """
+        if self.width() < 10 or self.height() < 10:
+            return
+        view = (float(self.scale), float(self.tx), float(self.ty),
+                self.width(), self.height())
+        self._compose_async(self._scene_sig(), view, self._epoch, "auto")
+
     def _on_layer_ready(self, lid: str, img, epoch: int) -> None:
         """某个图层渲染好了：存图并合成到「待上屏」的缓冲里。"""
         if epoch != self._epoch or img is None:
@@ -792,15 +1085,14 @@ class MapView(QWidget):
         if job is None:
             return
         self._layer_imgs[lid] = img
+        self._layer_views[lid] = job.view        # 这张图属于 job.view 那个视口
         # 存进图层缓存，下次同视口切显隐可直接复用
         key = self._img_keys.get(lid)
         if key is not None:
             self._img_cache[lid] = (key, img)
-        self._compose(job.sig, job.view, epoch)
+        # 首帧先显示已完成的图层；已有旧帧时等 _on_frame_ready 一次性上屏
         if self._frame is None:
-            # 首次出图：还没有旧帧可顶，就让用户先看到已经画好的部分
-            self._promote_pending(epoch, job.view, job.sig)
-            self.update()
+            self._compose_async(job.sig, job.view, epoch, "first")
 
     def _promote_pending(self, epoch: int, view, sig) -> None:
         """把「待上屏」的缓冲换成当前帧。
@@ -816,6 +1108,63 @@ class MapView(QWidget):
         self._frame_epoch = epoch
         self._frame_view = view
         self._frame_sig = sig
+
+    def _compose_async(self, sig, view, epoch: int, mode: str = "auto") -> None:
+        """把合成交给常驻合成线程；主线程只等整帧结果。"""
+        if self.width() < 10 or self.height() < 10:
+            return
+        dpr = self._device_pixel_ratio()
+        w = max(1, int(self.width() * dpr))
+        h = max(1, int(self.height() * dpr))
+        raster_items = []
+        if self._raster_imgs:
+            for lay in self._raster_layers:
+                if not self.visible.get(lay.id, True):
+                    continue
+                rimg = self._raster_imgs.get(lay.id)
+                if rimg is not None:
+                    raster_items.append((rimg, self._raster.view_of(lay.id)))
+        vec_items = []
+        for lay in self._layers_render_order():
+            if not self.visible.get(lay.id, True):
+                continue
+            vimg = self._layer_imgs.get(lay.id)
+            if vimg is not None:
+                vec_items.append((vimg, self._layer_views.get(lay.id)))
+        job = _ComposeJob(epoch, sig, view, dpr, w, h, raster_items, vec_items, mode)
+        try:
+            self._compose_worker.submit(job)
+        except Exception:
+            pass
+
+    def _on_compose_ready(self, job: _ComposeJob, img) -> None:
+        """合成线程完成：校验世代/视口后整体替换当前帧。"""
+        if job.epoch != self._epoch:
+            return
+        view_now = (float(self.scale), float(self.tx), float(self.ty),
+                    self.width(), self.height())
+        if tuple(job.view) != view_now:
+            return
+        if img is None or img.isNull():
+            return
+        promote = (job.mode == "force" and not self._vec_busy
+                   or (job.mode == "auto"
+                       and (self._frame is None or not self._vec_busy))
+                   or (job.mode == "first" and self._frame is None))
+        if not promote:
+            return
+        try:
+            pix = QPixmap.fromImage(img)
+            pix.setDevicePixelRatio(job.dpr)
+        except Exception:
+            return
+        self._frame = pix
+        self._frame_epoch = job.epoch
+        self._frame_view = job.view
+        self._frame_sig = job.sig
+        if job.mode == "force":
+            self._vec_busy = False
+        self.update()
 
     def _compose(self, sig, view, epoch: int) -> None:
         """把各图层图像按顺序叠成一帧（对应 QGIS 的 composeImage）。
@@ -835,16 +1184,96 @@ class MapView(QWidget):
             self._pending.setDevicePixelRatio(dpr)
         self._pending.fill(Qt.transparent)
         p = QPainter(self._pending)
-        for lay in self._layers_render_order():
-            if not self.visible.get(lay.id, True):
-                continue
-            img = self._layer_imgs.get(lay.id)
-            if img is not None:
-                p.drawImage(0, 0, img)
-        p.end()
+        # 合成是两条管线**唯一**共用的写画布路径，必须保证「一层画坏了不能
+        # 连累别人」：以前这里任何一层抛异常都会跳过后面所有图层（栅格先画，
+        # 于是矢量整片消失），并且 `p` 带着未配对的 save()/活跃画笔退出。
+        # 现在逐层兜底 + finally 收笔，异常最多丢那一层，帧照常完整。
+        try:
+            # ① 栅格先铺底（和 QGIS 一致：栅格通常在下，矢量叠上去）
+            if self._raster_imgs:
+                for lay in self._raster_layers:
+                    if not self.visible.get(lay.id, True):
+                        continue
+                    rimg = self._raster_imgs.get(lay.id)
+                    if rimg is not None:
+                        try:
+                            self._blit_view_image(p, rimg, self._raster.view_of(lay.id),
+                                                  view, dpr, device_size=True)
+                        except Exception:  # noqa: BLE001
+                            pass
+            # ② 矢量层按渲染顺序叠上去
+            for lay in self._layers_render_order():
+                if not self.visible.get(lay.id, True):
+                    continue
+                img = self._layer_imgs.get(lay.id)
+                if img is not None:
+                    try:
+                        self._blit_view_image(p, img, self._layer_views.get(lay.id),
+                                              view, dpr, device_size=False)
+                    except Exception:  # noqa: BLE001
+                        pass
+        finally:
+            p.end()
         self._pending_sig = sig
         self._pending_view = view
         self._pending_epoch = epoch
+
+    @staticmethod
+    def _blit_view_image(p: QPainter, img, own, view, dpr: float,
+                         device_size: bool) -> None:
+        """把一张「按 `own` 视口渲出来的整视口图」画到 `view` 视口上。
+
+        为什么不能直接 `drawImage(0, 0, img)`：视图一变（拖拽/滚轮），手上这张图
+        就过期了，但新图还在另一个线程里渲。这时按 (0,0) 贴等于把**整个世界**
+        拉回原处——用户看到的就是「松手后先跳回拖拽前的样子，过一会儿才归位」。
+        过期不等于没用：只要知道它当初按哪个 tx/ty/scale 画的，就能算出它现在
+        该画在哪儿：
+
+            translate(tx, ty) · scale(s / s0) · translate(-tx0, -ty0)
+
+        世界坐标里的点 w 在旧视口下是 `p0 = w·s0 + tx0`，代入上式得
+        `tx + s/s0·(w·s0) = w·s + tx`，正好是它在**新**视口下的屏幕位置。
+        所以纯平移是精确的整数位移，缩放是以视口为基准的精确等比变换；
+        代价只有「旧图分辨率不够 / 边缘缺一条」，而位置始终正确。
+
+        `own` / `view` 都是 `(scale, tx, ty, w, h[, ...])`：
+        `device_size=True` 时 w/h 是设备像素（栅格管线），否则是逻辑像素。
+        """
+        if own is None:
+            p.drawImage(0, 0, img)          # 不知道它属于哪个视口，只能原位贴
+            return
+        w_now = int(view[3] * dpr) if device_size else int(view[3])
+        h_now = int(view[4] * dpr) if device_size else int(view[4])
+        if own[3] != w_now or own[4] != h_now:
+            # 窗口尺寸变了：图的构图都不一样，换算没有意义，原位贴上顶一帧
+            p.drawImage(0, 0, img)
+            return
+        # 一律转 float：`own` 来自图层的渲染任务/缓存，可能带着 numpy.float64
+        # （gdf.total_bounds 一路传进 fit_bounds）。numpy 标量参与比较会得到
+        # numpy.bool_，而 QPainter.setRenderHint() 的第二个参数要求 bool/int，
+        # 会抛 TypeError —— 那会中断整次合成，屏幕上的矢量跟着一起消失。
+        s_now = float(view[0])
+        s_own = float(own[0])
+        r = (s_now / s_own) if s_own else 1.0
+        if not math.isfinite(r) or r <= 0.0:
+            p.drawImage(0, 0, img)
+            return
+        tx_now, ty_now = float(view[1]), float(view[2])
+        tx_own, ty_own = float(own[1]), float(own[2])
+        if abs(r - 1.0) <= 1e-9 and abs(tx_now - tx_own) < 0.5 \
+                and abs(ty_now - ty_own) < 0.5:
+            p.drawImage(0, 0, img)          # 视口没变（最常见），走最短路径
+            return
+        p.save()
+        try:
+            p.setRenderHint(QPainter.SmoothPixmapTransform, bool(abs(r - 1.0) > 1e-9))
+            p.translate(tx_now, ty_now)
+            if abs(r - 1.0) > 1e-9:
+                p.scale(r, r)
+            p.translate(-tx_own, -ty_own)
+            p.drawImage(0, 0, img)
+        finally:
+            p.restore()
 
     def _on_frame_ready(self, sig, view, epoch: int) -> None:
         """整帧渲染完成：校验世代号后整体上屏。
@@ -854,8 +1283,9 @@ class MapView(QWidget):
         """
         if epoch != self._epoch:
             return                      # 过期世代，丢弃（否则旧帧会覆盖新帧）
-        self._promote_pending(epoch, view, sig)
-        self.update()
+        self._vec_busy = False          # 矢量侧这套图已经是完整的了
+        # 在合成线程里把整帧叠好；UI 线程只接一次结果
+        self._compose_async(sig, view, epoch, "force")
 
     def _device_pixel_ratio(self) -> float:
         return self.devicePixelRatioF() or 1.0
@@ -920,8 +1350,19 @@ class MapView(QWidget):
     # ------------------------------------------------------------------ 构建
     def _layers_render_order(self) -> list:
         back = {"buffer", "dissolve", "grid", "merge", "convex_hull", "voronoi"}
-        idx = {id(l): i for i, l in enumerate(self.layers)}
-        return sorted(self.layers, key=lambda l: (0 if l.op in back else 1, idx[id(l)]))
+        # 只排矢量层：栅格由 RasterPipeline 自己管顺序，不参与这里的「背景算子置底」规则
+        idx = {id(l): i for i, l in enumerate(self._vec_layers)}
+        return sorted(self._vec_layers,
+                      key=lambda l: (0 if l.op in back else 1, idx[id(l)]))
+
+    def _build_pending(self) -> bool:
+        """还有几何构建没做完吗（数据在解析、或者分片构建定时器还活着）。
+
+        用来区分「还没准备好，先显示旧帧」和「确实没东西可画，该出空帧」。
+        分片构建正常收尾时 `_build_tick` 会停掉定时器，所以定时器不活跃
+        就等于构建已经结束。
+        """
+        return bool(self._loading or self._build_timer.isActive())
 
     def _kick_build(self) -> None:
         """启动分片构建定时器。"""
@@ -1767,9 +2208,8 @@ class MapView(QWidget):
             self._drag_moved += abs(d.x()) + abs(d.y())
             self._drag_from = pos.toPoint()
             self.viewChanged.emit()
-            # 平移只是位图偏移，超出一部分视口才重绘，保证拖动跟手
-            if self._frame_view and (abs(self.tx - self._frame_view[1]) > self.width() * PAN_RERENDER_RATIO
-                                     or abs(self.ty - self._frame_view[2]) > self.height() * PAN_RERENDER_RATIO):
+            # 平移只是位图偏移，露出的空白边够宽了才重绘，保证拖动跟手
+            if self._pan_gap_too_wide():
                 self._invalidate_frame()
                 self._kick_build()
             self.update()
@@ -1793,9 +2233,18 @@ class MapView(QWidget):
                 self._select_rect(band)
             self.update()
             return
+        if e.button() == Qt.MiddleButton and self._drag_from is not None:
+            # 中键拖拽结束也要收尾：以前这里没有分支，`_drag_from` 一直留着，
+            # 松手后鼠标一动地图还跟着跑，光标也卡在「抓手」上。
+            self._drag_from = None
+            self.setCursor(Qt.ArrowCursor)
+            self._end_pan()
+            self.update()
+            return
         if e.button() == Qt.LeftButton and self._drag_from is not None:
             self._drag_from = None
             self.setCursor(Qt.ArrowCursor)
+            self._end_pan()
             if self._drag_moved < 4:
                 hit = self._hit_test(e.position().x(), e.position().y())
                 if hit is None and self._sel:
@@ -2030,7 +2479,7 @@ class MapView(QWidget):
             p.setFont(QFont("Microsoft YaHei UI", 9))
             p.setPen(QColor("#a9a396"))
             p.drawText(rect.adjusted(0, 18, 0, 18), Qt.AlignCenter,
-                       "拖入 Shapefile / GeoJSON，或点右上角「示例数据」")
+                       "拖入 Shapefile / GeoJSON / GeoTIFF，或点右上角「示例数据」")
         else:
             # 图层已载入但几何还在构建：给出明确提示，而不是一片空白
             p.setPen(QColor("#8d897e"))

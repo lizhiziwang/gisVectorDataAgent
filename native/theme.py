@@ -86,6 +86,31 @@ QLabel#taskDot { font-size: 12px; }
 QLabel#taskTitle { font-size: 12px; color: #43413c; }
 QLabel#taskSub { font-size: 10px; color: #9a968c; }
 
+/* ---- 地图顶部任务通知 ---- */
+QFrame#taskNotice {
+    background: #fbfaf6;
+    border: 1px solid #ddd8ca;
+    border-radius: 10px;
+}
+QLabel#taskNoticeTitle { color: #43413c; font-size: 11px; font-weight: 600; }
+QLabel#taskNoticeBadge {
+    background: #f6ece6; color: #b0522f; border-radius: 7px;
+    padding: 0px 6px; font-size: 10px;
+}
+QPushButton#taskNoticeClear {
+    background: transparent; border: none; color: #8a8578;
+    font-size: 10px; padding: 1px 4px;
+}
+QPushButton#taskNoticeClear:hover { color: #43413c; }
+QFrame#taskNoticeRow { background: transparent; border: none; border-top: 1px solid #ece7db; }
+QLabel#taskNoticeName { color: #1f1e1d; font-size: 12px; font-weight: 500; }
+QLabel#taskNoticeSub { color: #8a8578; font-size: 10px; }
+QPushButton#taskNoticeClose {
+    background: transparent; border: none; color: #9a968c;
+    font-size: 14px; padding: 0px;
+}
+QPushButton#taskNoticeClose:hover { color: #43413c; }
+
 /* ---- 记忆管理面板 ---- */
 QTreeWidget#memoryTree {
     background: #ffffff; border: 1px solid #e7e3d8; border-radius: 7px;
@@ -93,6 +118,35 @@ QTreeWidget#memoryTree {
 }
 QTreeWidget#memoryTree::item { padding: 3px 2px; }
 QTreeWidget#memoryTree::item:selected { background: #f6ece6; color: #1f1e1d; }
+
+/* ---- 左栏：图层 / 工作区页签 ---- */
+QTabWidget#sideTabs::pane { border: none; background: transparent; }
+QTabWidget#sideTabs QTabBar::tab {
+    background: transparent; color: #8a8578; border: none;
+    padding: 5px 10px 4px 10px; font-size: 11px;
+}
+QTabWidget#sideTabs QTabBar::tab:selected {
+    color: #1f1e1d; font-weight: 600;
+    border-bottom: 2px solid #b0522f;
+}
+QTabWidget#sideTabs QTabBar::tab:hover { color: #43413c; }
+QFrame#workspace { background: transparent; }
+QLineEdit#workspaceSearch {
+    background: #f7f5ee; border: 1px solid #e7e3d8; border-radius: 6px;
+    padding: 3px 7px; margin: 0px 10px 4px 10px; font-size: 11px;
+    color: #43413c;
+}
+QLineEdit#workspaceSearch:focus { border-color: #c9bda8; }
+QTreeWidget#workspaceTree {
+    background: transparent; border: none; font-size: 11px;
+    outline: none;
+}
+QTreeWidget#workspaceTree::item { padding: 2px 1px; }
+QTreeWidget#workspaceTree::item:selected { background: #f6ece6; color: #1f1e1d; }
+QTreeWidget#workspaceTree QHeaderView::section {
+    background: transparent; border: none; border-bottom: 1px solid #e7e3d8;
+    color: #8a8578; font-size: 10px; padding: 2px 4px;
+}
 QLabel#pill {
     background: transparent; color: #6f6c64; border: 1px solid #e0dbcd;
     border-radius: 11px; padding: 2px 10px; font-size: 11px;
@@ -130,11 +184,43 @@ QPushButton#icon {
 }
 QPushButton#icon:hover { background: #f2efe6; border-color: #ddd8ca; }
 
+/* 地图右上角 放大 / 缩小 / 全图：白底卡片，避免压在暖白地图上“消失” */
+QPushButton#mapCtrl {
+    padding: 0px; border-radius: 8px;
+    font-size: 15px; font-weight: 500; color: #3f3d37;
+    background: #f1ecdf; border: 1px solid #c6bead;
+}
+QPushButton#mapCtrl:hover {
+    background: #e7e0d1; border-color: #b4ab98; color: #1f1e1d;
+}
+QPushButton#mapCtrl:pressed {
+    background: #ddd5c4; border-color: #a99f8a;
+}
+QPushButton#mapCtrl:checked {
+    background: #d97757; border-color: #c96442; color: #ffffff;
+}
+QWidget#compareHandle {
+    background: #c6bead;
+    border-left: 1px solid #faf9f5;
+    border-right: 1px solid #faf9f5;
+}
+QWidget#compareHandle:hover { background: #d97757; }
+QWidget#compareGuide {
+    background: #d97757;
+    border-radius: 1px;
+}
+
 QPushButton#ghost {
     border: 1px solid transparent; background: transparent; color: #43413c;
     padding: 4px 9px;
 }
 QPushButton#ghost:hover { background: #f2efe6; color: #1f1e1d; }
+QPushButton#winCtrl, QPushButton#winClose {
+    padding: 0px; border: none; border-radius: 4px;
+    background: transparent; color: #6f6c64; font-size: 14px;
+}
+QPushButton#winCtrl:hover { background: #f2efe6; color: #1f1e1d; }
+QPushButton#winClose:hover { background: #d9534f; color: #ffffff; }
 
 QLabel#toolGroup {
     color: #8d897e; font-size: 10px;
@@ -148,6 +234,36 @@ QPushButton#toolChip {
 }
 QPushButton#toolChip:hover { background: #ece8db; color: #1f1e1d; }
 QPushButton#toolChip:pressed { background: #e4dfd0; }
+
+/* 工具库两级分类：矢量 / 栅格 → 功能分组，均可收缩 */
+QFrame#toolKindCard {
+    background: #fbfaf6;
+    border: 1px solid #e7e3d8;
+    border-radius: 9px;
+}
+QFrame#toolGroupCard { background: transparent; border: none; }
+QPushButton#toolKindHeader {
+    text-align: left;
+    border: none;
+    background: transparent;
+    padding: 8px 9px 7px 9px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #43413c;
+    border-radius: 8px;
+}
+QPushButton#toolKindHeader:hover { background: #f2efe6; }
+QPushButton#toolGroupHeader {
+    text-align: left;
+    border: none;
+    border-top: 1px solid #efece1;
+    background: transparent;
+    padding: 7px 6px 3px 11px;
+    font-size: 10px;
+    color: #8d897e;
+}
+QPushButton#toolGroupHeader:hover { color: #43413c; }
+QWidget#toolKindBody, QWidget#toolGroupBody { background: transparent; }
 
 QPushButton#chip {
     padding: 2px 9px; font-size: 11px; border-radius: 11px;
@@ -221,8 +337,77 @@ QLabel#userText { color: #1f1e1d; font-size: 13px; }
 QFrame#agentBubble { background: transparent; border: none; }
 QLabel#agentText { color: #1f1e1d; font-size: 13px; }
 
+/* ---- Harness 式对话顶栏 / 状态 ---- */
+QTabBar#chatTabs::tab {
+    background: transparent; color: #8a8578; border: none;
+    padding: 4px 2px 5px 2px; margin-right: 16px; font-size: 12px;
+}
+QTabBar#chatTabs::tab:selected {
+    color: #1f1e1d; font-weight: 600;
+    border-bottom: 2px solid #b0522f;
+}
+QTabBar#chatTabs::tab:hover { color: #43413c; }
+QPushButton#taskPill {
+    background: #f6ece6; color: #b0522f; border: 1px solid #edd8cb;
+    border-radius: 10px; padding: 2px 8px; font-size: 10px;
+}
+QPushButton#taskPill:hover { background: #f2e0d5; }
+QFrame#toolActivity {
+    background: #f7f4ec; border: 1px solid #ece7db; border-radius: 7px;
+}
+QLabel#toolSpinner { color: #b0522f; font-size: 12px; }
+QLabel#toolActivityText { color: #6f6c64; font-size: 11px; }
+QPushButton#modelPicker {
+    background: transparent; color: #6f6c64; border: 1px solid #e7e3d8;
+    border-radius: 8px; padding: 2px 7px; font-size: 10px;
+}
+QPushButton#modelPicker:hover { color: #1f1e1d; background: #f7f4ec; }
+QLabel#chatStats { color: #9a968c; font-size: 10px; }
+QPlainTextEdit#traceView {
+    background: #faf9f5; border: none; color: #57544c;
+    font-size: 11px; padding: 10px 12px;
+}
+QLabel#stepConfirmHead { font-size: 14px; font-weight: 600; color: #1f1e1d; }
+QLabel#stepConfirmDetail { color: #57544c; font-size: 12px; }
+QPlainTextEdit#confirmArgs {
+    background: #f3f1ea; border: 1px solid #e7e3d8; border-radius: 6px;
+    color: #57544c; font-size: 11px; padding: 4px 6px;
+}
+QPlainTextEdit#confirmInput {
+    background: #ffffff; border: 1px solid #d8d2c4; border-radius: 8px;
+    color: #1f1e1d; font-size: 12px; padding: 5px 7px;
+}
+QPlainTextEdit#confirmInput:focus { border-color: #d97757; }
+QListWidget#skillList {
+    background: #faf9f5; border: 1px solid #e7e3d8; border-radius: 8px;
+    padding: 3px;
+}
+QListWidget#skillList::item { border-bottom: 1px solid #efece1; }
+QListWidget#skillList::item:selected { background: #f2eee3; color: #1f1e1d; }
+QPlainTextEdit#skillBody {
+    background: #ffffff; border: 1px solid #d8d2c4; border-radius: 8px;
+    color: #1f1e1d; font-size: 12px; padding: 7px;
+}
+QPlainTextEdit#skillBody:focus { border-color: #d97757; }
+QTabWidget#agentSettingsTabs::pane { border: 1px solid #e7e3d8; border-radius: 6px; }
+
 QFrame#stepCard { background: transparent; border: none; }
 QFrame#stepHead { background: transparent; border: none; }
+QFrame#planCard {
+    background: #f7f5ee; border: 1px solid #e3ded0; border-radius: 10px;
+}
+QLabel#planTitle { color: #1f1e1d; font-size: 12px; font-weight: 600; }
+QLabel#planSource {
+    color: #6f6c64; font-size: 10px; background: #ece8dc;
+    border-radius: 7px; padding: 1px 6px;
+}
+QLabel#planCount { color: #7d7a70; font-size: 10px; }
+QLabel#planErr { color: #b04a3f; font-size: 10px; }
+QFrame#planRow { background: transparent; border: none; border-top: 1px solid #ece7db; }
+QLabel#planNum { color: #9a968c; font-size: 10px; }
+QLabel#planName { color: #1f1e1d; font-size: 12px; font-weight: 500; }
+QLabel#planDetail { color: #6f6c64; font-size: 11px; }
+QLabel#planState { color: #7d7a70; font-size: 10px; }
 QLabel#stepDot { font-size: 11px; color: #3f7d58; }
 QLabel#stepDotErr { font-size: 11px; color: #b04a3f; }
 QLabel#stepName { font-size: 12px; font-weight: 500; color: #1f1e1d; }

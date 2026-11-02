@@ -73,7 +73,14 @@ text_w = short._label.fontMetrics().horizontalAdvance("你好")
 print(f"短消息气泡 {short.width()}x{short.height()}，文字宽 {text_w}，"
       f"两侧内边距合计 {slack}，右侧空白 {short._label.width() - text_w}")
 fit_ok = short.width() <= text_w + 46 and slack <= 30
-ok = fill_delta >= 6 and right and dark_px > 20 and fit_ok
+
+# 输入框右键菜单必须是中文（Qt 默认是英文 Undo/Cut/Copy…）
+menu_texts = [a.text() for a in win.chat.input.createStandardContextMenu().actions()]
+menu_cn = any("复制" in t or "粘贴" in t for t in menu_texts)
+print(f"右键菜单: {menu_texts}")
+
+ok = fill_delta >= 6 and right and dark_px > 20 and fit_ok and menu_cn
 print(f"短消息贴合文字: {fit_ok}")
+print(f"右键菜单中文: {menu_cn}")
 print("\n结论:", "PASS" if ok else "FAIL")
 win.close()

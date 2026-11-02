@@ -58,6 +58,12 @@ class FakePlanner(Planner):
         self.last_user = ""
         #: 系统提示里是否出现了澄清上下文
         self.saw_clarify = False
+        #: 普通对话分支收到的消息（验证 no-data 也不会被「还没有数据」挡住）
+        self.chat_calls = []
+
+    def llm_chat(self, text, cfg, history, memory_context="", has_data=False):
+        self.chat_calls.append((text, has_data))
+        return f"模型回答：{text}（has_data={has_data}）"
 
     def _call_llm(self, cfg, msgs, json_mode, max_tokens=1600):
         self.calls.append(msgs[-1].get("content", "")[:80])
@@ -173,8 +179,33 @@ pl = FakePlanner(st, [
 ])
 r = run_agent(st, pl, "算每个地块里的道路有多长", "地块", CFG, [], use_llm=True)
 check("返回了新算子请求", r.get("new_operator"), "计算每个地块内的道路总长度")
+check("带上原任务用于自动重跑", r.get("rerun"), "算每个地块里的道路有多长")
 check("没有产生步骤", len(r["steps"]), 0)
 check("保留了解释", "新写一个算子" in r["reply"], True)
+
+print("[10] 没有数据时，普通对话也要能走大模型")
+st = Store()
+pl = FakePlanner(st, [])
+r = run_agent(st, pl, "你是什么模型", None, CFG, [], use_llm=True)
+check("没有数据也能回答模型身份", "模型回答：你是什么模型" in r["reply"], True)
+check("planner 标记为 llm", r["planner"], "llm")
+check("调用的是普通对话而不是规划", pl.chat_calls, [("你是什么模型", False)])
+
+pl2 = FakePlanner(Store(), [])
+r = run_agent(pl2.store, pl2, "你知道1+6666等于多少吗", None, CFG, [], use_llm=True)
+check("没有数据也能做普通问答", "模型回答：你知道1+6666" in r["reply"], True)
+check("没有走规则引擎", pl2.chat_calls and pl2.chat_calls[0][1] is False, True)
+
+pl3 = FakePlanner(Store(), [])
+r = run_agent(pl3.store, pl3, "对地块做缓冲区", None, CFG, [], use_llm=True)
+check("没有数据做 GIS 操作仍提示先载入", "还没有数据" in r["reply"], True)
+check("GIS 意图没有误走闲聊", pl3.chat_calls, [])
+
+st4 = store()
+pl4 = FakePlanner(st4, [])
+r = run_agent(st4, pl4, "1+6666等于多少", "地块", CFG, [], use_llm=True)
+check("有数据时普通问答也走大模型", "模型回答：1+6666" in r["reply"], True)
+check("有数据时不产生空间步骤", r["steps"], [])
 
 print("\n结论:", "PASS" if not fails else f"FAIL {fails}")
 sys.exit(0 if not fails else 1)

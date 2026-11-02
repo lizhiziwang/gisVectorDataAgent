@@ -26,6 +26,10 @@ DEFAULTS = {
     "api_format": os.environ.get("LLM_API_FORMAT", "") or "openai_chat",
     # 自定义覆盖：{"path": "/v1/chat/completions", "headers": {...}, "body": {...}}
     "api_overrides": {},
+    # Agent 设置：每步确认 / 技能总开关
+    "confirm_steps": True,
+    "skills_enabled": True,
+    "skills_disabled": [],
 }
 
 
@@ -93,6 +97,12 @@ def normalize(cfg: dict) -> dict:
         if isinstance(v, dict) and v:
             clean[key2] = {str(k): val for k, val in v.items() if k}
     out["api_overrides"] = clean
+    out["confirm_steps"] = bool(out.get("confirm_steps", True))
+    out["skills_enabled"] = bool(out.get("skills_enabled", True))
+    disabled = out.get("skills_disabled")
+    if not isinstance(disabled, list):
+        disabled = []
+    out["skills_disabled"] = [str(x) for x in disabled if str(x).strip()]
     # 补默认值：
     # · 填了 key → 默认按 DeepSeek 补地址和模型（多数人只贴 key 就想能用）；
     # · Ollama 不需要 key → 只要选了 ollama 格式且没填地址，就给本地默认地址，

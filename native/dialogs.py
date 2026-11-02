@@ -1,19 +1,26 @@
 """对话框：属性表、模型设置、多图层选择、关于。"""
 from __future__ import annotations
 
+import queue
 import threading
+from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-                               QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
-                               QPushButton, QScrollArea, QTableWidget, QTableWidgetItem,
-                               QVBoxLayout, QWidget)
+                               QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
+                               QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
+                               QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from app import api_formats
 from app import conn_test
+from app.gdb import gdb_layer_infos
+from app.io_utils import VECTOR_EXTS, extract_zip, file_info
+from app.raster import RASTER_EXTS, read_info
+from app.tool_registry import CUSTOM_GROUP
 
 from .format import fmt_num
+from .theme import QSS
 
 
 class TableDialog(QDialog):
@@ -201,6 +208,12 @@ class SettingsDialog(QDialog):
         #: 正在跑测试的线程 / 取消标志
         self._test_thread: threading.Thread | None = None
         self._test_cancel: threading.Event | None = None
+        # 后台线程只往 queue 放结果，绝不从非 Qt 线程 emit 信号。
+        # 由主线程 QTimer 轮询，避免 Qt 在退出阶段清理 adopted thread 时崩溃。
+        self._test_queue: queue.Queue = queue.Queue()
+        self._test_timer = QTimer(self)
+        self._test_timer.setInterval(15)
+        self._test_timer.timeout.connect(self._poll_test)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 14, 16, 14)
@@ -337,7 +350,6 @@ class SettingsDialog(QDialog):
         self.adv.toggled.connect(self._on_adv_toggled)
         self.base.textChanged.connect(self._refresh_preview)
         self.model.textChanged.connect(self._refresh_preview)
-        self._test_done.connect(self._on_test_done)
         self._refresh_preview()
 
     @property
@@ -384,10 +396,15 @@ class SettingsDialog(QDialog):
         请求放到后台线程跑：主线程被 HTTP 阻塞住的话，界面会整块冻住
         （超时 12 秒起，网关不通时更久），窗口拖不动、关不掉。
         """
-        if self._test_thread is not None and self._test_thread.isRunning():
+        if self._test_thread is not None and self._test_thread.is_alive():
             return
         cfg = self.value()
         self._test_cancel = threading.Event()
+        while True:
+            try:
+                self._test_queue.get_nowait()
+            except queue.Empty:
+                break
         self.btn_test.setEnabled(False)
         self.btn_test_cancel.show()
         self.test_result.setText("正在测试…")
@@ -397,17 +414,24 @@ class SettingsDialog(QDialog):
                 res = conn_test.test_connection(cfg)
             except Exception as e:  # noqa: BLE001
                 res = conn_test.TestResult(False, f"测试出错：{e}")
-            # 回到主线程再改界面。
-            # 窗口可能已经关了 —— emit 到一个已析构的 C++ 对象会崩
-            # （退出时偶发 0xC0000409 就是这么来的），所以先确认还活着。
-            try:
-                self._test_done.emit(res)
-            except RuntimeError:
-                pass       # 窗口已销毁，结果没人要了
+            # 只写线程安全队列；界面更新由主线程 QTimer 完成。
+            self._test_queue.put(res)
 
         self._test_thread = threading.Thread(target=work, daemon=True,
                                              name="llm-conn-test")
         self._test_thread.start()
+        self._test_timer.start()
+
+    def _poll_test(self) -> None:
+        """主线程取后台测试结果（不跨线程 emit Qt 信号）。"""
+        try:
+            res = self._test_queue.get_nowait()
+        except queue.Empty:
+            if self._test_thread is not None and not self._test_thread.is_alive():
+                self._test_timer.stop()
+            return
+        self._test_timer.stop()
+        self._on_test_done(res)
 
     def _cancel_test(self) -> None:
         """请求取消正在进行的测试。
@@ -437,22 +461,14 @@ class SettingsDialog(QDialog):
         self.test_detail = res.detail
 
     def closeEvent(self, e):  # noqa: N802
-        """关窗口时把后台测试收尾。
-
-        线程是 daemon 的，但 daemon 线程在解释器退出时被杀，
-        如果它正卡在 emit 上，就会留下半个状态 —— 表现为
-        退出时偶发 0xC0000409（STATUS_STACK_BUFFER_OVERRUN）。
-        这里先标记取消，再给它一点时间自己收工。
-        """
+        """关窗口时把后台测试收尾，避免线程在解释器退出阶段改界面。"""
+        self._test_timer.stop()
         if self._test_cancel is not None:
             self._test_cancel.set()
         t = self._test_thread
         if t is not None and t.is_alive():
             t.join(timeout=1.0)
         super().closeEvent(e)
-        if res.detail:
-            self.test_detail_label.setText(res.detail)
-            self.test_detail_label.setVisible(True)
 
     def value(self) -> dict:
         overrides: dict = {}
@@ -480,8 +496,19 @@ class SettingsDialog(QDialog):
         }
 
 
+def _cand_detail(c: dict) -> str:
+    """导入候选的副标题：矢量报要素数，栅格报尺寸和波段。"""
+    crs = c.get("crs") or "无坐标系"
+    if c.get("kind") == "raster":
+        w, h, b = c.get("width") or 0, c.get("height") or 0, c.get("bands") or 0
+        if not w or not h:
+            return f"栅格 · {crs}"
+        return f"{w}×{h} · {b} 波段 · {crs}"
+    return f"{fmt_num(c.get('features'))} 要素 · {c.get('geom') or '未知类型'} · {crs}"
+
+
 class ImportDialog(QDialog):
-    """压缩包里有多个矢量文件时，让用户挑要载入哪些。"""
+    """压缩包里有多个文件时，让用户挑要载入哪些（矢量、栅格都可以）。"""
 
     def __init__(self, candidates: list[dict], source: str = "", parent=None):
         super().__init__(parent)
@@ -493,7 +520,15 @@ class ImportDialog(QDialog):
         root.setContentsMargins(16, 14, 16, 14)
         root.setSpacing(9)
 
-        tip = QLabel(f"压缩包里有 {len(candidates)} 个矢量图层，勾选需要的（可多选）。")
+        n_vec = sum(1 for c in candidates if c.get("kind") != "raster")
+        n_ras = len(candidates) - n_vec
+        parts = []
+        if n_vec:
+            parts.append(f"{n_vec} 个矢量")
+        if n_ras:
+            parts.append(f"{n_ras} 个栅格")
+        tip = QLabel(f"压缩包里有 {len(candidates)} 个图层"
+                     f"（{' · '.join(parts)}），勾选需要的（可多选）。")
         tip.setObjectName("muted")
         root.addWidget(tip)
 
@@ -522,14 +557,20 @@ class ImportDialog(QDialog):
             info.setSpacing(1)
             name = QLabel(f"{c['name']}{c.get('ext', '')}")
             name.setStyleSheet("font-size:12px;font-weight:600;")
-            detail = QLabel(f"{fmt_num(c.get('features'))} 要素 · {c.get('geom') or '未知类型'}"
-                            f" · {c.get('crs') or '无坐标系'}")
+            detail = QLabel(_cand_detail(c))
             detail.setObjectName("muted")
             info.addWidget(name)
             info.addWidget(detail)
             hl.addLayout(info, 1)
 
-            size = QLabel(f"{c.get('size_mb', 0)} MB")
+            mb = float(c.get("size_mb") or 0)
+            # 小文件按 MB 保留 1 位会被舍成 "0.0 MB"，看着像空文件，改用 KB
+            if mb < 0.1:
+                size = QLabel(f"{max(int(mb * 1024), 1)} KB")
+            elif mb < 1:
+                size = QLabel(f"{mb:.2f} MB")
+            else:
+                size = QLabel(f"{mb:.1f} MB")
             size.setObjectName("muted")
             hl.addWidget(size)
             vl.addWidget(frame)
@@ -538,7 +579,7 @@ class ImportDialog(QDialog):
         scroll.setWidget(host)
         root.addWidget(scroll, 1)
 
-        note = QLabel("要素量大的图层载入、绘制会慢一些，建议先载入主要图层。")
+        note = QLabel("体积大的图层载入、绘制会慢一些，建议先载入主要图层。")
         note.setObjectName("tiny")
         root.addWidget(note)
 
@@ -553,10 +594,337 @@ class ImportDialog(QDialog):
         return [i for cb, i in self._boxes if cb.isChecked()]
 
 
-class OperatorDialog(QDialog):
-    """预览「按文字描述生成的工具」：看得到代码、试跑结果，再决定要不要入库。"""
+class ImportDataDialog(QDialog):
+    """自定义导入矢量数据：先选数据源，再勾选文件内部的图层。
 
-    def __init__(self, spec: dict, parent=None):
+    `.gdb` / `.gpkg` 不是「一个文件 = 一个图层」：一个库里有多个要素类。
+    这里把内部图层列成可勾选卡片，导入时只读选中的图层，避免把整个 GDB
+    的几十个图层一次性塞进图层面板。
+    """
+
+    def __init__(self, parent=None, start_paths: list[str] | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("导入数据")
+        self.resize(640, 560)
+        # QDialog 是顶层窗口，不能总指望继承主窗口的 QSS；显式套一遍主题。
+        self.setStyleSheet(QSS)
+        self._entries: list[dict] = []
+        self._boxes: list[tuple[QCheckBox, dict]] = []
+        self._seen: set[tuple[str, str]] = set()
+        self._tmp_roots: list[Path] = []
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 14, 16, 12)
+        root.setSpacing(8)
+
+        pick = QHBoxLayout()
+        pick.setSpacing(7)
+        btn_file = QPushButton("添加文件…")
+        btn_file.setObjectName("ghost")
+        btn_file.clicked.connect(self.choose_files)
+        pick.addWidget(btn_file)
+        btn_gdb = QPushButton("添加 FileGDB 文件夹…")
+        btn_gdb.setObjectName("ghost")
+        btn_gdb.clicked.connect(self.choose_gdb)
+        pick.addWidget(btn_gdb)
+        pick.addStretch(1)
+        root.addLayout(pick)
+
+        tip = QLabel("支持 shp / GeoJSON / GPKG / KML / GML / CSV / TIF / ZIP；"
+                     "GPKG、FileGDB 会自动列出内部图层，可多选。")
+        tip.setObjectName("muted")
+        tip.setWordWrap(True)
+        root.addWidget(tip)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        host = QWidget()
+        self.list_layout = QVBoxLayout(host)
+        self.list_layout.setContentsMargins(0, 0, 0, 0)
+        self.list_layout.setSpacing(5)
+        self.list_layout.addStretch(1)
+        self.scroll.setWidget(host)
+        root.addWidget(self.scroll, 1)
+
+        self.empty = QLabel("还没有选择数据。点「添加文件…」或「添加 FileGDB 文件夹…」。")
+        self.empty.setObjectName("muted")
+        self.empty.setAlignment(Qt.AlignCenter)
+        root.addWidget(self.empty)
+
+        tools = QHBoxLayout()
+        btn_all = QPushButton("全选")
+        btn_all.setObjectName("tiny")
+        btn_all.clicked.connect(lambda: self._set_all(True))
+        btn_none = QPushButton("全不选")
+        btn_none.setObjectName("tiny")
+        btn_none.clicked.connect(lambda: self._set_all(False))
+        tools.addWidget(btn_all)
+        tools.addWidget(btn_none)
+        tools.addStretch(1)
+        root.addLayout(tools)
+
+        self.btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self._ok = self.btns.button(QDialogButtonBox.Ok)
+        self._ok.setText("导入所选")
+        self.btns.button(QDialogButtonBox.Cancel).setText("取消")
+        self.btns.accepted.connect(self.accept)
+        self.btns.rejected.connect(self.reject)
+        root.addWidget(self.btns)
+
+        if start_paths:
+            self.add_paths(start_paths)
+        self._sync_empty()
+        self._update_ok()
+
+    # ---------------------------------------------------------------- 数据源
+    @staticmethod
+    def _file_filter() -> str:
+        vec = " ".join("*" + e for e in VECTOR_EXTS if e != ".gdb")
+        ras = " ".join("*" + e for e in RASTER_EXTS)
+        return (f"矢量与栅格 ({vec} {ras} *.zip);;"
+                f"矢量数据 ({vec} *.zip);;栅格数据 ({ras});;所有文件 (*.*)")
+
+    def choose_files(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(self, "选择矢量/栅格文件", "", self._file_filter())
+        if paths:
+            self.add_paths(paths)
+
+    def choose_gdb(self) -> None:
+        d = QFileDialog.getExistingDirectory(
+            self, "选择 Esri FileGDB 文件夹（.gdb）", "", QFileDialog.ShowDirsOnly)
+        if not d:
+            return
+        if not str(d).lower().endswith(".gdb"):
+            QMessageBox.information(self, "不是 FileGDB",
+                                    "请选择以 .gdb 结尾的文件夹（例如 2024年国土.gdb）。")
+            return
+        self.add_paths([d])
+
+    def add_paths(self, paths: list[str]) -> None:
+        errors = []
+        for raw in paths:
+            p = Path(raw)
+            try:
+                suffix = p.suffix.lower()
+                if p.is_dir():
+                    if suffix == ".gdb":
+                        self._add_gdb(p)
+                    else:
+                        errors.append(f"{p.name}：不是 .gdb 文件夹")
+                elif suffix == ".gpkg":
+                    self._add_gpkg(p)
+                elif suffix == ".zip":
+                    root, files = extract_zip(p)
+                    self._tmp_roots.append(root)
+                    for f in files:
+                        if f.suffix.lower() != ".zip":
+                            self.add_paths([str(f)])
+                elif suffix in RASTER_EXTS:
+                    self._add_raster(p)
+                elif suffix in VECTOR_EXTS:
+                    self._add_single(p)
+                else:
+                    errors.append(f"{p.name}：不支持的格式")
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{p.name}：{e}")
+        if errors:
+            QMessageBox.warning(self, "部分数据未加入", "\n".join(errors[:8]))
+        self._sync_empty()
+
+    def _add_entry(self, entry: dict) -> None:
+        key = (entry["path"], str(entry.get("layer") or ""))
+        if key in self._seen:
+            return
+        self._seen.add(key)
+        self._entries.append(entry)
+
+        frame = QFrame()
+        frame.setObjectName("candCard")
+        frame.setStyleSheet("QFrame#candCard{background:#faf9f5;border:1px solid #e7e3d8;"
+                            "border-radius:9px;}")
+        hl = QHBoxLayout(frame)
+        hl.setContentsMargins(9, 7, 9, 7)
+        hl.setSpacing(8)
+        cb = QCheckBox()
+        cb.setChecked(True)
+        cb.toggled.connect(lambda _checked: self._update_ok())
+        hl.addWidget(cb)
+        self._boxes.append((cb, entry))
+
+        info = QVBoxLayout()
+        info.setSpacing(1)
+        name = QLabel(entry["name"])
+        name.setStyleSheet("font-size:12px;font-weight:600;")
+        detail = QLabel(
+            f"{fmt_num(entry.get('features') or 0)} 个要素 · "
+            f"{entry.get('geom') or '未知类型'} · {entry.get('crs') or '未定义坐标系'}")
+        detail.setObjectName("muted")
+        info.addWidget(name)
+        info.addWidget(detail)
+        hl.addLayout(info, 1)
+        self.list_layout.insertWidget(self.list_layout.count() - 1, frame)
+        self._update_ok()
+
+    def _add_gdb(self, path: Path) -> None:
+        infos = gdb_layer_infos(path)
+        if not infos:
+            raise ValueError("GDB 里没有可导入的矢量图层")
+        for info in infos:
+            self._add_entry({
+                "path": str(path), "layer": info["name"], "kind": "vector",
+                "name": f"{path.stem}/{info['name']}",
+                "features": info.get("features"), "geom": info.get("geom"),
+                "crs": info.get("crs"),
+            })
+
+    def _add_gpkg(self, path: Path) -> None:
+        infos = []
+        try:
+            import pyogrio
+            for name, geom in pyogrio.list_layers(path):
+                name = str(name)
+                try:
+                    meta = pyogrio.read_info(path, layer=name)
+                    infos.append({
+                        "name": name,
+                        "features": int(meta.get("features") or 0),
+                        "geom": str(meta.get("geometry_type") or geom or ""),
+                        "crs": str(meta.get("crs") or ""),
+                    })
+                except Exception:
+                    infos.append({"name": name, "features": 0,
+                                  "geom": str(geom or ""), "crs": ""})
+        except Exception as e:  # noqa: BLE001
+            raise ValueError(f"读取 GeoPackage 图层失败：{e}") from e
+        if not infos:
+            raise ValueError("GeoPackage 里没有可导入的图层")
+        for info in infos:
+            self._add_entry({
+                "path": str(path), "layer": info["name"], "kind": "vector",
+                "name": f"{path.stem}/{info['name']}",
+                "features": info.get("features"), "geom": info.get("geom"),
+                "crs": info.get("crs"),
+            })
+
+    def _add_single(self, path: Path) -> None:
+        info = file_info(path)
+        self._add_entry({
+            "path": str(path), "layer": None, "kind": "vector",
+            "name": path.stem, "features": info.get("features"),
+            "geom": info.get("geom"), "crs": info.get("crs"),
+        })
+
+    def _add_raster(self, path: Path) -> None:
+        ri = read_info(path)
+        self._add_entry({
+            "path": str(path), "layer": None, "kind": "raster",
+            "name": path.stem, "features": 0,
+            "geom": f"{ri.width}×{ri.height} · {ri.bands} 波段",
+            "crs": ri.crs_name or "",
+        })
+
+    # ---------------------------------------------------------------- 选择
+    def _set_all(self, checked: bool) -> None:
+        for cb, _entry in self._boxes:
+            cb.setChecked(checked)
+
+    def _update_ok(self) -> None:
+        self._ok.setEnabled(any(cb.isChecked() for cb, _ in self._boxes))
+
+    def _sync_empty(self) -> None:
+        self.empty.setVisible(not self._boxes)
+
+    def selections(self) -> list[dict]:
+        return [entry for cb, entry in self._boxes if cb.isChecked()]
+
+    def _cleanup_tmp(self) -> None:
+        import shutil
+        roots, self._tmp_roots = self._tmp_roots, []
+        for root in roots:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def take_tmp_roots(self) -> list[Path]:
+        roots, self._tmp_roots = self._tmp_roots, []
+        return roots
+
+    def done(self, result: int) -> None:  # noqa: N802 (Qt 命名)
+        # 取消/关窗时立即清理；接受时把解压目录交给主窗口，等导入完成再删。
+        if result != QDialog.Accepted:
+            self._cleanup_tmp()
+        super().done(result)
+
+
+class NewToolDialog(QDialog):
+    """「＋ 新建工具」的第一步：描述算法 + 选一个分组。
+
+    分组下拉放在这里，是因为这一步是用户唯一能主动表达「这个工具该放哪」的时机；
+    之后的代码预览弹窗只是把这里的默认值带过去（用户仍可改）。
+    不选就落「我的工具」。
+    """
+
+    def __init__(self, parent=None, group_choices: list[str] | None = None,
+                 initial_group: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("用文字描述一个工具")
+        self.resize(560, 360)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 14, 16, 12)
+        root.setSpacing(8)
+
+        lab = QLabel("说明要算什么、参数是什么。例如：\n"
+                     "统计每个面内道路的总长度和条数，一个新图层输出这些字段。")
+        lab.setWordWrap(True)
+        lab.setObjectName("muted")
+        root.addWidget(lab)
+
+        self.editor = QPlainTextEdit()
+        self.editor.setPlaceholderText("描述这个工具要做的事…")
+        self.editor.setMinimumHeight(150)
+        root.addWidget(self.editor, 1)
+
+        # ---- 分组：放进工具库的哪一组
+        self.group_combo = QComboBox()
+        self.group_combo.setObjectName("toolGroupCombo")
+        choices = [str(g) for g in (group_choices or []) if str(g).strip()]
+        if CUSTOM_GROUP not in choices:
+            choices.append(CUSTOM_GROUP)
+        for g in choices:
+            self.group_combo.addItem(g)
+        cur = str(initial_group or "").strip()
+        if cur and self.group_combo.findText(cur) >= 0:
+            self.group_combo.setCurrentText(cur)
+        else:
+            self.group_combo.setCurrentText(CUSTOM_GROUP)
+
+        grow = QHBoxLayout()
+        grow.setContentsMargins(0, 0, 0, 0)
+        glab = QLabel("分组")
+        glab.setStyleSheet("font-size:11px;color:#43413c;font-weight:600;")
+        grow.addWidget(glab)
+        grow.addWidget(self.group_combo, 1)
+        root.addLayout(grow)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.button(QDialogButtonBox.Ok).setText("下一步")
+        btns.button(QDialogButtonBox.Cancel).setText("取消")
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        root.addWidget(btns)
+
+    def value(self) -> tuple[str, str]:
+        """返回 (算法描述, 选中的分组)。"""
+        return (self.editor.toPlainText().strip(),
+                str(self.group_combo.currentText() or "").strip() or CUSTOM_GROUP)
+
+
+class OperatorDialog(QDialog):
+    """预览「按文字描述生成的工具」：看得到代码、试跑结果，再决定要不要入库。
+
+    还能挑它进工具库的哪个分组；不挑就放「我的工具」。
+    """
+
+    def __init__(self, spec: dict, parent=None, group_choices: list[str] | None = None):
         super().__init__(parent)
         self.spec = dict(spec or {})
         title = self.spec.get("title") or self.spec.get("name") or "新工具"
@@ -576,6 +944,28 @@ class OperatorDialog(QDialog):
         desc.setWordWrap(True)
         desc.setObjectName("muted")
         root.addWidget(desc)
+
+        # ---- 分组：放进工具库的哪一组
+        self.group_combo = QComboBox()
+        self.group_combo.setObjectName("toolGroupCombo")
+        # 候选 = 传入的分组 + 恒定的「我的工具」（没选时的默认落点）
+        choices = [str(g) for g in (group_choices or []) if str(g).strip()]
+        if CUSTOM_GROUP not in choices:
+            choices.append(CUSTOM_GROUP)
+        for g in choices:
+            self.group_combo.addItem(g)
+        cur_group = str(self.spec.get("group") or "").strip()
+        if cur_group and self.group_combo.findText(cur_group) >= 0:
+            self.group_combo.setCurrentText(cur_group)
+        else:
+            self.group_combo.setCurrentText(CUSTOM_GROUP)
+        grow = QHBoxLayout()
+        grow.setContentsMargins(0, 0, 0, 0)
+        glab = QLabel("分组")
+        glab.setStyleSheet("font-size:11px;color:#43413c;font-weight:600;")
+        grow.addWidget(glab)
+        grow.addWidget(self.group_combo, 1)
+        root.addLayout(grow)
 
         params = self.spec.get("params") or {}
         if params:
@@ -630,4 +1020,7 @@ class OperatorDialog(QDialog):
     def value(self) -> dict:
         spec = dict(self.spec)
         spec["code"] = self.editor.toPlainText()
+        # 分组：用户选了就用选的；下拉框为空（理论上不会）则回落到默认组
+        picked = str(self.group_combo.currentText() or "").strip()
+        spec["group"] = picked or CUSTOM_GROUP
         return spec

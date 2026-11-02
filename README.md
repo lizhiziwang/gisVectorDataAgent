@@ -3,6 +3,8 @@
 一句话操作矢量数据：拖进 Shapefile / GeoJSON，用中文说需求，Agent 规划算子链、真实执行空间运算、生成新图层，并在内置地图上直接看结果。
 
 界面是**纯 Qt 原生控件**（PySide6 + QWidget + QPainter），没有任何 WebView / 浏览器内核，进程里不会出现 `msedgewebview2.exe`。
+窗口使用自绘无边框标题栏：顶部空白/品牌区可拖动，右上角「Agent 设置」右侧是最小化 / 最大化 / 关闭；
+右下角有尺寸手柄，双击顶部栏可最大化/还原。
 
 ![界面预览](preview.png)
 
@@ -42,11 +44,12 @@ fastapi、uvicorn、pywebview 可以不装。
 | 在地图上高亮显示地块 | `highlight` |
 | 导出地块为 shapefile | 存成 zip |
 
-**26 个内置算子**（按用途分组，与界面左栏一致）：
+**34 个内置算子**（按用途分组，与界面左栏一致）：
 
 | 组 | 算子 |
 |---|---|
 | 概览 | 数据体检、高亮显示 |
+| 栅格 | 栅格体检、栅格裁剪、栅格重投影、栅格重采样、栅格计算、分区统计、栅格镶嵌、栅格转矢量 |
 | 几何构造 | 缓冲区、要素转点、凸包、最小外接矩形、泰森多边形、生成渔网 |
 | 叠加分析 | 裁剪、求交、叠加合并、擦除 |
 | 邻近与连接 | 空间连接、最近邻、范围框选 |
@@ -82,19 +85,40 @@ fastapi、uvicorn、pywebview 可以不装。
 
 - **左栏**：暖灰底，拖入即载入；图层列表带显隐勾选，**双击图层名可直接改名**，
   右键菜单：缩放到图层 / 属性表 / 重命名 / 复制图层 / 只显示此层 / 显示全部 / 导出（4 种格式）/ 删除；
-  重命名会自动避开重名（加序号），也能 `Ctrl+Z` 撤回。下方工具库**按用途分 6 组**排布——
-  概览 / 几何构造 / 叠加分析 / 邻近与连接 / 属性与统计 / 整理（自建算子另起「我的算子」组），
-  组标题带组内算子数、组间以发丝线分隔，组内两列并排；点一下就把该算子的指令模板写进输入框，悬停看算子说明。
-- **中间**：QPainter 自绘地图，支持拖拽平移、滚轮缩放（以光标为中心）、双击放大、悬停高亮、点击看属性、经纬网与比例尺。
-  **Shift + 拖拽 = 框选**（只作用于左栏当前图层）：选中的要素描朱红边 + 淡填充，状态栏实时报数量，
+  重命名会自动避开重名（加序号），也能 `Ctrl+Z` 撤回。点击拖拽区打开**自定义导入弹窗**：
+  可以添加文件或 `.gdb` 文件夹，GPKG / FileGDB 会列出内部图层，勾选后再导入。
+  左栏上方是「图层 / 工作区」两个页签：工作区按「gis-agent → 未分组 → 会话」
+  展示历史会话，每个会话带最近更新时间和图层引用；点开会话会同步恢复对话和图层。
+  图层数据只存共享 `data/cache`，不按会话复制，会话状态只记录引用。
+  下方工具库**先分「矢量」「栅格」两大类**，
+  再按功能分组（矢量：概览 / 几何构造 / 叠加分析 / 邻近与连接 / 属性与统计 / 整理 / 我的工具；
+  栅格：概览 / 处理 / 分析 / 转换）。**一级分类和每个功能分组都可点击收缩**，
+  分组标题带数量、组间以发丝线分隔、组内两列并排；点一下就把该算子的指令模板写进输入框，悬停看算子说明。
+  输入框等标准控件的右键菜单、Qt 原生对话框会自动加载 `qtbase_zh_CN` 翻译，显示中文而不是
+  Undo / Cut / Copy 这类英文。
+- **中间**：QPainter 自绘地图，支持拖拽平移、滚轮缩放（以光标为中心）、双击放大、悬停高亮、点击看属性、经纬网与比例尺。  **Shift + 拖拽 = 框选**（只作用于左栏当前图层）：选中的要素描朱红边 + 淡填充，状态栏实时报数量，
   这时在右栏说一句「做 500 米缓冲区」，会**先把选中要素单独成一层**再执行——算子从此能作用于"一部分"而不是整层。
   Esc 先清选区、再清高亮；点空白处也取消选择。
   **键盘**：`←→↑↓` 平移（按住 Shift 步长 ×4）、`+`/`-` 缩放、`Home` 全图；**中键拖拽**也能平移（GIS 老习惯）。
+- **地图对比**：点地图右上角 `◫`，选左右两张栅格底图，支持左右 50/50 分屏、上下分屏、
+  卷帘拖动、透明度叠加、闪烁对比；中间分隔条可拖动改比例，两侧视图（平移/缩放）实时同步，
+  再点一次按钮退出对比。
   **右键菜单**：全图 / 缩放到当前图层 / 把选中要素存成图层 / 清除选区 / 导出当前视图 / 导出当前图层。
 - **属性表 ↔ 地图联动**：点表格任意一行，地图立刻高亮该要素并缩放到它；表头点击排序（再点反向），
   顶部筛选框对任意列做包含匹配，超过 200 行进分页——不再截断成"只能看前 500 行"。
-- **右栏**：白底对话区；底部是一个整体式的圆角输入容器（圆形箭头发送），Enter 发送 / Shift+Enter 换行，
+- **右栏**：白底对话区；顶部是「对话 / 轨迹」两个页签，后台任务胶囊、面板开关和清空按钮；
+  底部输入容器带模型选择器（打开模型设置）和实时统计（轮数 / 工具步数 / tok/s /
+  总 token / 缓存命中 / 上下文占比）；执行时上方出现「正在调用工具 · xxx」状态条。
+  Enter 发送 / Shift+Enter 换行，
   **`↑`/`↓` 翻之前发过的指令**（单行时接管，多行不会抢光标），Ctrl+O 打开文件，Ctrl+0 全图。
+  Agent 拿到计划后会先显示一张「工具调用计划」卡：逐行列出算子、目标图层和关键参数，
+  执行中实时更新「执行中 / 完成 / 耗时 / 失败」，不再是只转一个计时圈。
+- **逐步确认**：每一步执行前都会弹窗确认，可点「执行这一步 / 跳过这一步 / 取消任务」；
+  下方还能输入补充要求（例如「缓冲区改成 800 米」「只处理当前选区」），模型会先重写
+  这一步再执行；改不出来会停下提示，不会按旧参数硬跑。
+- **Agent 设置**：头部最右侧的「⚙ Agent 设置」管理技能和逐步确认开关。技能就是
+  根目录 `skills/` 下的 Markdown 卡片，在设置里可以添加、编辑、启用/禁用、删除；
+  启用的技能会自动拼进下一次规划提示词（只对模型规划生效）。
 - **导出视图**：`Ctrl+Shift+S`（或地图右键）把当前画面存成 PNG —— 连图例和缩放键一起抓，出报告直接用。
 - **可撤销**：`Ctrl+Z` / `Ctrl+Shift+Z`（或 `Ctrl+Y`）。因为算子只产出新图层，撤销 = 把派生层摘掉/放回，
   包括「删掉的图层按原位置还原」，栈深 20 步。
@@ -117,6 +141,9 @@ fastapi、uvicorn、pywebview 可以不装。
 
 **接了大模型之后，自然语言才是真正自由的。** 规则引擎只认模板句式（「对 X 做 500 米缓冲区」），
 而大模型能把「帮我看看每个小区周边 300 米内有没有地铁站」翻译成算子参数。
+
+普通对话（问「你是什么模型」「1+6666 等于多少」、闲聊、问常识）走**独立的 chat 模式**，
+不要求模型输出 JSON，也不需要先载入数据；只有明确的 GIS 意图才进算子规划。
 
 ### 用 @ 指定图层
 
@@ -201,8 +228,8 @@ fastapi、uvicorn、pywebview 可以不装。
    │        ├─ clarify ──► 界面渲染成**可点选项** ──► 用户点一个
    │        │                    └─「原始需求 + 问题 + 回答」一起回灌 ──► 重新规划 ──► 执行
    │        │
-   │        ├─ new_operator ──► 真的写一个算子 ──► **先给用户看代码** ──► 确认后入库
-   │        │                    └─ 用户可以改代码再保存
+   │        ├─ new_operator ──► 真的写一个工具 ──► **先给用户看代码** ──► 确认后入库
+   │        │                    └─ 用户可以改代码再保存；入库后自动重跑原任务
    │        │
    │        └─ 做不到 ──► 说清缺什么 + 给 1~2 个用现有算子能做的替代方案
    │
@@ -229,6 +256,8 @@ fastapi、uvicorn、pywebview 可以不装。
 | 规划 / 澄清 / 新工具请求的提示词与解析 | [app/agent.py](app/agent.py) `Planner.llm_plan` |
 | 执行失败后的修复回灌 | `app/agent.py` `Planner.llm_repair` |
 | Agent 主循环（规划→执行→观察→修复） | `app/agent.py` `run_agent` |
+| 执行计划卡 / 逐步骤流式状态 | [native/chat.py](native/chat.py) `PlanCard`；`app/agent.py` 的 `plan` / `step` 事件 |
+| 逐步确认 / 每步补充要求 | [native/stepconfirm.py](native/stepconfirm.py) `StepConfirmDialog`；`app/agent.py` `run_plan(confirm_step=...)` / `Planner.revise_step` |
 | 澄清选项的界面渲染 | [native/chat.py](native/chat.py) `ChatPanel.add_clarify` |
 | 澄清闭环的桌面端接线 | [native/app.py](native/app.py) `_show_clarify` / `_on_clarify_picked` |
 | 新工具：生成 → 预览 → 确认 → 入库 | `native/app.py` `_handle_operator_gen` + `native/dialogs.py` `OperatorDialog` |
@@ -284,7 +313,8 @@ fastapi、uvicorn、pywebview 可以不装。
 | `_RenderJob` | `QgsMapRendererJob` | 一次渲染任务的上下文 + 世代号（epoch） |
 | `_RenderWorker` | `QgsMapRendererParallelJob` | 常驻渲染线程，请求队列只留最新一个 |
 | `_LayerJob` | `LayerRenderJob` | **每个图层渲染到自己的一张 QImage** |
-| `_compose()` | `composeImage()` | 在**干净画布**上按顺序把各层叠成整帧 |
+| `_compose_async()` / `_ComposeWorker` | `composeImage()` | 常驻合成线程把各层 QImage 叠成整帧，UI 线程只接一次结果 |
+| `_compose()` | `composeImage()` | 同步合成（单测/兼容路径） |
 | `_img_cache` | `QgsMapRendererCache` | 图层级缓存：键 = 视口 + 尺寸 + dpr + 图层几何版本 |
 | `_RenderSet` | 渲染范围 + `QgsSimplifyMethod` 的组合 | 一个「范围 + 容差」下的一整套路径 |
 | `_select_indices()` | `QgsFeatureRequest::setFilterRect(extent)` | 视口矩形筛要素，**筛完全量画** |
@@ -304,6 +334,23 @@ fastapi、uvicorn、pywebview 可以不装。
 - **合成绝不叠旧帧**：每帧在干净画布上从零合成，整帧画完才替换上屏
   （`QgsMapRendererParallelJob` 结束时换图的语义）。在上一帧上继续叠图层会让
   14% 的填充叠成实色，看起来就像「有些地方渲染错了」。
+- **合成在独立线程**：图层 QImage 在 `_ComposeWorker` 里叠成整帧，主线程只做
+  `QPixmap.fromImage` + `update`；拖拽大栅格时不会再被逐层 `drawImage` 卡住。
+  栅格回调在矢量帧未完成时只更新图，不重复触发全屏合成。
+- **平移只在「露出的空白够宽」时重绘，但松手一定重绘**：拖拽期间画面是把整帧
+  当位图偏移贴上去的（`paintEvent`），偏移多少就露多少空白。重绘阈值取
+  `min(视口 × 0.3, 72 px)` —— 只用比例的话，900 px 宽的视口要拖 270 px 才重绘，
+  小幅拖拽永远等不到，右/下会留一圈空边。松手时（`_end_pan`）无条件重绘一次，
+  因为这时候手停了、正是补齐的时机；`tx/ty` 没变则不重绘，避免纯点击白白渲染。
+- **过期图层图按自己的视口重投影**：视图一变，缓存里的图层图就过期，但新图还在渲染。
+  这时按 `(0,0)` 贴会把整幅图拉回拖拽前的位置（就是「松手后闪一下才归位」）。
+  每张图都记着渲它的那个视口（`_layer_views`），合成时套
+  `translate(tx,ty)·scale(s/s0)·translate(-tx0,-ty0)` —— 对世界坐标精确，
+  纯平移是整数位移，缩放是精确等比变换。
+- **视口移出数据范围也要出空帧**：`_make_snapshot()` 为空时不能一律「继续显示旧帧」，
+  那只对「几何还在建」成立。判断依据是 `_build_pending()`：没有在飞的构建、
+  也没有可用渲染集，就说明这个视口里确实没东西（拖到数据范围外了），
+  必须合成空帧，否则屏幕上的旧内容永远不动，看着像「拖不动」。
 - **世代号（epoch）**：视图一变就 +1，旧世代的帧和图层图一律丢弃，旧帧不会覆盖新帧。
 - **取消不阻塞**：对应 QGIS 的 `feedback()->cancel()`，旧任务在图层间隙收工；
   但**不取消正在跑的任务**，否则连续缩放时每帧都半途而废、屏幕一直停在旧画面。
@@ -371,10 +418,131 @@ QPainter 在 GL 上要把路径三角化（stencil-and-cover），而 CPU 光栅
 > 读 `.cpg` 编码一次读对（不再三遍择优）」把影响降到最低。
 
 
+### 栅格渲染管线（第二条管线，与矢量完全隔离）
+
+栅格和矢量是**两条互不相干的管线**。矢量那边的一切（渲染集、简化、按批合并、
+几何缓存）对栅格完全不适用，所以栅格自己一套，代码在 `native/rasterview.py`，
+矢量管线一行没改。
+
+隔离靠的是一个很薄的缝：`MapView.set_layers()` 把图层分成 `_vec_layers` 和
+`_raster_layers`，**栅格不建 `_LayerCache`**。矢量渲染的每个循环都是
+`if self._cache.get(id) is None: continue` 开头，于是栅格天然被所有矢量逻辑跳过 ——
+不需要在每个循环里加 `if is_raster: continue`。
+
+| 本项目 | QGIS 对应 | 说明 |
+| --- | --- | --- |
+| `RasterViewPort` | `QgsRasterViewPort` | 视口快照：范围、像素尺寸、缩放、dpr |
+| `_RasterItem` / `_RasterJob` | `LayerRenderJob`（栅格版） | 每个栅格自己一张全视口透明 QImage |
+| `_RasterWorker` | `QgsMapRendererParallelJob` | 独立渲染线程，只保留最新请求 |
+| `render_layer_image()` | `QgsRasterLayerRenderer::render()` | 求像素矩形 → 按目标尺寸取块 → 画进视口图 |
+| `read_window()` | `QgsRasterIterator::readBlock()` | **按屏幕像素尺寸抽取**，不整幅读入内存 |
+| `resampling` | `QgsRasterResampleFilter` | nearest / bilinear / cubic / average |
+| `percentile_stretch()` | `QgsContrastEnhancement` | 累计裁剪拉伸（默认 2%–98%） |
+
+要点：
+
+- **只读屏幕需要的像元**：`read_window()` 用 rasterio 的窗口读 + `out_shape` 降采样，
+  1 万×1 万的 GeoTIFF 在 700 px 的视口里只解码 700×N 个像素，载入时只读文件头
+  （`read_info()`，不碰像素），所以大栅格是「秒开」而不是「先卡十秒」。
+- **打开前检查金字塔**：没有 overview / `.ovr` 的大栅格会弹窗询问是否生成；
+  生成时用 GDAL 的真实进度条，输出外部 `.ovr`，不改原 TIFF。没有金字塔时
+  先降采样再读，大图缩放会明显变慢。
+- **不按视口裁剪图片**：和矢量一样，每个栅格渲染成**整视口大小**的透明图，
+  `_compose()` 只需多一句 `drawImage(0, 0, img)`，不用管偏移。
+- **过期图不扔，按自己的视口挪过去**（这一条决定了拖拽的手感）：视图一变，
+  手上的图层图就过期了，但新图还在后台线程里渲。直接按 `(0, 0)` 贴等于把整个世界
+  拉回原处 —— 用户看到的正是「松手后先跳回拖拽前的样子，过一会儿才归位」。
+  所以每张图都记着自己是按哪个视口渲的（`_layer_views` / `RasterPipeline.view_of()`），
+  合成时套一次
+
+      translate(tx, ty) · scale(s / s0) · translate(-tx0, -ty0)
+
+  世界坐标里的点 w 在旧视口下是 `p0 = w·s0 + tx0`，代入得 `w·s + tx`，正好是它在新视口下
+  的位置 —— 纯平移是精确的整数位移，缩放是以视口为基准的精确等比变换。代价只有
+  「旧图分辨率不够 / 边缘缺一条」，位置始终正确。这套规则**矢量和栅格共用**
+  （`MapView._blit_view_image`），因为矢量的图层图也是整视口大小的，同样会过期。
+- **栅格回调不能抢先上屏**：栅格是异步的，它完成时矢量 job 可能还在跑，那时
+  `_layer_imgs` 只是一套「缓存命中的子集」，拿它合成会把正在重画的矢量层整片抹掉。
+  用 `_vec_busy` 闸住：矢量空闲才允许栅格驱动上屏，否则只更新 `_pending`，
+  等矢量的整帧回来一起上。首次出图（`_frame is None`）例外，那是渐进显示的宽限期。
+- **合成层是两条管线唯一的共用写画布路径，必须逐层兜底**：`_compose()` 里栅格先画，
+  任何一层抛异常都会让后面的矢量整片消失；而且异常发生在 `p.save()` 之后会把画笔
+  留在活跃状态，后续合成全部报 "paint device can only be painted by one painter"。
+  所以每层单独 `try/except` + `finally: p.end()`，一层坏了只丢那一层。
+- **所有进 `_blit_view_image()` 的坐标必须先转 Python `float`**：`fit_bounds()` 直接吃
+  `gdf.total_bounds` 的 `numpy.float64` 时，`scale/tx/ty` 也会是 numpy 标量，
+  `abs(scale/s0 - 1) > 1e-9` 得到 `numpy.bool_`，`QPainter.setRenderHint()` 不接受，
+  会抛 TypeError。`fit_bounds` / `zoom_at` / `RasterViewPort` 三处都已归一。
+- **缓存键与矢量同构**：`(scale, tx, ty, w, h, dpr, rev)`。平移/缩放没变化就直接复用，
+  `request()` 返回 `False` 表示整帧都有缓存，一帧都不用重算。
+- **投影共用一套函数**（`native/proj.py`）：两条管线各自实现 Web Mercator 早晚会算出
+  半像素的偏差，栅格和矢量叠在一起就是「地块压不住影像」。
+- **N 波段 → RGBA**：3/4 波段按 RGB(A) 合成，单/双波段走灰度 + 百分位拉伸；
+  `nodata` 写进 alpha=0，不要用黑色填充（不然影像边界会出现一圈黑边）。
+- **`QImage` 必须 `.copy()`**：numpy 的缓冲区 Qt 不持有所有权，直接 `fromData`
+  会在一帧后被回收成花屏。
+
+### 通用栅格工具（8 个，与矢量算子同一套契约）
+
+栅格不只能看，也能像矢量一样被自然语言/工具库调用。实现集中在 `app/raster_ops.py`：
+裁剪/重投影/重采样/计算/镶嵌返回新的 GeoTIFF 图层，`raster_info` 只体检、
+`zonal_stats` 返回带统计字段的面图层；原始文件只读不改。rasterio 只在真正执行时导入，
+纯矢量流程的启动不加载 GDAL。
+
+| 工具 | 作用 | 关键参数 |
+| --- | --- | --- |
+| `raster_info` | 栅格体检：尺寸、波段、dtype、CRS、分辨率、nodata、各波段抽样统计 | `layer` |
+| `raster_clip` | 按经纬度 bbox 或面图层裁剪 | `layer`、`mask` / `bbox`、`all_touched` |
+| `raster_reproject` | 重投影到目标 EPSG | `layer`、`epsg`、`resampling`、`resolution` |
+| `raster_resample` | 按比例或目标分辨率重采样（0.5 = 宽高减半） | `layer`、`scale` / `resolution`、`resampling` |
+| `raster_calc` | 栅格计算器：`b1…bN` + 四则/`where`/`clip`/`sqrt` 等，输出单波段 float32 | `layer`、`expression` |
+| `zonal_stats` | 分区统计：把栅格值按面汇总，给面图层新增字段 | `layer`（面）、`raster`、`band`、`stats` |
+| `raster_merge` | 多栅格镶嵌（要求同 CRS / 波段数 / dtype） | `layers`、`resampling`、`nodata` |
+| `raster_to_vector` | 按像元值转面（polygonize），`scale` 控制要素数量 | `layer`、`band`、`scale` |
+
+实现要点：
+
+- **按窗口/按块处理**：裁剪用 `rasterio.mask` / `Window`，重投影按输出块 `reproject`，
+  栅格计算按 1024×1024 块读写，分区统计对每个面用 `geometry_window` 只读覆盖的像元；
+  大影像不会整幅读进内存。
+- **NDVI 就是栅格计算**：`(b4-b3)/(b4+b3)` 用 `raster_calc` 跑，不必为每个指数写死一个算子。
+- **栅格/矢量在规划层也分流**：`validate_plan()` 会在执行前拒绝「对栅格做缓冲区」这类
+  请求，并给出可用的栅格工具；`zonal_stats` 是唯一同时吃「面 + 栅格」的工具。
+- **$prev 串联**：和矢量一样，上一步的栅格结果可以用 `$prev` 传给下一步，
+  例如「裁剪影像 → 对结果重采样」。
+- **网页版仍不提供栅格工具**：上传纯栅格会提示用桌面版（见 `app/main.py` 的过滤）。
+
+已知边界：栅格仍没有属性表、不能做矢量叠加（误操作会在校验期得到一句中文错误），
+也没有拉伸/伪彩色面板（默认参数写死在 `RasterLayer.style` 里）。网页版还没有栅格管线，
+上传纯栅格压缩包会明确提示用桌面版。
+
+
 ## 支持的格式
 
-读：`.zip`（可含多个 shp，弹窗勾选要载入哪些）、`.shp`、`.geojson/.json`、`.gpkg`、`.kml`、`.gml`、`.csv`（经纬度列或 WKT 列）
-写：GeoJSON、GeoPackage、Shapefile（zip）、CSV（含 WKT）
+读：`.zip`（可含多个 shp / GeoTIFF，弹窗勾选要载入哪些）、`.shp`、`.geojson/.json`、`.gpkg`、`.kml`、`.gml`、`.csv`（经纬度列或 WKT 列）
+栅格读：`.tif/.tiff`、`.img`、`.vrt`、`.jp2`（依赖 `rasterio`，它自带 GDAL）
+FileGDB：`.gdb` 文件夹（Esri File Geodatabase，依赖纯 Python 的 `pyopenfilegdb`）
+写：GeoJSON、GeoPackage、Shapefile（zip）、CSV（含 WKT）；栅格「导出」是复制原文件，不做重编码
+
+### Esri FileGDB（.gdb）
+
+`.gdb` 是**文件夹数据库**，一个库里可以有多个要素类。点顶栏「＋ GDB」选文件夹，
+或直接把 `.gdb` 文件夹拖进窗口：
+
+- 列出库里所有要素类，逐个导入为图层，名字是 `库名/要素类名`（如 `2024国土/村行政区划`）；
+- 属性、几何、坐标系（WGS84 / CGCS2000 3 度带等）都保留，后续和普通矢量图层一样做算子；
+- 也支持压缩包里放 `.gdb` 文件夹；
+- 读取走纯 Python 的 [`pyopenfilegdb`](https://github.com/lizhiziwang/pyopengdb)，
+  不依赖 GDAL / fiona：
+
+  ```bash
+  pip install "pyopenfilegdb @ git+https://github.com/lizhiziwang/pyopengdb.git"
+  ```
+
+  没装时打开 GDB 会给出这条安装提示，不影响其他格式。它自带的
+  `_gdbaccel` C 扩展会加速 GDB 的二进制解码；本项目再用
+  `Geometry.xy_parts + shapely.from_ragged_array` 批量转 GeoDataFrame，
+  350 MB / 2.4 万面的库实测从逐要素转换的约 88 秒降到约 8 秒。
 
 ### 大图层：内存预算 + 磁盘换出
 
@@ -393,9 +561,12 @@ QPainter 在 GL 上要把路径三角化（stencil-and-cover），而 CPU 光栅
 gis-agent/
 ├─ native_app.py / run.py / desktop.py   三个入口：桌面版 / 网页版 / 网页版套原生窗口
 ├─ native/      纯 Qt 界面层：主窗口（app.py）、地图与渲染管线（mapview.py）、
-│               对话面板（chat.py）、对话框（dialogs.py）、任务中心（taskcenter.py）、
+│               对话面板（chat.py）、对话框（dialogs.py / agent_settings.py）、
+│               任务通知（taskcenter.py 的 TaskNotice）、
 │               记忆管理面板（memory_panel.py）、主题（theme.py）
-├─ app/         与界面无关的内核：图层仓库与 25 个算子（engine.py）、两级规划器与执行器
+│
+├─ skills/      Agent 技能卡（Markdown + frontmatter）；在「Agent 设置」里管理
+├─ app/         与界面无关的内核：图层仓库、26 个矢量算子 + 8 个栅格算子（engine.py / raster_ops.py）、两级规划器与执行器
 │               （agent.py）、算子契约与参数校验（tool_registry.py）、自定义算子（custom_ops.py）、
 │               矢量读写（io_utils.py）、会话与记忆持久化（storage.py / models.py）、
 │               任务调度与事件流（runtime.py）、记忆提取与检索（memory.py）、
@@ -423,8 +594,9 @@ gis-agent/
 
 - 聊天 / 导出 / 导入 / 生成算子都进同一个优先级队列（聊天 100 > 生成算子 90 >
   导出 70 > 导入 60），单写通道串行执行——GIS 算子会新建图层，并行写要上 MVCC，第一版不做。
-- 右栏顶部有**任务中心**：执行中 / 排队中 / 已完成 / 失败一目了然，
-  可以**取消**排队或执行中的任务、**重试**失败的任务、**看日志**回放这次运行。
+- **地图顶部居中**显示任务通知：执行中 / 排队中 / 已完成 / 失败一目了然，
+  可以**取消**排队或执行中的任务、**重试**失败的任务、**看日志**回放这次运行；
+  通知不占用右栏对话空间，完成后自动消失，失败会保留更久。
 - 分析运行中导出不再被拒绝，而是排到队列后面；不再覆盖 `_worker`，没有 QThread 崩溃风险。
 - 取消是**协作式**的：长 GEOS 调用杀不掉，语义是「当前步骤跑完后停止」，界面显示「正在取消…」。
 - 关窗时若有任务在跑会先问一句：等它跑完，还是取消并关闭。
@@ -457,9 +629,11 @@ gis-agent/
 这是开发者视角（写代码加算子），和界面上「＋ 新建工具」（让大模型写）不是一回事。
 
 1. 在 `app/engine.py` 写 `def _my_op(store, layer, ...) -> Result`，返回 `Result(ok, message, new_layer, warnings, data)`；
-2. 注册到 `OPERATIONS`；
-3. 在 `app/agent.py` 的 `TOOL_SPECS` / `TOOL_LABEL` 加签名与中文名（大模型、工具库按钮都会自动读到）；
-4. 若要支持固定说法，在 `_parse_clause` 里加一条正则分支。
+2. 注册到 `OPERATIONS`（矢量在 `engine.py`，栅格在 `raster_ops.py`）；
+3. 在 `app/tool_registry.py` 加 `ToolSpec`（参数 schema / 中文名 / 分组），
+   大模型提示词、工具库按钮、参数校验会自动读到；
+4. 若是栅格算子，还要在 `native/app.py` 的 `RASTER_TOOL_GROUPS` 里归到「概览 / 处理 / 分析 / 转换」之一；
+5. 若要支持固定说法，在 `_parse_clause` 里加一条正则分支。
 
 ## 已知边界
 

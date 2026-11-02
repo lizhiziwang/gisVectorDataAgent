@@ -39,6 +39,16 @@ PREDICATES = ("intersects", "contains", "within", "overlaps", "touches", "crosse
               "covers", "covered_by")
 JOIN_HOWS = ("inner", "left", "right")
 
+#: 自定义算子的默认分组。用户新建工具时没指定分组，就落在这里。
+#: 改名时只需改这一处 —— 引擎、界面、持久化都引用它。
+CUSTOM_GROUP = "我的工具"
+
+#: 内置算子的分组顺序（工具库展示顺序）。
+BUILTIN_GROUP_ORDER = ["概览", "栅格", "几何构造", "叠加分析", "邻近与连接", "属性与统计", "整理"]
+
+#: 新建工具弹窗里可选的分组。
+GROUP_CHOICES = BUILTIN_GROUP_ORDER + [CUSTOM_GROUP]
+
 
 def _default_prompt(p: "Param") -> str:
     """把参数说明拼成一句给模型看的话。"""
@@ -325,6 +335,68 @@ def _build_builtins() -> dict[str, ToolSpec]:
         ToolSpec("explode", "拆分多部件", "整理",
                  "多部件几何拆分为单部件",
                  {"layer": _layer()}, "拆分「{L}」的多部件"),
+        # ---------------------------------------------------------------- 栅格
+        ToolSpec("raster_info", "栅格体检", "栅格",
+                 "栅格体检：尺寸、波段、dtype、坐标系、分辨率、nodata 与各波段抽样统计（不生成新图层）",
+                 {"layer": _layer("栅格图层名")},
+                 "看一下「{L}」的波段和取值范围", output="none"),
+        ToolSpec("raster_clip", "栅格裁剪", "栅格",
+                 "按经纬度 bbox 或面图层裁剪栅格，输出新的 GeoTIFF；mask 与 bbox 二选一",
+                 {"layer": _layer("栅格图层名"),
+                  "mask": Param("mask", "string", "裁剪面图层（可选）"),
+                  "bbox": Param("bbox", "string", "经纬度范围 x0,y0,x1,y1（可选）"),
+                  "all_touched": _p("all_touched", "boolean", "是否包含与面相交的像元", False, False),
+                  "nodata": _p("nodata", "number", "输出 nodata 值（可选，默认沿用源）")},
+                 "用「{O}」裁剪「{L}」"),
+        ToolSpec("raster_reproject", "栅格重投影", "栅格",
+                 "把栅格转换到目标 EPSG；可指定目标分辨率（目标 CRS 单位）",
+                 {"layer": _layer("栅格图层名"),
+                  "epsg": _p("epsg", "string", "目标 EPSG 编号，如 4326/3857/4544", True),
+                  "resampling": _p("resampling", "string", "重采样方式", False, "bilinear",
+                                   ("nearest", "bilinear", "cubic", "average", "mode", "lanczos")),
+                  "resolution": _p("resolution", "number", "目标分辨率（可选，目标 CRS 单位）", False,
+                                   minimum=0.0000001)},
+                 "把「{L}」重投影到 EPSG:3857"),
+        ToolSpec("raster_resample", "栅格重采样", "栅格",
+                 "按比例或目标分辨率重采样：scale=0.5 宽高各减半；也可用 resolution 指定目标像元大小",
+                 {"layer": _layer("栅格图层名"),
+                  "scale": _p("scale", "number", "缩放比例", False, 0.5, minimum=0.001, maximum=20),
+                  "resolution": _p("resolution", "number", "目标分辨率（目标 CRS 单位，可选；优先于 scale）",
+                                   False, minimum=0.0000001),
+                  "resampling": _p("resampling", "string", "重采样方式", False, "bilinear",
+                                   ("nearest", "bilinear", "cubic", "average", "mode", "lanczos"))},
+                 "把「{L}」重采样到一半"),
+        ToolSpec("raster_calc", "栅格计算", "栅格",
+                 "栅格计算器：用 b1…bN 表示各波段，输出单波段 float32；支持 + - * / **、"
+                 "where/clip/abs/sqrt/log 等。例：NDVI=(b4-b3)/(b4+b3)",
+                 {"layer": _layer("栅格图层名"),
+                  "expression": _p("expression", "string",
+                                   "计算表达式，b1…bN 是波段，如 (b4-b3)/(b4+b3)", True)},
+                 "计算「{L}」的 NDVI：(b4 - b3) / (b4 + b3)"),
+        ToolSpec("zonal_stats", "分区统计", "栅格",
+                 "把栅格值按面要素汇总，给面图层新增字段（均值/最值/标准差/总和/计数）",
+                 {"layer": _layer("面图层名"),
+                  "raster": Param("raster", "string", "栅格图层名", True),
+                  "band": _p("band", "integer", "栅格波段号（从 1 开始）", False, 1, minimum=1),
+                  "stats": _p("stats", "string", "统计项，逗号分隔",
+                              False, "mean,min,max,std,sum,count"),
+                  "prefix": _p("prefix", "string", "新增字段前缀", False, "r"),
+                  "all_touched": _p("all_touched", "boolean", "是否包含与面相交的像元", False, False)},
+                 "统计「{O}」在「{L}」各面内的均值"),
+        ToolSpec("raster_merge", "栅格镶嵌", "栅格",
+                 "把多个栅格镶嵌成一整幅；要求同 CRS、同波段数、同 dtype",
+                 {"layers": _p("layers", "array", "栅格图层名数组，可用 * 表示全部栅格", True),
+                  "resampling": _p("resampling", "string", "重采样方式", False, "bilinear",
+                                   ("nearest", "bilinear", "cubic", "average", "mode", "lanczos")),
+                  "nodata": _p("nodata", "number", "输出 nodata 值（可选）")},
+                 "把「{L}」和「{O}」镶嵌成一整幅"),
+        ToolSpec("raster_to_vector", "栅格转矢量", "栅格",
+                 "按像元值把栅格转成面（polygonize）；scale<1 先降采样以控制要素数量",
+                 {"layer": _layer("栅格图层名"),
+                  "band": _p("band", "integer", "波段号（从 1 开始）", False, 1, minimum=1),
+                  "scale": _p("scale", "number", "降采样比例（0~1）", False, 1.0,
+                              minimum=0.001, maximum=1.0)},
+                 "把「{L}」转成矢量面"),
     ]
     return {s.name: s for s in specs}
 
@@ -357,7 +429,7 @@ def template_map() -> dict:
 
 
 def groups() -> list[tuple[str, list[str]]]:
-    order = ["概览", "几何构造", "叠加分析", "邻近与连接", "属性与统计", "整理", "我的算子"]
+    order = BUILTIN_GROUP_ORDER + [CUSTOM_GROUP]
     out: dict[str, list[str]] = {g: [] for g in order}
     for n in _ORDER:
         s = REGISTRY.get(n)

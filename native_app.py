@@ -23,11 +23,13 @@ def main() -> int:
     from PySide6.QtGui import QFont
     from PySide6.QtWidgets import QApplication
 
-    from native.app import MainWindow, make_icon
+    from native.app import MainWindow, install_qt_translations, make_icon
 
     QApplication.setApplicationName("GIS 矢量数据 Agent")
     QApplication.setOrganizationName("local")
     app = QApplication(sys.argv)
+    # 让输入框右键菜单 / 文件对话框走 Qt 自带中文翻译
+    install_qt_translations(app)
     app.setWindowIcon(make_icon())
     app.setFont(QFont("Microsoft YaHei UI", 9))
     win = MainWindow()

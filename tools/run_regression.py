@@ -27,7 +27,7 @@ GUI_TESTS = {
     "test_ux_more.py", "test_visible.py", "test_agent_v2.py",
     "test_task_center.py", "test_clarify_flow.py", "test_settings_dialog.py",
     "test_mentions_desktop.py", "test_highlight_desktop.py",
-    "test_highlight_agent.py",
+    "test_highlight_agent.py", "test_tool_groups.py",
 }
 
 #: 需要外部服务（真实 LLM 接口）的测试，跳过。
@@ -50,6 +50,7 @@ ORDER = [
     "test_highlight.py",
     "test_highlight_desktop.py",
     "test_highlight_agent.py",
+    "test_tool_groups.py",
     "test_multitask.py",
     "test_runtime_phase2.py",
     "test_memory_ui.py",
@@ -77,6 +78,9 @@ def main() -> int:
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUNBUFFERED"] = "1"
+    # 逐步骤人工确认默认开启；回归里的旧流程脚本用自动确认，避免弹窗阻塞。
+    # 专门测确认的 test_step_confirm.py 会在脚本内部覆盖成 1。
+    env.setdefault("GIS_AGENT_CONFIRM_STEPS", "0")
     env.setdefault("QT_QPA_PLATFORM", "offscreen")
 
     passed, failed, skipped = [], [], []

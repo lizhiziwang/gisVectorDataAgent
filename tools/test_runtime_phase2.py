@@ -14,6 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ.setdefault("GIS_AGENT_CONFIRM_STEPS", "0")
 os.environ["GIS_AGENT_PERSIST"] = "0"
 
 import geopandas as gpd

@@ -26,6 +26,11 @@ import shapely
 ROOT = Path(__file__).resolve().parent.parent
 OPS_DIR = ROOT / "data" / "operators"
 
+#: 本进程里已注册的自定义算子名。
+#: 用来区分「撞上内置算子」（要拒绝）和「改自己以前装过的算子」（要放行）——
+#: 不能靠分组名判断，因为自定义工具现在也能被放进内置分组。
+_CUSTOM_NAMES: set[str] = set()
+
 # 生成代码里允许出现的名字（其余一律拒绝）
 _ALLOWED_BUILTINS = (
     "abs", "all", "any", "bool", "dict", "divmod", "enumerate", "filter", "float",
@@ -165,6 +170,7 @@ def _safe_name(name: str) -> str:
 
 def save(spec: dict) -> dict:
     """保存到 data/operators/<name>.json，返回补全后的 spec。"""
+    from .tool_registry import CUSTOM_GROUP, GROUP_CHOICES
     spec = dict(spec or {})
     spec["name"] = _safe_name(spec.get("name") or spec.get("title"))
     spec["title"] = (spec.get("title") or spec["name"]).strip()[:24]
@@ -172,6 +178,9 @@ def save(spec: dict) -> dict:
     spec["params"] = spec.get("params") or {}
     spec["code"] = spec.get("code") or ""
     spec["created"] = spec.get("created") or time.strftime("%Y-%m-%d %H:%M:%S")
+    # 分组：只认白名单里的组，没选或写错了就落「我的工具」
+    group = str(spec.get("group") or "").strip()
+    spec["group"] = group if group in GROUP_CHOICES else CUSTOM_GROUP
     check_code(spec["code"])
     OPS_DIR.mkdir(parents=True, exist_ok=True)
     (OPS_DIR / f"{spec['name']}.json").write_text(
@@ -204,18 +213,21 @@ def install(spec: dict) -> dict:
     """
     from .agent import register_tool_spec
     from .engine import OPERATIONS, make_custom_operator
+    from .tool_registry import CUSTOM_GROUP
 
     spec = dict(spec)
     spec["name"] = _safe_name(spec.get("name") or spec.get("title"))
-    from .tool_registry import REGISTRY
-    existing = REGISTRY.get(spec["name"])
-    if spec["name"] in OPERATIONS and (existing is None or existing.group != "我的算子"):
+    # 同名时：只要是**我们以前装过的**自定义算子，就允许覆盖（改完重存）；
+    # 撞上真正的内置算子则拒绝。
+    if spec["name"] in OPERATIONS and spec["name"] not in _CUSTOM_NAMES:
         raise OperatorError(
             f"算子名「{spec['name']}」与内置算子冲突，请换一个名字（例如 custom_{spec['name']}）。")
     OPERATIONS[spec["name"]] = make_custom_operator(spec)
+    _CUSTOM_NAMES.add(spec["name"])
     register_tool_spec(spec["name"], spec.get("title") or spec["name"],
                        spec.get("desc") or "自定义算子",
-                       spec.get("params") or {"layer": "图层名"})
+                       spec.get("params") or {"layer": "图层名"},
+                       group=spec.get("group") or CUSTOM_GROUP)
     return spec
 
 
@@ -241,11 +253,15 @@ def remove(name: str) -> bool:
         except Exception:
             return False
     try:
-        from .agent import TOOL_LABEL, TOOL_SPECS
+        from .agent import TOOL_GROUP, TOOL_LABEL, TOOL_SPECS
         from .engine import OPERATIONS
+        from .tool_registry import REGISTRY
         OPERATIONS.pop(name, None)
         TOOL_LABEL.pop(name, None)
+        TOOL_GROUP.pop(name, None)
+        REGISTRY.pop(name, None)
         TOOL_SPECS[:] = [s for s in TOOL_SPECS if s.get("name") != name]
     except Exception:
         pass
+    _CUSTOM_NAMES.discard(name)
     return ok

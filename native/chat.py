@@ -5,11 +5,13 @@ from typing import Callable
 
 from PySide6.QtCore import QSize, QThread, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea,
-                               QSizePolicy, QTableWidget, QTableWidgetItem, QTextEdit,
+from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QMenu, QPlainTextEdit,
+                               QPushButton, QScrollArea, QSizePolicy, QStackedWidget,
+                               QTabBar, QTableWidget, QTableWidgetItem, QTextEdit,
                                QVBoxLayout, QWidget)
 
 from .format import kv_text
+from .icons import panel_icon
 
 
 def _send_icon(busy: bool = False, color: str = "#ffffff", px: int = 16) -> QIcon:
@@ -157,7 +159,13 @@ class StepCard(QFrame):
 
         if step.get("layer"):
             lay = step["layer"]
-            bl.addWidget(_label(f"＋ 新图层「{lay.get('name')}」· {lay.get('count')} 要素", "newLayerTag"))
+            if str(lay.get("geomType") or "") == "Raster":
+                r = lay.get("raster") or {}
+                tag = (f"＋ 新栅格图层「{lay.get('name')}」· "
+                       f"{r.get('width')}×{r.get('height')} 像元 · {r.get('bands')} 波段")
+            else:
+                tag = f"＋ 新图层「{lay.get('name')}」· {lay.get('count')} 要素"
+            bl.addWidget(_label(tag, "newLayerTag"))
 
         acts = QHBoxLayout()
         acts.setSpacing(6)
@@ -225,6 +233,187 @@ def _bubble_size(text: str, fm, maxw: int) -> int:
     return max(20, min(maxw, r.width() + 4))
 
 
+class PlanCard(QFrame):
+    """执行计划卡：先列出所有步骤，再随执行逐行变成「执行中 / 完成 / 失败」。
+
+    和最终结果卡不同，这里放的是**计划阶段**就能知道的信息（算子、目标图层、
+    参数），不依赖算子返回；用户不用盯着一个「正在规划并执行…」转圈。
+    """
+
+    _DOT = {
+        "pending": "#c9c4b8",
+        "confirm": "#6f8fb5",
+        "running": "#d8a54a",
+        "ok": "#3f7d58",
+        "warn": "#d8a54a",
+        "error": "#b04a3f",
+        "skipped": "#a9a396",
+        "cancelled": "#b04a3f",
+    }
+
+    def __init__(self, plan: list[dict], source: str = "", win=None):
+        super().__init__()
+        self.setObjectName("planCard")
+        self._win = win
+        self._rows: list[dict] = []
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(10, 8, 10, 8)
+        outer.setSpacing(5)
+
+        head = QHBoxLayout()
+        head.setSpacing(7)
+        title = QLabel("工具调用计划")
+        title.setObjectName("planTitle")
+        head.addWidget(title)
+        src = "大模型规划" if source in ("llm", "chat") else "规则规划"
+        self._source = QLabel(src)
+        self._source.setObjectName("planSource")
+        head.addWidget(self._source)
+        head.addStretch(1)
+        self._count = QLabel(f"0/{max(0, len(plan))} 完成")
+        self._count.setObjectName("planCount")
+        head.addWidget(self._count)
+        outer.addLayout(head)
+
+        self._host = QWidget()
+        self._vl = QVBoxLayout(self._host)
+        self._vl.setContentsMargins(0, 0, 0, 0)
+        self._vl.setSpacing(0)
+        outer.addWidget(self._host)
+
+        for i, st in enumerate(plan or []):
+            self._add_row(i, st)
+        self._refresh_count()
+
+    # ---------------------------------------------------------------- 行
+    @staticmethod
+    def _detail_text(step: dict) -> str:
+        detail = str(step.get("detail") or "").strip()
+        if detail:
+            return detail
+        args = step.get("args") or {}
+        if not isinstance(args, dict):
+            return ""
+        bits = []
+        for k in ("layer", "other", "mask", "layer2", "join_layer", "raster"):
+            v = args.get(k)
+            if isinstance(v, str) and v:
+                bits.append(v)
+        return " · ".join(bits[:3])
+
+    def _add_row(self, index: int, step: dict) -> dict:
+        row = QFrame()
+        row.setObjectName("planRow")
+        hl = QHBoxLayout(row)
+        hl.setContentsMargins(2, 4, 2, 4)
+        hl.setSpacing(7)
+
+        dot = QLabel()
+        dot.setFixedSize(8, 8)
+        dot.setStyleSheet("background:%s;border-radius:4px;"
+                          % self._DOT["pending"])
+        hl.addWidget(dot, 0, Qt.AlignTop)
+
+        num = QLabel(f"{index + 1:02d}")
+        num.setObjectName("planNum")
+        num.setFixedWidth(20)
+        hl.addWidget(num, 0, Qt.AlignTop)
+
+        info = QVBoxLayout()
+        info.setSpacing(1)
+        name = _label(step.get("label") or step.get("tool") or "算子", "planName", True, 260)
+        detail = _label(self._detail_text(step), "planDetail", True, 300)
+        detail.setVisible(bool(detail.text()))
+        info.addWidget(name)
+        info.addWidget(detail)
+        hl.addLayout(info, 1)
+
+        state = _label("等待", "planState", False)
+        state.setFixedWidth(56)
+        state.setAlignment(Qt.AlignRight | Qt.AlignTop)
+        hl.addWidget(state, 0, Qt.AlignTop)
+
+        self._vl.addWidget(row)
+        item = {"dot": dot, "name": name, "detail": detail, "state": state,
+                "step": dict(step or {})}
+        self._rows.append(item)
+        return item
+
+    def update_step(self, index: int, payload: dict) -> None:
+        if index < 0:
+            return
+        while index >= len(self._rows):
+            self._add_row(len(self._rows), payload)
+        item = self._rows[index]
+        st = str(payload.get("status") or "running")
+        item["step"].update(payload)
+        color = self._DOT.get(st, self._DOT["pending"])
+        item["dot"].setStyleSheet("background:%s;border-radius:4px;" % color)
+        if payload.get("label"):
+            item["name"].setText(_soft_break(str(payload["label"])))
+        if payload.get("detail"):
+            item["detail"].setText(_soft_break(str(payload["detail"])))
+            item["detail"].setVisible(True)
+        el = payload.get("elapsed") or 0
+        if st == "running":
+            item["state"].setText("执行中…")
+        elif st == "confirm":
+            item["state"].setText("待确认")
+        elif st == "pending":
+            item["state"].setText("等待")
+        elif st == "skipped":
+            item["state"].setText("已跳过")
+        elif st == "cancelled":
+            item["state"].setText("已取消")
+            msg = str(payload.get("message") or "").strip()
+            if msg:
+                item["detail"].setText(_soft_break(msg))
+                item["detail"].setVisible(True)
+        elif st == "error":
+            item["state"].setText("失败")
+            msg = str(payload.get("message") or "").strip()
+            if msg:
+                item["detail"].setText(_soft_break(msg))
+                item["detail"].setVisible(True)
+        elif st == "warn":
+            item["state"].setText(f"{el:.1f}s" if el else "完成")
+        else:
+            item["state"].setText(f"{el:.1f}s" if el else "完成")
+        self._refresh_count()
+
+    def finish(self, failed: bool = False) -> None:
+        if failed:
+            text = f"{sum(1 for r in self._rows if r['step'].get('status') == 'error')} 步失败"
+        else:
+            skipped = sum(1 for r in self._rows
+                          if r["step"].get("status") == "skipped")
+            done = sum(1 for r in self._rows
+                       if r["step"].get("status") in ("ok", "warn", "error"))
+            text = f"{done}/{len(self._rows)} 完成"
+            if skipped:
+                text += f" · {skipped} 跳过"
+        self._count.setText(text)
+        self._count.setObjectName("planErr" if failed else "planCount")
+        self._count.style().unpolish(self._count)
+        self._count.style().polish(self._count)
+
+    def fail(self, message: str = "") -> None:
+        for item in self._rows:
+            if str(item["step"].get("status") or "pending") in ("running", "pending", "confirm"):
+                item["state"].setText("未执行")
+        self._count.setText("已中止" if not message else "执行出错")
+        self._count.setObjectName("planErr")
+        self._count.style().unpolish(self._count)
+        self._count.style().polish(self._count)
+
+    def _refresh_count(self) -> None:
+        done = sum(1 for r in self._rows
+                   if str(r["step"].get("status") or "") in
+                   ("ok", "warn", "error", "skipped", "cancelled"))
+        self._count.setText(f"{done}/{len(self._rows)} 完成")
+
+
 class ChatPanel(QWidget):
     sent = Signal(str)
 
@@ -243,11 +432,11 @@ class ChatPanel(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # 头部
+        # 头部：助手标题 + 后台任务胶囊 + 面板开关 + 清空
         head = QWidget()
         hl = QHBoxLayout(head)
-        hl.setContentsMargins(12, 10, 10, 10)
-        hl.setSpacing(9)
+        hl.setContentsMargins(12, 8, 8, 6)
+        hl.setSpacing(8)
         avatar = QLabel("✳")
         avatar.setFixedSize(22, 22)
         avatar.setAlignment(Qt.AlignCenter)
@@ -263,6 +452,25 @@ class ChatPanel(QWidget):
         titles.addWidget(self.planner_label)
         hl.addLayout(titles)
         hl.addStretch(1)
+        self.task_pill = QPushButton("")
+        self.task_pill.setObjectName("taskPill")
+        self.task_pill.setCursor(Qt.PointingHandCursor)
+        self.task_pill.setToolTip("后台任务运行中")
+        self.task_pill.hide()
+        self.task_pill.clicked.connect(
+            lambda _=False: getattr(getattr(self._win, "task_notice", None),
+                                    "refresh", lambda: None)())
+        hl.addWidget(self.task_pill)
+        self.pane_btn = QPushButton()
+        self.pane_btn.setObjectName("icon")
+        self.pane_btn.setFixedSize(26, 26)
+        self.pane_btn.setIcon(panel_icon())
+        self.pane_btn.setIconSize(QSize(15, 15))
+        self.pane_btn.setToolTip("显示 / 隐藏左侧工作区")
+        self.pane_btn.setCursor(Qt.PointingHandCursor)
+        self.pane_btn.clicked.connect(
+            lambda _=False: getattr(self._win, "toggle_left_panel", lambda: None)())
+        hl.addWidget(self.pane_btn)
         self.clear_btn = QPushButton("⟲")
         self.clear_btn.setObjectName("icon")
         self.clear_btn.setFixedSize(26, 26)
@@ -270,12 +478,32 @@ class ChatPanel(QWidget):
         hl.addWidget(self.clear_btn)
         root.addWidget(head)
 
+        self.tabs = QTabBar()
+        self.tabs.setObjectName("chatTabs")
+        self.tabs.addTab("对话")
+        self.tabs.addTab("轨迹")
+        self.tabs.setExpanding(False)
+        self.tabs.setDrawBase(False)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        tab_wrap = QWidget()
+        tw = QHBoxLayout(tab_wrap)
+        tw.setContentsMargins(14, 0, 10, 0)
+        tw.addWidget(self.tabs)
+        tw.addStretch(1)
+        root.addWidget(tab_wrap)
+
         line = QFrame()
         line.setFixedHeight(1)
         line.setStyleSheet("background:#e7e3d8;")
         root.addWidget(line)
 
-        # 消息区
+        self.chat_stack = QStackedWidget()
+
+        # 消息页
+        chat_page = QWidget()
+        cp = QVBoxLayout(chat_page)
+        cp.setContentsMargins(0, 0, 0, 0)
+        cp.setSpacing(0)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -286,11 +514,21 @@ class ChatPanel(QWidget):
         # 用户气泡（蓝底白字）会变成白底白字，看起来就像「用户消息没显示」。
         self.msgs.setObjectName("chatMsgs")
         self.msg_layout = QVBoxLayout(self.msgs)
-        self.msg_layout.setContentsMargins(16, 18, 16, 10)
+        self.msg_layout.setContentsMargins(16, 14, 16, 10)
         self.msg_layout.setSpacing(14)
         self.msg_layout.addStretch(1)
         self.scroll.setWidget(self.msgs)
-        root.addWidget(self.scroll, 1)
+        cp.addWidget(self.scroll, 1)
+        self.chat_stack.addWidget(chat_page)
+
+        # 轨迹页：工具调用流水（只读，不参与消息气泡滚动）
+        self.trace_view = QPlainTextEdit()
+        self.trace_view.setObjectName("traceView")
+        self.trace_view.setReadOnly(True)
+        self.trace_view.setPlaceholderText("工具调用轨迹会出现在这里。")
+        self.chat_stack.addWidget(self.trace_view)
+        root.addWidget(self.chat_stack, 1)
+
         # 「贴底」：人在底部时，新消息、表格、气泡重排长高之后都自动跟到最新；
         # 手动往上翻就停在他看的位置，不再被强行拽回去。
         self._stick = True
@@ -301,8 +539,23 @@ class ChatPanel(QWidget):
         # 输入区
         foot = QWidget()
         fl = QVBoxLayout(foot)
-        fl.setContentsMargins(10, 8, 10, 9)
-        fl.setSpacing(6)
+        fl.setContentsMargins(10, 6, 10, 8)
+        fl.setSpacing(5)
+
+        # 当前工具调用状态（正在调用工具 · xxx）
+        self.tool_activity = QFrame()
+        self.tool_activity.setObjectName("toolActivity")
+        al = QHBoxLayout(self.tool_activity)
+        al.setContentsMargins(8, 4, 8, 4)
+        al.setSpacing(6)
+        self.tool_spinner = QLabel("◌")
+        self.tool_spinner.setObjectName("toolSpinner")
+        al.addWidget(self.tool_spinner)
+        self.tool_label = QLabel("")
+        self.tool_label.setObjectName("toolActivityText")
+        al.addWidget(self.tool_label, 1)
+        self.tool_activity.hide()
+        fl.addWidget(self.tool_activity)
 
         chip_scroll = QScrollArea()
         chip_scroll.setFixedHeight(30)
@@ -320,16 +573,27 @@ class ChatPanel(QWidget):
 
         composer = QFrame()
         composer.setObjectName("composer")
-        box = QHBoxLayout(composer)
-        box.setContentsMargins(12, 8, 8, 8)
-        box.setSpacing(6)
+        box = QVBoxLayout(composer)
+        box.setContentsMargins(10, 6, 7, 6)
+        box.setSpacing(4)
         self.input = QTextEdit()
         self.input.setObjectName("chatInput")
         self.input.setPlaceholderText("描述你要做的空间分析…（用 @ 指定图层）")
-        self.input.setFixedHeight(44)
+        self.input.setFixedHeight(38)
         self.input.installEventFilter(self)
         self.input.textChanged.connect(self._on_input_changed)
-        box.addWidget(self.input, 1)
+        box.addWidget(self.input)
+
+        # 输入框内部底栏：模型选择器在发送键左侧（和 Harness 一致）
+        bottom = QHBoxLayout()
+        bottom.setSpacing(6)
+        self.model_btn = QPushButton("模型")
+        self.model_btn.setObjectName("modelPicker")
+        self.model_btn.setCursor(Qt.PointingHandCursor)
+        self.model_btn.setToolTip("当前规划模型 / 打开模型设置")
+        self.model_btn.clicked.connect(self._open_model_menu)
+        bottom.addStretch(1)
+        bottom.addWidget(self.model_btn)
         self.send_btn = QPushButton()
         self.send_btn.setObjectName("send")
         self.send_btn.setFixedSize(30, 30)
@@ -338,13 +602,20 @@ class ChatPanel(QWidget):
         self.send_btn.setCursor(Qt.PointingHandCursor)
         self.send_btn.setToolTip("发送（Enter）")
         self.send_btn.clicked.connect(lambda _checked=False: self._emit_send())
-        box.addWidget(self.send_btn, 0, Qt.AlignBottom)
+        bottom.addWidget(self.send_btn, 0, Qt.AlignBottom)
+        box.addLayout(bottom)
         fl.addWidget(composer)
+
+        self.stats = QLabel("0 轮 · 0 步")
+        self.stats.setObjectName("chatStats")
+        self.stats.setAlignment(Qt.AlignRight)
+        fl.addWidget(self.stats)
 
         hint = QLabel("Enter 发送 · Shift+Enter 换行 · 原始数据只读，有产出才建新图层")
         hint.setObjectName("tiny")
         fl.addWidget(hint)
         root.addWidget(foot)
+        self._refresh_model_button()
 
     # ------------------------------------------------------------------ 事件
     def eventFilter(self, obj, event):  # noqa: N802
@@ -517,12 +788,97 @@ class ChatPanel(QWidget):
         self.planner_label.style().unpolish(self.planner_label)
         self.planner_label.style().polish(self.planner_label)
 
+    # ---------------------------------------------------------------- Harness 顶栏
+    def _refresh_model_button(self) -> None:
+        try:
+            from app.config import load_cfg
+            cfg = load_cfg()
+        except Exception:
+            cfg = {}
+        model = str(cfg.get("model") or "规则引擎")
+        if not cfg.get("enabled", True):
+            model = "规则引擎"
+        if not model:
+            model = "规则引擎"
+        self.model_btn.setText(f"{model} · Max  ▾")
+
+    def _open_model_menu(self) -> None:
+        menu = QMenu(self)
+        try:
+            from app.config import load_cfg
+            cfg = load_cfg()
+            model = str(cfg.get("model") or "规则引擎")
+            if not cfg.get("enabled", True):
+                model = "规则引擎"
+        except Exception:
+            model = "当前模型"
+        act = menu.addAction(model)
+        act.setEnabled(False)
+        menu.addSeparator()
+        menu.addAction("打开模型设置…", lambda: self._win.open_settings())
+        menu.addAction("刷新模型信息", self._refresh_model_button)
+        menu.exec(self.model_btn.mapToGlobal(self.model_btn.rect().bottomLeft()))
+
+    def set_background_tasks(self, running: int, pending: int = 0) -> None:
+        n = int(running or 0) + int(pending or 0)
+        if n <= 0:
+            self.task_pill.hide()
+            return
+        extra = f" · {pending} 排队" if pending else ""
+        self.task_pill.setText(f"◌ {n} 个后台任务运行中{extra}")
+        self.task_pill.show()
+
+    def set_tool_activity(self, name: str = "", active: bool = True) -> None:
+        if not active or not name:
+            self.tool_activity.hide()
+            return
+        self.tool_label.setText(f"正在调用工具 · {name}")
+        self.tool_activity.show()
+
+    def set_stats(self, turns: int = 0, steps: int = 0, tok_s: float = 0.0,
+                  total_tokens: int = 0, cache_pct: float | None = None,
+                  context_pct: float | None = None) -> None:
+        bits = [f"{int(turns)} 轮", f"{int(steps)} 步"]
+        if tok_s > 0:
+            bits.append(f"{tok_s:.0f} tok/s")
+        if total_tokens:
+            if total_tokens >= 1_000_000_000:
+                tok_text = f"{total_tokens / 1_000_000_000:.1f}B"
+            elif total_tokens >= 1_000_000:
+                tok_text = f"{total_tokens / 1_000_000:.1f}M"
+            else:
+                tok_text = f"{total_tokens / 1000:.0f}K"
+            bits.append(f"{tok_text} tok")
+        if cache_pct is not None:
+            bits.append(f"缓存 {cache_pct:.1f}%")
+        if context_pct is not None:
+            bits.append(f"上下文 {context_pct:.0f}%")
+        self.stats.setText(" · ".join(bits))
+
+    def add_trace(self, text: str) -> None:
+        """往「轨迹」页追加一条工具调用/状态流水。"""
+        stamp = __import__("time").strftime("%H:%M:%S")
+        self.trace_view.appendPlainText(f"[{stamp}] {text}")
+
+    def _on_tab_changed(self, index: int) -> None:
+        if self.chat_stack is not None:
+            self.chat_stack.setCurrentIndex(1 if index == 1 else 0)
+
+    def show_chat_tab(self) -> None:
+        if self.tabs.currentIndex() != 0:
+            self.tabs.setCurrentIndex(0)
+
     def clear(self) -> None:
         while self.msg_layout.count() > 1:
             it = self.msg_layout.takeAt(0)
             w = it.widget()
             if w:
                 w.deleteLater()
+        try:
+            self.trace_view.clear()
+            self.set_tool_activity("", False)
+        except Exception:
+            pass
 
     def _append(self, w: QWidget) -> None:
         stick = self._stick
@@ -604,6 +960,7 @@ class ChatPanel(QWidget):
         self._reflow()
 
     def add_user(self, text: str) -> None:
+        self.show_chat_tab()
         row = QWidget()
         hl = QHBoxLayout(row)
         hl.setContentsMargins(0, 0, 0, 0)
@@ -612,6 +969,7 @@ class ChatPanel(QWidget):
         self._append(row)
 
     def add_agent(self, text: str, steps: list[dict] | None = None) -> None:
+        self.show_chat_tab()
         wrap = QWidget()
         vl = QVBoxLayout(wrap)
         vl.setContentsMargins(0, 0, 0, 0)
@@ -622,6 +980,11 @@ class ChatPanel(QWidget):
         for i, st in enumerate(steps or []):
             vl.addWidget(StepCard(i, st, self._win))
         self._append(wrap)
+
+    def add_plan(self, card: PlanCard) -> None:
+        """追加执行计划卡（步骤状态由主窗口的流事件更新）。"""
+        self.show_chat_tab()
+        self._append(card)
 
     def add_clarify(self, question: str, options: list[str],
                    on_pick: Callable[[str], None]) -> None:

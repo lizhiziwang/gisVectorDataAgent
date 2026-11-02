@@ -200,6 +200,26 @@ class Store:
         self._trim_memory(keep={lid})
         return lay
 
+    def add_raster(self, info, name: str, **kw):
+        """加入一个栅格图层。
+
+        栅格不走 `add()`：那条路径要 GeoDataFrame。这里只登记元信息，
+        像素等到渲染时才按视口读取（QGIS 的 provider 也是这个思路）。
+        """
+        from .raster import RasterLayer
+        lid = "R" + uuid.uuid4().hex[:8]
+        color = PALETTE[self._n % len(PALETTE)]
+        self._n += 1
+        existing = {l.name for l in self.layers.values()}
+        if name in existing:
+            base, k = name, 2
+            while f"{base}_{k}" in existing:
+                k += 1
+            name = f"{base}_{k}"
+        lay = RasterLayer(id=lid, name=name, info=info, color=kw.pop("color", color), **kw)
+        self.layers[lid] = lay
+        return lay
+
     # ------------------------------------------------------------------ 高亮
     def set_highlight(self, layer_id: str, indices: list[int],
                       color: str = "#d97757") -> None:
@@ -226,6 +246,40 @@ class Store:
                 except Exception:
                     pass
         return total / 1e6
+
+    def cache_layer(self, lay: Layer, release: bool = False) -> str | None:
+        """把矢量图层写到共享缓存目录（不按会话复制）。
+
+        `_spill()` 只处理超过阈值的大图层并释放内存；会话恢复需要**所有**
+        矢量图层都能从磁盘重建，所以这里提供强制缓存入口。返回值是缓存路径，
+        写失败返回 None。栅格不在这里缓存（它本身就有源文件路径）。
+        """
+        if getattr(lay, "is_raster", False) or getattr(lay, "_gdf", None) is None:
+            return getattr(lay, "cache_path", None)
+        if lay.cache_path and Path(lay.cache_path).exists():
+            return lay.cache_path
+        if self.cache_dir is None:
+            return None
+        try:
+            import importlib.util
+            use_parquet = importlib.util.find_spec("pyarrow") is not None
+        except Exception:
+            use_parquet = False
+        path = Path(self.cache_dir) / (f"{lay.id}.parquet" if use_parquet else f"{lay.id}.gpkg")
+        try:
+            if use_parquet:
+                tmp = path.with_suffix(".tmp.parquet")
+                lay.gdf.to_parquet(tmp, index=False)
+            else:
+                tmp = path.with_suffix(".tmp.gpkg")
+                lay.gdf.to_file(tmp, driver="GPKG", layer="layer")
+            os.replace(tmp, path)
+            lay.cache_path = str(path)
+            if release:
+                lay._gdf = None
+            return lay.cache_path
+        except Exception:
+            return None
 
     def _spill(self, lay: Layer) -> bool:
         """把图层写到磁盘并释放内存；失败时保持原样，不影响本次运算。"""
@@ -276,9 +330,9 @@ class Store:
                 pass
         self._trim_memory()
 
-    def clear(self) -> None:
+    def clear(self, preserve_cache: bool = False) -> None:
         for lay in list(self.layers.values()):
-            if lay.cache_path:
+            if lay.cache_path and not preserve_cache:
                 try:
                     Path(lay.cache_path).unlink(missing_ok=True)
                 except Exception:
@@ -287,10 +341,11 @@ class Store:
         self._n = 0
 
     def cache_stats(self) -> dict:
+        vec = [l for l in self.layers.values() if not getattr(l, "is_raster", False)]
         return {"layers": len(self.layers),
                 "memory_mb": round(self._memory_mb(deep=False), 1),
                 "budget_mb": self.memory_budget_mb,
-                "spilled": sum(1 for l in self.layers.values() if l._gdf is None)}
+                "spilled": sum(1 for l in vec if l._gdf is None)}
 
     def get(self, ref: str | None) -> Layer | None:
         if not ref:
@@ -463,6 +518,11 @@ class Result:
 
 def op_describe(store: Store, layer: str | None = None) -> Result:
     lay = store.resolve(layer)
+    if getattr(lay, "is_raster", False):
+        # 「数据体检」对矢量/栅格都应该是同一个入口。栅格没有要素/字段，
+        # 交给栅格算子输出尺寸、波段、CRS 和抽样统计。
+        from .raster_ops import op_raster_info
+        return op_raster_info(store, lay.id)
     g = lay.gdf
     warns = []
     info = lay.meta(with_invalid=True)
@@ -1258,3 +1318,9 @@ OPERATIONS: dict[str, Callable] = {
     "fix_geometry": _fix,
     "explode": _explode,
 }
+
+# 栅格算子单独一个模块：rasterio 只在真正执行栅格算子时才导入，
+# 纯矢量流程的启动时间和依赖不受影响。
+from .raster_ops import OPERATIONS as _RASTER_OPERATIONS  # noqa: E402
+
+OPERATIONS.update(_RASTER_OPERATIONS)

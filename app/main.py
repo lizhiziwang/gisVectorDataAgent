@@ -25,6 +25,7 @@ from .samples import ensure_samples, SAMPLE_FILES
 from .util import json_safe
 from .io_utils import (export_layer as write_layer_file, extract_zip, file_info,
                        load_any)
+from .raster import is_raster_path
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB = ROOT / "web"
@@ -161,6 +162,15 @@ async def upload(file: UploadFile = File(...)):
     try:
         if suffix == ".zip":
             root, files = extract_zip(dest)
+            # 桌面端能渲栅格，网页端还没有栅格管线：这里只挑矢量，
+            # 否则 load_any 会把 GeoTIFF 当矢量读，报一句牛头不对马嘴的错。
+            rasters = [f.name for f in files if is_raster_path(f)]
+            files = [f for f in files if not is_raster_path(f)]
+            if not files:
+                shutil.rmtree(root, ignore_errors=True)
+                raise HTTPException(
+                    400, "压缩包里只有栅格数据（" + "、".join(rasters[:5]) + "）。"
+                         "网页版暂不支持渲染栅格，请用桌面版打开，或换成矢量数据。")
             if len(files) > 1:
                 # 多个图层：不擅自决定，交给用户勾选
                 job = uuid.uuid4().hex[:8]
@@ -171,7 +181,7 @@ async def upload(file: UploadFile = File(...)):
                         "id": i,
                         "name": f.stem,
                         "rel": str(f.relative_to(root)),
-                        "size_mb": round(f.stat().st_size / 1e6, 1),
+                        "size_mb": round(f.stat().st_size / 1e6, 3),
                         "ext": f.suffix.lower(),
                         **info,
                     })
@@ -366,8 +376,11 @@ def set_settings(body: SettingsIn):
 
 @app.get("/api/suggestions")
 def suggestions():
+    # 网页版还没有栅格管线：不要把这些工具挂出去，点了只会报「找不到栅格图层」
+    tools = [k for k in OPERATIONS
+             if k != "describe" and not (k.startswith("raster_") or k == "zonal_stats")]
     return {"suggestions": SUGGESTIONS, "tools": [{"name": k, "label": TOOL_LABEL.get(k, k)}
-                                                  for k in OPERATIONS if k != "describe"]}
+                                                  for k in tools]}
 
 
 @app.post("/api/samples")

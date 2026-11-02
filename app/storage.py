@@ -536,6 +536,18 @@ class AgentStore:
                                   (session_id,)).fetchone()
         return int(row[0]) if row else 0
 
+    def count_user_messages(self, session_id: str) -> int:
+        row = self.conn().execute(
+            "SELECT COUNT(*) FROM messages WHERE session_id=? AND role='user'",
+            (session_id,)).fetchone()
+        return int(row[0]) if row else 0
+
+    def count_session_steps(self, session_id: str) -> int:
+        row = self.conn().execute(
+            "SELECT COUNT(*) FROM steps s JOIN runs r ON s.run_id=r.id "
+            "WHERE r.session_id=?", (session_id,)).fetchone()
+        return int(row[0]) if row else 0
+
     # ------------------------------------------------------------------ 图层元信息
     def upsert_layer(self, rec: LayerRecord) -> None:
         with self._write() as c:

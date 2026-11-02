@@ -4,6 +4,7 @@ import sys
 
 sys.path.insert(0, '.')
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ.setdefault("GIS_AGENT_CONFIRM_STEPS", "0")
 os.environ.setdefault("GIS_AGENT_PERSIST", "0")
 
 import urllib.request

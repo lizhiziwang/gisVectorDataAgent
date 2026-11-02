@@ -17,9 +17,14 @@ from pathlib import Path
 import geopandas as gpd
 import pandas as pd
 
+from .raster import RASTER_EXTS
 from .util import json_safe
 
-VECTOR_EXTS = (".shp", ".gpkg", ".geojson", ".json", ".kml", ".gml")
+VECTOR_EXTS = (".shp", ".gpkg", ".geojson", ".json", ".kml", ".gml", ".gdb")
+
+#: 压缩包里除了矢量也可以放栅格（GeoTIFF 等）。
+#: 扩展名清单从 app.raster 取，避免同一份格式列表写两遍、改了一边忘另一边。
+ARCHIVE_EXTS = VECTOR_EXTS + RASTER_EXTS
 
 
 # --------------------------------------------------------------------------- 读
@@ -32,6 +37,14 @@ def read_vector(path: Path, encoding: str | None = None) -> gpd.GeoDataFrame:
         # 不给这条，下面 pyogrio 抛 DataSourceError 后会去试没装的 fiona，
         # 用户看到的是一句「requires the fiona package」——离真正原因差得远
         raise ValueError(f"文件不存在：{Path(path).name}")
+    if Path(path).suffix.lower() == ".gdb":
+        # .gdb 是文件夹，可能含多个要素类。单图层 API 只能返回一个；
+        # 多图层由 native 的导入队列走 read_gdb_layers() 全部导入。
+        from .gdb import read_gdb_layers
+        layers = read_gdb_layers(path)
+        if len(layers) > 1:
+            raise ValueError(f"这个 FileGDB 有 {len(layers)} 个要素类，请逐个选择图层导入。")
+        return layers[0][1]
     try:
         gdf = gpd.read_file(path, **opts)
     except Exception as first:
@@ -144,7 +157,10 @@ def load_any(path: Path) -> gpd.GeoDataFrame:
 
 
 def extract_zip(zip_path: Path) -> tuple[Path, list[Path]]:
-    """解压并返回（解压根目录, 矢量文件列表，按体积降序）。
+    """解压并返回（解压根目录, 可载入文件列表，按体积降序）。
+
+    列表里既有矢量也有栅格：用户上传的 zip 常常是「一个 shp 全家桶」
+    或「一堆 GeoTIFF」，两种都得认，否则明明解压成功却报「没有可识别的文件」。
 
     加了解压大小/文件数上限：上传的 zip 不能把磁盘写满（zip bomb）。
     路径穿越由标准库 zipfile 负责清理，这里只做资源限制。
@@ -166,16 +182,45 @@ def extract_zip(zip_path: Path) -> tuple[Path, list[Path]]:
         if total > max_mb * 1024 * 1024:
             raise ValueError(f"压缩包解压后约 {total / (1024*1024):.0f} MB，超过 {max_mb} MB 限制。")
         z.extractall(out)
-    files = sorted({p for ext in VECTOR_EXTS for p in out.rglob("*" + ext)},
+    files = sorted({p for ext in ARCHIVE_EXTS for p in out.rglob("*" + ext)},
                    key=lambda p: -p.stat().st_size)
     if not files:
-        raise ValueError("压缩包中没有找到可识别的矢量文件（shp/gpkg/geojson/kml）。")
+        raise ValueError("压缩包中没有找到可识别的矢量或栅格文件"
+                         "（shp/gpkg/geojson/kml/gdb/tif）。")
     return out, files
+
+
+def read_layer(path: Path, layer: str | None = None) -> gpd.GeoDataFrame:
+    """读取一个指定名称的图层（GPKG / GDB 多图层选择用）。
+
+    GDB 是文件夹，别走这里；它由 app.gdb.read_gdb_layers 处理。
+    """
+    if not layer:
+        return load_vector(path)
+    if Path(path).suffix.lower() == ".gdb":
+        raise ValueError("FileGDB 请用 read_gdb_layers() 读取")
+    try:
+        gdf = gpd.read_file(path, layer=layer)
+    except Exception as first:
+        try:
+            gdf = gpd.read_file(path, layer=layer, engine="fiona")
+        except Exception:
+            raise ValueError(f"读取图层「{layer}」失败：{first}") from first
+    if gdf.empty:
+        raise ValueError(f"图层「{layer}」没有任何要素。")
+    return gdf
 
 
 def file_info(path: Path) -> dict:
     """只读头信息，快速拿要素数与几何类型，不加载整份数据。"""
     info = {"features": 0, "geom": "", "crs": ""}
+    if Path(path).suffix.lower() == ".gdb" and Path(path).is_dir():
+        try:
+            from .gdb import gdb_info
+            info.update(gdb_info(path))
+            return info
+        except Exception:
+            return info
     try:
         import pyogrio
         meta = pyogrio.read_info(path)

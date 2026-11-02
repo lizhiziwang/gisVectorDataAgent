@@ -4,6 +4,7 @@ import sys
 import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ.setdefault("GIS_AGENT_CONFIRM_STEPS", "0")
 sys.path.insert(0, r"D:\gis-agent")
 
 from PySide6.QtWidgets import QApplication, QMenu, QPushButton

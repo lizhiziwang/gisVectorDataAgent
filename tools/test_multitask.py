@@ -9,6 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ.setdefault("GIS_AGENT_CONFIRM_STEPS", "0")
 os.environ["GIS_AGENT_PERSIST"] = "0"
 
 import geopandas as gpd
@@ -48,6 +49,10 @@ for _ in range(200):
     if win.tasks.running_count == 0 and win.tasks.pending_count == 0:
         break
     time.sleep(0.03)
+# 调度器计数归零时 done 事件可能还在 Qt 事件队列里；多泵几轮再断言
+for _ in range(10):
+    app.processEvents()
+    time.sleep(0.01)
 snap = win.tasks.snapshot()
 # 不看顺序：snapshot 是按创建时间倒序的，两条任务谁先谁后不影响结论。
 statuses = sorted(t["status"] for t in snap[:2])

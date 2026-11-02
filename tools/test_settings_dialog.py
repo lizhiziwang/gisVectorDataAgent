@@ -11,7 +11,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# 这个测试会起多个 SettingsDialog；Windows 的 offscreen 插件在进程退出阶段
+# 偶发 QThreadStorage 崩溃，用真实 windows 平台跑（不上屏，不影响其它测试）。
+os.environ["QT_QPA_PLATFORM"] = "windows" if os.name == "nt" else "offscreen"
 
 from PySide6.QtWidgets import QApplication
 
@@ -120,4 +122,18 @@ check("提示缺地址或缺 Key", "✗" in d5.test_result.text(), True)
 check("有具体说明", bool(d5.test_detail), True)
 
 print("\n结论:", "PASS" if not fails else f"FAIL {fails}")
+# 收尾：停掉测试连接用的轮询定时器/对话框，别让 Qt 在 os._exit 时还有活对象。
+for _w in list(app.topLevelWidgets()):
+    try:
+        _t = getattr(_w, "_test_timer", None)
+        if _t is not None:
+            _t.stop()
+        _w.close()
+        _w.deleteLater()
+    except Exception:
+        pass
+app.processEvents()
+app.quit()
+app.processEvents()
+sys.stdout.flush()
 sys.exit(0 if not fails else 1)
