@@ -8,6 +8,8 @@ import sys
 import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# 离屏平台默认不带字体：不指过去整屏都是豆腐块，截图没法看
+os.environ.setdefault("QT_QPA_FONTDIR", r"C:\Windows\Fonts")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from PySide6.QtWidgets import QApplication
@@ -36,7 +38,9 @@ while time.perf_counter() < deadline:
     if now - last > 2:
         last = now
         mv = win.map
-        ready = not mv._has_pending()
+        # provider 图层没有构建任务，`_has_pending()` 会立刻为 False；
+        # 要等渲染线程把所有图层图都交回来，否则截到的是半成品。
+        ready = (not mv._has_pending()) and (not getattr(mv, "_vec_busy", False))
         print(f"  {now-t0:5.1f}s 图层 {len(mv.layers)} 构建完成={ready} "
               f"mpp={mv.mpp():.0f} 状态={win.st_message.text() if hasattr(win,'st_message') else ''}",
               flush=True)

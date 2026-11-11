@@ -27,7 +27,7 @@ GUI_TESTS = {
     "test_ux_more.py", "test_visible.py", "test_agent_v2.py",
     "test_task_center.py", "test_clarify_flow.py", "test_settings_dialog.py",
     "test_mentions_desktop.py", "test_highlight_desktop.py",
-    "test_highlight_agent.py", "test_tool_groups.py",
+    "test_highlight_agent.py", "test_tool_groups.py", "test_tool_manage.py",
 }
 
 #: 需要外部服务（真实 LLM 接口）的测试，跳过。

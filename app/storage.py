@@ -348,6 +348,25 @@ class AgentStore:
         return self.append_message(session_id, role,
                                    [Part(type="text", content={"text": text})], run_id=run_id, **kw)
 
+    def update_part(self, message_id: str, part_type: str, content: dict) -> bool:
+        """更新一条消息里第一个指定类型的 part（用于澄清卡/计划卡的状态）。
+
+        卡片是“先创建、后更新”的：问题卡在用户点选后要变成“已确认”，
+        计划卡在每步结束后要写入最终状态。只更新 part 内容，不新增消息，
+        保证重启回放时顺序仍是原来的对话顺序。
+        """
+        with self._write() as c:
+            row = c.execute(
+                "SELECT id FROM parts WHERE message_id=? AND type=? ORDER BY ordinal LIMIT 1",
+                (message_id, part_type)).fetchone()
+            if row is None:
+                return False
+            c.execute("UPDATE parts SET content_json=? WHERE id=?",
+                      (json.dumps(content, ensure_ascii=False, default=str), row["id"]))
+            c.execute("UPDATE sessions SET updated_at=? WHERE id=("
+                      "SELECT session_id FROM messages WHERE id=?)", (now(), message_id))
+        return True
+
     def list_messages(self, session_id: str, limit: int = 50) -> list[Message]:
         c = self.conn()
         rows = c.execute(

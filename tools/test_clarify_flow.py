@@ -124,11 +124,15 @@ check("澄清里有问题", pend.get("question"), "要处理哪个图层？")
 check("澄清里有选项", pend.get("options"), ["地块", "道路"])
 check("原始需求也留着", pend.get("origin"), "给我做缓冲区")
 
-print("[2] 界面渲染了选项按钮")
-from PySide6.QtWidgets import QPushButton
-btns = [b for b in win.chat.findChildren(QPushButton)
-        if b.objectName() == "chip" and b.text() in ("地块", "道路")]
-check("渲染出 2 个选项按钮", len(btns), 2)
+print("[2] 界面渲染了问题卡 + 可点选项")
+from PySide6.QtCore import QEvent, QPointF, Qt
+from PySide6.QtGui import QMouseEvent
+
+card = win.chat._clarify_card
+check("有一张待回答的问题卡", card is not None, True)
+check("题干就是模型的问题", card.question_lb.text(), "要处理哪个图层？")
+check("渲染出 2 个选项", [r.text for r in card._rows], ["地块", "道路"])
+check("输入框提示改成回答问题", "回答" in win.chat.input.placeholderText(), True)
 
 print("[3] 点选项 → 重新规划 → 真的执行了")
 # 追加一段剧本：这一轮应当按用户的选择（道路）做缓冲
@@ -136,8 +140,13 @@ win.planner.script.append({
     "plan": [{"tool": "buffer", "args": {"layer": "道路", "distance": 100, "unit": "m"}}],
     "reply": "按你的选择对道路做缓冲",
 })
-target = [b for b in btns if b.text() == "道路"][0]
-target.click()
+target = [r for r in card._rows if r.text == "道路"][0]
+pos = QPointF(target.rect().center())
+target.mouseReleaseEvent(QMouseEvent(
+    QEvent.Type.MouseButtonRelease, pos, pos,
+    Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+check("卡片立即变成已确认", card._kicker.text(), "已确认")
+check("没被选的选项失效", card._rows[0]._done, True)
 check("第二轮跑完了", wait_idle(win), True)
 check("澄清状态已清空", win._pending_clarify is None, True)
 # 系统提示里应带上「最初需求 + 问题 + 回答」

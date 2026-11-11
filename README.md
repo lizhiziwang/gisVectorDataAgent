@@ -20,10 +20,11 @@ python -m venv .venv
 ```
 
 依赖只需 Python **3.10 ~ 3.13**；`requirements.txt` 里标了实测版本（PySide6 6.12 / GeoPandas 1.2 /
-Shapely 2.2 / pandas 3.1），并分成「核心 / 桌面界面 / 可选：网页版」三段 —— 只用桌面端时
-fastapi、uvicorn、pywebview 可以不装。
+Shapely 2.2 / pandas 3.1 / pyarrow 26），分「核心 / 桌面界面 / 栅格 / 可选补充」几段，
+不含任何 Web 服务或浏览器内核依赖。`pyarrow` 用于消费 `pyogrio.open_arrow()` 的
+RecordBatch，是 500 万要素按批流式渲染的关键。
 
-启动异常时双击 `调试启动.bat`（带控制台）；桌面端启动异常日志在 `data\app.log`，服务模式（`run.py` / `desktop.py`）的日志输出到控制台 / `data\app.log`。
+启动异常时双击 `调试启动.bat`（带控制台）；启动异常日志在 `data\app.log`。
 
 首次打开点右上角 **示例数据**，会生成成都某片区的 4 个图层（行政区 / 地块 665 / 道路 / 学校），可直接演示。
 
@@ -84,7 +85,7 @@ fastapi、uvicorn、pywebview 可以不装。
 靠 1px 暖灰细线分隔、不用大圆角卡片和阴影；助手回复是纯文本段落（不套气泡），用户消息是一块浅色底块。
 
 - **左栏**：暖灰底，拖入即载入；图层列表带显隐勾选，**双击图层名可直接改名**，
-  右键菜单：缩放到图层 / 属性表 / 重命名 / 复制图层 / 只显示此层 / 显示全部 / 导出（4 种格式）/ 删除；
+  右键菜单：缩放到图层 / 属性表 / 图层样式 / 重命名 / 复制图层 / 只显示此层 / 显示全部 / 导出（4 种格式）/ 删除；
   重命名会自动避开重名（加序号），也能 `Ctrl+Z` 撤回。点击拖拽区打开**自定义导入弹窗**：
   可以添加文件或 `.gdb` 文件夹，GPKG / FileGDB 会列出内部图层，勾选后再导入。
   左栏上方是「图层 / 工作区」两个页签：工作区按「gis-agent → 未分组 → 会话」
@@ -96,12 +97,52 @@ fastapi、uvicorn、pywebview 可以不装。
   分组标题带数量、组间以发丝线分隔、组内两列并排；点一下就把该算子的指令模板写进输入框，悬停看算子说明。
   输入框等标准控件的右键菜单、Qt 原生对话框会自动加载 `qtbase_zh_CN` 翻译，显示中文而不是
   Undo / Cut / Copy 这类英文。
-- **中间**：QPainter 自绘地图，支持拖拽平移、滚轮缩放（以光标为中心）、双击放大、悬停高亮、点击看属性、经纬网与比例尺。  **Shift + 拖拽 = 框选**（只作用于左栏当前图层）：选中的要素描朱红边 + 淡填充，状态栏实时报数量，
+- **在线地图**：工具库顶部「底图 → 在线地图」打开弹窗，填写「在线地图地址 / 加载方式 /
+  在线地图名称」后确认加载。支持 **XYZ 瓦片**（`{z}/{x}/{y}`、TMS 的 `{-y}`、子域 `{s}`）、
+  **WMTS 瓦片模板**（REST 的 `{TileMatrix}/{TileCol}/{TileRow}`，以及天地图这类 KVP 写法
+  `TILEMATRIX={z}&TILEROW={y}&TILECOL={x}`）和 **WMS**（保留地址里的 LAYERS/STYLES，
+  按当前视图自动补 BBOX/WIDTH/HEIGHT/SRS（1.3.0 用 CRS））。弹窗还支持可选 **Token**
+  （参数名可选 `token` / `access_token` / `key` / `tk` / `apikey` 或自定义）、**自定义参数**
+  （每行 `key=value`）和**自定义请求头**（每行 `Name: value`）；Token 也可在地址、参数或请求头里
+  用 `{token}` 引用（例如 `Authorization: Bearer {token}`，此时不再重复追加查询参数）。
+  **天地图**：加载方式选 **WMTS**，Token 参数名填 `tk`（贴入天地图地址会自动带出），矢量底图地址模板：
+  ```text
+  https://t{s}.tianditu.gov.cn/vec_w/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=vec&STYLE=default&TILEMATRIXSET=w&FORMAT=tiles&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}&tk={token}
+  ```
+  把 `vec_w/vec` 换成 `img_w/img`、`ter_w/ter` 可切影像/地形；程序会按天地图规则把
+  最小层级夹到 1，并让 `{s}` 使用 `t0`…`t7`。注意不要填
+  `https://t0.tianditu.gov.cn/img_c/wmts/{z}/{x}/{y}` 这种 REST 路径式地址，天地图会返回
+  404；也不要用 `_c`/`TILEMATRIXSET=c`（当前渲染是 Web Mercator，用 `_w`/`w`）。
+  瓦片是**逐张上屏**的：每拿到一张就合成一次当前视口，最后一张到齐后再用完整图替换，
+  不会等所有瓦片都下载完才显示；在线瓦片还跑在单独线程，不会把本地栅格的渲染堵在后面。
+  在线底图登记成栅格图层放在图层栈底部，
+  可像普通底图一样显隐、缩放定位、调不透明度、删除，并随会话保存地址、加载方式、Token 和自定义参数
+  （恢复时会重新取图，不缓存图片）。
+- **图层样式**：图层右键「图层样式…」打开弹窗，左边实时预览、右边按几何类型只显示相关项：
+  面图层的填充色 / 填充不透明度 / 描边色 / 描边不透明度 / 线宽，线图层的描边与线宽，
+  点图层的点颜色 / 点大小；栅格图层可改不透明度、拉伸方式（累计裁剪 / 最小–最大 / 不拉伸）和 gamma。
+  **要素标注**选一个属性字段、字号、文字颜色和白色描边开关，标注按当前视野取点并自动避让，
+  **线要素沿线方向旋转排字**（锚点取线中点，和 QGIS「沿线上放置」一致），同名道路挨得太近不会
+  重复堆叠（参考 QGIS 的「合并相连线」），超过 40 字截断；取数与缓存跑在独立线程，
+  旧视野的取数会被新视野打断，拖动时标注立刻跟上。没有空间索引的源文件
+  （GeoParquet、无 `.qix` 的 Shapefile）还会在图层进来时后台读一次**整层锚点表**，
+  之后平移/缩放只做内存筛选——614MB 的村界面数据从「每拖一次重读 4 秒」变成一次 4 秒、
+  之后 0.1ms。
+  保存后地图立刻按新样式重画，颜色同步到图层行色块和图例；样式随会话保存，切换/重开会话还在。
+  **没动过样式的图层外观和以前完全一致**。
+- **中间**：QPainter 自绘地图，支持拖拽平移、滚轮缩放（以光标为中心）、双击放大、点击看属性、经纬网与比例尺。
+  鼠标移动不在地图上做悬停命中测试，避免大图层因悬停触发整层读取。  **Shift + 拖拽 = 框选**（只作用于左栏当前图层）：选中的要素描朱红边 + 淡填充，状态栏实时报数量，
   这时在右栏说一句「做 500 米缓冲区」，会**先把选中要素单独成一层**再执行——算子从此能作用于"一部分"而不是整层。
   Esc 先清选区、再清高亮；点空白处也取消选择。
+  **源文件图层的宽视野缓存**：Shapefile / GPKG 没有空间索引，一缩到省域就是整文件重读（47 万条道路实测
+  整帧 6s，拖动/缩放时反复重来就是「卡 5~8 秒」）。大图层打开后会在后台按固定粗容差把整层读**一次**、
+  建成一套约 30 MB 的路径缓存（`_LodWorker` + `vectorstream.build_lod_paths`），之后
+  **每像素地面米数 ≥ 45（约 1:17 万及更远）** 的平移/缩放只在内存里筛批，整省帧从 ~6s 降到 ~0.3s；
+  城市级仍按 bbox 读窗口保证细节（缓存太粗时自动退回）。点图层、超大面图层（顶点超 400 万）不建缓存。
   **键盘**：`←→↑↓` 平移（按住 Shift 步长 ×4）、`+`/`-` 缩放、`Home` 全图；**中键拖拽**也能平移（GIS 老习惯）。
 - **地图对比**：点地图右上角 `◫`，选左右两张栅格底图，支持左右 50/50 分屏、上下分屏、
-  卷帘拖动、透明度叠加、闪烁对比；中间分隔条可拖动改比例，两侧视图（平移/缩放）实时同步，
+  卷帘拖动、透明度叠加、闪烁对比；中间分隔条可拖动改比例（卷帘模式下分隔条实时跟手，
+  左右两个方向拖动都即时露出对应一侧的地图），两侧视图（平移/缩放）实时同步，
   再点一次按钮退出对比。
   **右键菜单**：全图 / 缩放到当前图层 / 把选中要素存成图层 / 清除选区 / 导出当前视图 / 导出当前图层。
 - **属性表 ↔ 地图联动**：点表格任意一行，地图立刻高亮该要素并缩放到它；表头点击排序（再点反向），
@@ -119,6 +160,10 @@ fastapi、uvicorn、pywebview 可以不装。
 - **Agent 设置**：头部最右侧的「⚙ Agent 设置」管理技能和逐步确认开关。技能就是
   根目录 `skills/` 下的 Markdown 卡片，在设置里可以添加、编辑、启用/禁用、删除；
   启用的技能会自动拼进下一次规划提示词（只对模型规划生效）。
+- **工具库管理**：「Agent 设置 → 工具」按矢量/栅格分组列出工具库里的全部算子，支持按
+  名称/说明/算子名搜索。取消勾选即停用：左栏工具库不再显示、不再交给大模型，执行前也会
+  被拦下并提示去哪儿启用；自定义工具还能编辑代码/改名/换分组/删除，内置工具只能停用
+  不能删。停用列表存在 `data/settings.json` 的 `tools_disabled` 里，重启后仍生效。
 - **导出视图**：`Ctrl+Shift+S`（或地图右键）把当前画面存成 PNG —— 连图例和缩放键一起抓，出报告直接用。
 - **可撤销**：`Ctrl+Z` / `Ctrl+Shift+Z`（或 `Ctrl+Y`）。因为算子只产出新图层，撤销 = 把派生层摘掉/放回，
   包括「删掉的图层按原位置还原」，栈深 20 步。
@@ -258,15 +303,17 @@ fastapi、uvicorn、pywebview 可以不装。
 | Agent 主循环（规划→执行→观察→修复） | `app/agent.py` `run_agent` |
 | 执行计划卡 / 逐步骤流式状态 | [native/chat.py](native/chat.py) `PlanCard`；`app/agent.py` 的 `plan` / `step` 事件 |
 | 逐步确认 / 每步补充要求 | [native/stepconfirm.py](native/stepconfirm.py) `StepConfirmDialog`；`app/agent.py` `run_plan(confirm_step=...)` / `Planner.revise_step` |
-| 澄清选项的界面渲染 | [native/chat.py](native/chat.py) `ChatPanel.add_clarify` |
+| 澄清问题的界面渲染（问题卡 + 整行可点选项） | [native/chat.py](native/chat.py) `ClarifyCard` / `ChatPanel.add_clarify` |
 | 澄清闭环的桌面端接线 | [native/app.py](native/app.py) `_show_clarify` / `_on_clarify_picked` |
 | 新工具：生成 → 预览 → 确认 → 入库 | `native/app.py` `_handle_operator_gen` + `native/dialogs.py` `OperatorDialog` |
+| 工具库管理（停用 / 编辑 / 删除） | [native/agent_settings.py](native/agent_settings.py) 的「工具」页；分类在 [app/tool_catalog.py](app/tool_catalog.py)，停用状态在 [app/tool_prefs.py](app/tool_prefs.py) |
 
 ### Agent 闭环（本次优化重点）
 
 规划不再是一次性的：执行器逐步返回结果，遇到「字段不存在 / 几何类型不匹配 / 表达式错误」时，
 把**失败步骤 + 错误 + 当前图层 schema** 回灌给模型，让它给出剩余修正计划（最多 2 次），
-已成功的步骤和图层保留。图层或字段有歧义时，模型可以只输出 `clarify`，界面渲染成可点选项，
+已成功的步骤和图层保留。图层或字段有歧义时，模型可以只输出 `clarify`，界面渲染成一张
+**问题卡**（题干 + 带序号的可点选项，点一次就锁定并回填答案；也可以在输入框里直接回答），
 不再静默取「最近创建的图层」。
 
 同时：
@@ -299,7 +346,8 @@ fastapi、uvicorn、pywebview 可以不装。
 - **几何有效性**：入口处 `make_valid` 修复无效几何并计数（超过 2 万要素的图层跳过逐个校验，避免卡死）。
 - **空值安全**：真实数据里成片的 NULL 会在 JSON 序列化时炸掉接口（`NaN is not JSON compliant`），服务接口统一走 `json_safe` 清洗；导出 GeoJSON 前也会把 NaN 变 null。
 - **Shapefile 编码**：读入时在 UTF-8 / GBK 间择优（中文不乱码）；导出时字段名按 **10 字节**安全截断，超限改名 `F1/F2…` 并在压缩包里附 `字段对照.txt`——否则中文会被切成半个字，DBF 直接读不回来。
-- **离线性**：地图是自绘渲染器，不依赖在线瓦片、不依赖 CDN。
+- **离线性**：默认地图是自绘渲染器，不依赖在线瓦片、不依赖 CDN；需要底图时可在工具库
+  「底图 → 在线地图」手动添加 XYZ/WMTS/WMS（天地图用 WMTS），只有该图层可见时才联网。
 - **选区即输入**：框选的要素会被复制成一个独立图层（`原层名_选中N`）再参与运算，不污染原图层；
   这一层同样可以撤销 / 导出 / 删掉。
 
@@ -311,13 +359,16 @@ fastapi、uvicorn、pywebview 可以不装。
 | 本项目 | QGIS 对应 | 说明 |
 | --- | --- | --- |
 | `_RenderJob` | `QgsMapRendererJob` | 一次渲染任务的上下文 + 世代号（epoch） |
-| `_RenderWorker` | `QgsMapRendererParallelJob` | 常驻渲染线程，请求队列只留最新一个 |
-| `_LayerJob` | `LayerRenderJob` | **每个图层渲染到自己的一张 QImage** |
+| `_RenderWorker` | `QgsMapRendererParallelJob` | 常驻调度线程，请求队列只留最新一个；多图层时线程池并行画层 |
+| `_LayerJob` | `LayerRenderJob` | **每个图层渲染到自己的一张 QImage**，按原图层顺序回传 |
 | `_compose_async()` / `_ComposeWorker` | `composeImage()` | 常驻合成线程把各层 QImage 叠成整帧，UI 线程只接一次结果 |
 | `_compose()` | `composeImage()` | 同步合成（单测/兼容路径） |
 | `_img_cache` | `QgsMapRendererCache` | 图层级缓存：键 = 视口 + 尺寸 + dpr + 图层几何版本 |
 | `_RenderSet` | 渲染范围 + `QgsSimplifyMethod` 的组合 | 一个「范围 + 容差」下的一整套路径 |
 | `_select_indices()` | `QgsFeatureRequest::setFilterRect(extent)` | 视口矩形筛要素，**筛完全量画** |
+| `vectorstream.paint_stream_layer()` | `QgsVectorLayerRenderer::render()` | 大图层按屏幕范围取要素、分块建路径、立即画，不缓存整层路径 |
+| `app/vector_provider.py` | `QgsVectorDataProvider::getFeatures(setFilterRect)` | 源文件图层只读文件头；`open_arrow` 按屏幕 bbox 逐批产出 |
+| `pyarrow.RecordBatchReader` | `QgsFeatureIterator` | 一批 WKB 解成 shapely，画完即丢，不物化整个窗口 |
 | `_simplify_tol()` | `QgsSimplifyMethod::tolerance` | 容差以**屏幕像素**为准（0.8 px 对应地面距离） |
 | `_split_subpixel()` | `QgsSimplifyMethod::threshold` | 屏幕尺寸 < 1.5 px 的面要素降为点绘制 |
 | `_keep_mask()` | 简化器的退化保护 | 小要素被简化没了就回退原几何 |
@@ -331,9 +382,9 @@ fastapi、uvicorn、pywebview 可以不装。
 - **不做覆盖范围记账**：每套渲染集只记录自己那个矩形。判据是
   「**某一个**集合完整包含视口」，不是「若干集合的并集包含视口」——
   后者在平移出几段不相邻区域后会把中间的空白也当成已覆盖，正是矩形空洞的来源。
-- **合成绝不叠旧帧**：每帧在干净画布上从零合成，整帧画完才替换上屏
-  （`QgsMapRendererParallelJob` 结束时换图的语义）。在上一帧上继续叠图层会让
-  14% 的填充叠成实色，看起来就像「有些地方渲染错了」。
+- **合成绝不叠旧帧**：每次合成都在干净画布上从零叠所有图层图，final 帧完成后
+  才登记为可复用；provisional 帧同样从零合成，只用于显示、不登记 `_frame_sig`。
+  在上一帧上继续叠图层会让 14% 的填充叠成实色，看起来就像「有些地方渲染错了」。
 - **合成在独立线程**：图层 QImage 在 `_ComposeWorker` 里叠成整帧，主线程只做
   `QPixmap.fromImage` + `update`；拖拽大栅格时不会再被逐层 `drawImage` 卡住。
   栅格回调在矢量帧未完成时只更新图，不重复触发全屏合成。
@@ -352,9 +403,88 @@ fastapi、uvicorn、pywebview 可以不装。
   也没有可用渲染集，就说明这个视口里确实没东西（拖到数据范围外了），
   必须合成空帧，否则屏幕上的旧内容永远不动，看着像「拖不动」。
 - **世代号（epoch）**：视图一变就 +1，旧世代的帧和图层图一律丢弃，旧帧不会覆盖新帧。
-- **取消不阻塞**：对应 QGIS 的 `feedback()->cancel()`，旧任务在图层间隙收工；
-  但**不取消正在跑的任务**，否则连续缩放时每帧都半途而废、屏幕一直停在旧画面。
+- **取消不阻塞**：对应 QGIS 的 `feedback()->cancel()`，旧任务在图层间隙、流式
+  batch/chunk 边界收工。新视图到来时**连正在跑的任务也标记取消**：大矢量一帧
+  可能要几秒，不取消就会让最新视图排队等它画完；已经画出的部分保留，旧帧在屏上
+  按新视口平移，不会清空。连续滚轮时防抖只提交最后一个视图，不会每帧都半途而废。
 - **按图层渲染 + 合成**：每层只遍历一遍自己的要素包围盒，一层画完就能先合成。
+- **大图层流式渲染**：超过 25 万要素的图层不再预建整层 `QPainterPath`，
+  而是按当前屏幕矩形筛出要素，分 4096 个一块取几何、简化、建路径、立即画，
+  路径用完即丢。参照 `QgsVectorLayerRenderer` 的 extent 过滤 + 逐要素渲染，
+  避免“整层几何 + 整层路径”双份内存；小图层仍用渲染集缓存换平移/缩放速度。
+  可用 `GIS_AGENT_STREAM_VECTOR=1` 强制所有图层走流式，`=0` 全部走缓存。
+- **流式中间帧**：每画完一块，把当前图层图复制一份发给主线程合成
+  **provisional 帧**（小窗口约 0.06 s、大窗口 0.12 s 一次，`layerProgress` 信号），所以要素会一块块
+  出现在屏幕上，而不是整层画完才换图。中间帧只显示、不进图层缓存、不登记
+  `_frame_sig`；整帧完成后才由 final 帧替换。
+  不是“逐要素上屏”：Qt 每次 `drawPath` 的固定开销远大于顶点开销，
+  逐要素画 47 万条道路会慢一个数量级，块级渐进才是可用的流式粒度。
+- **源文件 / 磁盘缓存 provider 模式**：Shapefile / GeoPackage / GeoJSON / KML / GML
+  （以及 `.gpkg` / `.parquet` 磁盘缓存）导入时**不论要素数**都只读文件头
+  （要素数、范围、CRS、字段），不再先整份 `gpd.read_file()`；
+  GeoParquet 走 `pyarrow.ParquetFile.iter_batches()`；
+  其它格式走 `pyogrio.open_arrow(..., bbox=...)`：OGR 按 RecordBatch 流式产出，
+  `pyarrow` 消费一批、解成 shapely、画完即丢，不再把整个 bbox 物化成 GeoDataFrame。
+  首个批次通常几十毫秒就能到渲染线程，500 万要素也不会先申请一个整层数组。
+  算子/导出/拾取等需要全量数据时才懒加载 `Layer.gdf`。
+- **投影大图层的渲染 LOD 缓存**：GeoParquet 若源 CRS 是投影坐标，先按等效 WGS84
+  容差在**源 CRS 里简化、再投影**（直接投影 4480 万顶点要数秒，简化后通常只剩
+  十几万到几十万顶点）；简化结果按 2 的幂次容差档位缓存整层 WGS84 几何，
+  平移只做 bbox 过滤，缩放一档可复用 2.5 倍容差内的相邻档位。实测 21k 块 /
+  4480 万顶点的图层：首帧约 4 s，同一档位平移/一级缩放约 0.2~0.4 s，
+  跨 4 倍档位才重建一次（约 4~5 s）。缓存上限 96 MB，只存简化后的几何，
+  不保留原始全量；`read_bbox()` 仍返回完整几何，不受渲染简化影响。
+- **流式渲染不等于 0 内存峰值**：PyArrow 的 `ParquetFile` 在销毁前会保留读过的
+  column chunk。现在按 row group 重开/销毁 reader，并在扫描结束调用
+  `pyarrow.default_memory_pool().release_unused()` 把页还给 OS。同一 21k 块 /
+  4480 万顶点图层稳定后 WorkingSet 约 180–190 MB（含 Qt + 依赖约 146 MB 基线），
+  不是 0.9 GB。旧式单 row-group 缓存第一次全文件扫描瞬时峰值约 0.9 GB，扫完
+  即降；新建缓存用 `row_group_size=512`，同样扫描峰值约 280 MB。当前 586 MB
+  的村行政区划缓存已重建为 42 个 512 行 row group，会话启动峰值实测从约 1.0 GB
+  降到约 460 MB，空闲稳定在约 253 MB。
+- **栅格图层本身不是 1 GB 的来源**：48128×30342、带 overview 的影像在
+  1816×986 窗口下，源 block cache 只有几 MB，视口 QImage 约 1.8 MB；整份
+  8 图层会话只显示这张栅格时 WorkingSet 约 230 MB，从全隐藏状态勾选它只增加
+  约 8 MB。`TILE_CACHE` / `SOURCE_CACHE` 各封顶 64 MB，GDAL 块缓存 128 MB。
+  如果启动时看到 1 GB，通常是“村行政区划”的旧单 row-group 缓存还在流式渲染：
+  PyArrow 暂时保留约 645 MB column chunk，4~5 秒后释放；栅格加入本身不是这条峰值。
+  该缓存已重建为 42 个 512 行 row group，现在启动峰值约 460 MB。
+- **属性表只读属性列，不加载几何**：provider 图层打开属性表走
+  `Layer.attrs_frame()` / `VectorProvider.attrs_frame()`：GeoParquet 只读非几何列，
+  Shapefile/GPKG/GeoJSON 用 `pyogrio.read_dataframe(read_geometry=False)`。
+  21k 块 / 4480 万顶点的图层，旧路径为显示属性表调用 `layer.gdf`，会把整层 WKB
+  解码并缓存；新路径 0.45s、WorkingSet 约 179 MB（属性表数据约 4.65 MB），
+  `Layer.gdf` 保持 None。点表格一行时只解码该要素用于高亮/定位。
+- **悬停功能已移除，点击拾取也不触发全量加载**：鼠标移动不再做命中测试；
+  点击时 provider 图层（`c.geoms is None`）的 `_hit_test()` 走
+  `VectorProvider.hit_test()`：GeoParquet 用 LOD 缓存里的简化几何找最近要素，
+  再按源文件行号只读**属性列**（`attrs_at()`，不读几何）；Shapefile/GPKG 只读
+  点击点附近的小 bbox。实测 21k 块 / 4480 万顶点的图层，点击从 15.5s、
+  内存 4.3GB 降到 0.02s、只增加约 6MB 属性表内存，`Layer.gdf` 保持 None。
+  `_select_rect` / `zoom_to_feature` 在 `_gdf` 未加载时也不会再为 provider 图层
+  建全量几何索引；整层框选仍不支持，属性表按行定位改为单要素读取。
+  注意：Shapefile 没有空间索引时，bbox 过滤仍会顺序扫描 `.shp`，只是不把范围外
+  要素读进内存；GPKG 有空间索引时窗口读取明显更快。
+- **恢复会话也不全量读缓存**：溢出缓存（`.gpkg` / `.parquet`）同样能作为 provider。
+  GeoParquet 用 `pyarrow.ParquetFile.iter_batches()` 逐批解 WKB，打开时只读文件头；
+  恢复图层先填会话里保存的 count，不再为了图层面板显示一行元信息而
+  `gpd.read_parquet()`。实测一个 21k 块、4480 万顶点的缓存图层，旧路径
+  `gpd.read_parquet()` 峰值 3 GB 以上，新路径空闲恢复约 220 MB（隐藏状态）。
+  Parquet 的 bbox 没有空间索引时仍需扫 batch，但每次只驻留一个 batch。
+- **Shapefile 自动 `.qix`**：打开 `.shp` 时后台用 GDAL `ogrinfo` 补一次空间索引
+  （只写同目录 `.qix` 旁车文件，不碰 `.shp/.dbf`；`GIS_AGENT_AUTO_INDEX=0` 可关）。
+  470k 道路实测：城市窗口从 2.8 s 降到 0.27 s；500 万 Shapefile 首次打开会先顺序
+  流式显示，索引建好后平移/缩放才走索引。也可用
+  `tools/build_spatial_index.py layer.shp` 提前建好。
+- **500 万点降为像素桶**：点图层在当前视口超过 8 万个点时，把世界坐标量化到
+  1 个设备像素，同一个像素只画一次 `drawPoints`。这不是抽样：被占用的像素一个不少；
+  5M 点 / 1000×700 实测从 96 s 降到约 6 s，首帧 0.2 s；放大到城市窗口后
+  `point_dots=False`，恢复 3.4 px 圆点。需要逐点圆点对比时设
+  `GIS_AGENT_POINT_DOTS=0`。
+- **多图层并行 job**：每个图层一个任务、各自画到独立 QImage，线程池并行；
+  但仍按原始图层顺序回传 `layerReady`，上层先画完只暂存，不会先盖住下层。
+  实测 3 个图层 4.20s → 2.75s，整机冒烟 12s → 8.1s，最终帧逐像素一致。
+  `GIS_AGENT_PARALLEL_LAYERS=0` 可退回串行对照。
 - **图层缓存**：同视口下切显隐、调图层顺序直接复用上次的图层图。
   缓存键用**图层自己的**几何版本号，别的图层重建不会把这张图废掉。
 - **屏幕像素级容差**：0.8 像素对应的地面距离，放大后自动变细；
@@ -389,6 +519,9 @@ fastapi、uvicorn、pywebview 可以不装。
 
 放大那两级剩下的时间主要在**几何构建**（把 47 万条道路的坐标写成 QPainterPath 的顶点调用）
 和**简化**上，属于每个比例尺只付一次的代价，不是每帧成本。
+
+> 上表是渲染集管线的历史数据。启用 provider 后，源文件的「载入」只剩读文件头，
+> 首屏时间变成「bbox 读取 + 分块绘制」；Shapefile 首屏仍要顺序扫描一次，GPKG 有索引更快。
 
 ### 为什么没有上 OpenGL
 
@@ -436,17 +569,48 @@ QPainter 在 GL 上要把路径三角化（stencil-and-cover），而 CPU 光栅
 | `_RasterWorker` | `QgsMapRendererParallelJob` | 独立渲染线程，只保留最新请求 |
 | `render_layer_image()` | `QgsRasterLayerRenderer::render()` | 求像素矩形 → 按目标尺寸取块 → 画进视口图 |
 | `read_window()` | `QgsRasterIterator::readBlock()` | **按屏幕像素尺寸抽取**，不整幅读入内存 |
+| `RasterSourceCache` | `QgsRasterBlockCache` | **源 overview 固定像素块**，LRU 按字节限额，键不含视口 |
+| `RasterTileCache` | `QgsMapRendererCache`（屏幕 tile 版） | 世界坐标固定网格 tile，同一比例尺平移复用 |
 | `resampling` | `QgsRasterResampleFilter` | nearest / bilinear / cubic / average |
 | `percentile_stretch()` | `QgsContrastEnhancement` | 累计裁剪拉伸（默认 2%–98%） |
 
 要点：
 
-- **只读屏幕需要的像元**：`read_window()` 用 rasterio 的窗口读 + `out_shape` 降采样，
-  1 万×1 万的 GeoTIFF 在 700 px 的视口里只解码 700×N 个像素，载入时只读文件头
-  （`read_info()`，不碰像素），所以大栅格是「秒开」而不是「先卡十秒」。
-- **打开前检查金字塔**：没有 overview / `.ovr` 的大栅格会弹窗询问是否生成；
-  生成时用 GDAL 的真实进度条，输出外部 `.ovr`，不改原 TIFF。没有金字塔时
-  先降采样再读，大图缩放会明显变慢。
+- **只读屏幕需要的像元**：`read_window()` 用 rasterio 的窗口读 + `out_shape` 降采样；
+  源窗口超过 400 万像元时按**目标图像块**（256×256，外扩 2 px）切分，
+  每个块的源窗口边界落在全局输出网格的整数边界上再分别解码。按源块切会让
+  每块自己的重采样比例和全局不一致，nearest 在接缝处整段错位；按目标块切
+  可以做到和整窗读取逐像素一致（`tools/test_raster_block_read.py`）。
+  1 万×1 万的 GeoTIFF 在 700 px 视口里只保留屏幕大小的输出；载入时只读
+  文件头（`read_info()`，不碰像素）。
+- **GDAL 块缓存封顶**：`GDAL_CACHEMAX=128 MB`，可用 `GIS_AGENT_GDAL_CACHE_MB`
+  调整。不设时 GDAL 会按物理内存比例给缓存，448 MB / 613M 像元的 TIFF 一次
+  整窗读取峰值可到 1.4~1.9 GB；封顶后同样窗口的 WorkingSet 约 80 MB。代价是
+  无 overview 时首帧会慢很多，所以大栅格仍建议生成金字塔（有 `.ovr` 时读取
+  走缩减层，0.3 s 级，且会跳过目标块分块）。
+- **源 block cache（对应 `QgsRasterBlockCache`）**：先按目标抽取倍率选
+  overview 层，再按该层的固定 **256×256 源像素块**读取，块图像是拉伸后的
+  RGBA。键是 `(图层, rev, 样式, overview factor, bx, by, 块尺寸)`，**不含
+  scale/tx/ty**，所以平移、放大、缩小到同一 overview 层都能复用；上限
+  **64 MB / 512 块**，按 QImage 实际字节数淘汰。
+  448 MB / 20673×29673 的 TIFF 在 900×640 视口实测（直接调用
+  `render_layer_image`）：全图首帧 136ms、同视口重绘 10ms、连续放大
+  28/50/51/46ms、缩小 15/16/12/10ms；对比旧的整窗路径每次缩放都要
+  0.3s~几十秒。
+- **屏幕 tile cache**：同一比例尺平移时按世界坐标固定网格复用逻辑 256px
+  tile。首帧用整窗/分块读取，画完把**完整落在视口内**的 tile 裁进 LRU；
+  键是 `(图层, rev, 样式, scale, dpr, ix, iy)`，不含 tx/ty；上限
+  **64 MB / 512 块**。源影像不足 200 万像元时默认不切 tile
+  （整窗一次读完更快、也没有边界误差）；大图默认开启。
+  `GIS_AGENT_RASTER_TILES=0/1`、`GIS_AGENT_RASTER_BLOCKS=0/1` 可强制关闭/开启。
+- **overview 管理**：载入时仍会问一次是否生成 `.ovr`（不改原 TIFF）；
+  如果用户暂不生成，之后**可见大栅格首次渲染/缩放**时 `MapView` 发
+  `overviewNeeded`，主窗口用后台 `PyramidWorker` 补 `.ovr` 并在状态栏显示
+  进度，不阻塞地图交互。生成完成后刷新该栅格所有图层的 `info.overviews`、
+  清空 stats/源块缓存，下一次缩放自动选中缩减层。
+- **统计抽样**：拉伸统计用 `sample_stats()`：有 overview 时读 512×512
+  缩减层，无 overview 时均匀取 8×8 个 256×256 源块，不再为了 percentile
+  扫全图（这是旧逻辑第一次缩放卡几十秒的另一个原因）。
 - **不按视口裁剪图片**：和矢量一样，每个栅格渲染成**整视口大小**的透明图，
   `_compose()` 只需多一句 `drawImage(0, 0, img)`，不用管偏移。
 - **过期图不扔，按自己的视口挪过去**（这一条决定了拖拽的手感）：视图一变，
@@ -461,10 +625,10 @@ QPainter 在 GL 上要把路径三角化（stencil-and-cover），而 CPU 光栅
   的位置 —— 纯平移是精确的整数位移，缩放是以视口为基准的精确等比变换。代价只有
   「旧图分辨率不够 / 边缘缺一条」，位置始终正确。这套规则**矢量和栅格共用**
   （`MapView._blit_view_image`），因为矢量的图层图也是整视口大小的，同样会过期。
-- **栅格回调不能抢先上屏**：栅格是异步的，它完成时矢量 job 可能还在跑，那时
-  `_layer_imgs` 只是一套「缓存命中的子集」，拿它合成会把正在重画的矢量层整片抹掉。
-  用 `_vec_busy` 闸住：矢量空闲才允许栅格驱动上屏，否则只更新 `_pending`，
-  等矢量的整帧回来一起上。首次出图（`_frame is None`）例外，那是渐进显示的宽限期。
+- **栅格回调不能抢矢量中间帧的合成线程**：栅格是异步的，它完成时矢量 job 可能还在跑。
+  用 `_vec_busy` 闸住：矢量空闲才允许栅格驱动一次整帧合成；否则只把栅格图存进
+  `_raster_imgs`，等矢量中间帧/final 帧合成时自然带上。首次出图（`_frame is None`）
+  例外，让栅格先显示，避免空白。
 - **合成层是两条管线唯一的共用写画布路径，必须逐层兜底**：`_compose()` 里栅格先画，
   任何一层抛异常都会让后面的矢量整片消失；而且异常发生在 `p.save()` 之后会把画笔
   留在活跃状态，后续合成全部报 "paint device can only be painted by one painter"。
@@ -510,11 +674,8 @@ QPainter 在 GL 上要把路径三角化（stencil-and-cover），而 CPU 光栅
   请求，并给出可用的栅格工具；`zonal_stats` 是唯一同时吃「面 + 栅格」的工具。
 - **$prev 串联**：和矢量一样，上一步的栅格结果可以用 `$prev` 传给下一步，
   例如「裁剪影像 → 对结果重采样」。
-- **网页版仍不提供栅格工具**：上传纯栅格会提示用桌面版（见 `app/main.py` 的过滤）。
-
 已知边界：栅格仍没有属性表、不能做矢量叠加（误操作会在校验期得到一句中文错误），
-也没有拉伸/伪彩色面板（默认参数写死在 `RasterLayer.style` 里）。网页版还没有栅格管线，
-上传纯栅格压缩包会明确提示用桌面版。
+也没有拉伸/伪彩色面板（默认参数写死在 `RasterLayer.style` 里）。
 
 
 ## 支持的格式
@@ -553,13 +714,13 @@ FileGDB：`.gdb` 文件夹（Esri File Geodatabase，依赖纯 Python 的 `pyope
 - 缓存目录可用 `GIS_AGENT_CACHE_DIR` 指定；
 - 有 `pyarrow` 时用 GeoParquet，否则用 GeoPackage；
 - 换出后 `Layer.meta()` 仍走缓存（count/bounds/fields 不重新读盘），下次访问 `layer.gdf` 时懒加载；
-- 删除图层 / 清空项目会清理对应缓存文件；`/api/health` 返回 `cache` 统计（服务模式）。
+- 删除图层 / 清空项目会清理对应缓存文件。
 
 ## 目录结构
 
 ```
 gis-agent/
-├─ native_app.py / run.py / desktop.py   三个入口：桌面版 / 网页版 / 网页版套原生窗口
+├─ native_app.py                        桌面端入口（原生 Qt 窗口）
 ├─ native/      纯 Qt 界面层：主窗口（app.py）、地图与渲染管线（mapview.py）、
 │               对话面板（chat.py）、对话框（dialogs.py / agent_settings.py）、
 │               任务通知（taskcenter.py 的 TaskNotice）、
@@ -568,11 +729,12 @@ gis-agent/
 ├─ skills/      Agent 技能卡（Markdown + frontmatter）；在「Agent 设置」里管理
 ├─ app/         与界面无关的内核：图层仓库、26 个矢量算子 + 8 个栅格算子（engine.py / raster_ops.py）、两级规划器与执行器
 │               （agent.py）、算子契约与参数校验（tool_registry.py）、自定义算子（custom_ops.py）、
-│               矢量读写（io_utils.py）、会话与记忆持久化（storage.py / models.py）、
+│               矢量读写（io_utils.py）、矢量 provider（vector_provider.py）、
+│               在线地图配置（Token/参数/请求头，含天地图）与 XYZ/WMTS/WMS URL 构造（online_map.py）、
+│               会话与记忆持久化（storage.py / models.py）、
 │               任务调度与事件流（runtime.py）、记忆提取与检索（memory.py）、
 │               大模型接口格式适配（api_formats.py）、连接性测试（conn_test.py）、
 │               @ 图层提及解析（mentions.py）、配置读写（config.py）
-├─ web/         网页版前端（本分支暂缓维护，桌面端优先）
 ├─ tools/       验证与性能工具：verify_render（完备性 + 像素比对）、perf_*（耗时分解）、
 │               test_*（回归）、run_regression.py（跑全部回归）、smoke_app（整机冒烟）
 ├─ samples/     内置示例 GeoJSON
@@ -637,11 +799,19 @@ gis-agent/
 
 ## 已知边界
 
-- 单机单会话，图层默认在内存；超过 `GIS_AGENT_MEMORY_MB` 的不活跃大图层会换出到 `data/cache/`，关掉窗口后需重新载入（已导出的文件不受影响）。
+- 单机单会话；源文件图层默认只读文件头、按 bbox 渲染，不把整层读进内存；
+  算子/导出/拾取等需要全量数据时才懒加载。内存图层超过 `GIS_AGENT_MEMORY_MB` 的
+  不活跃大图层会换出到 `data/cache/`，关掉窗口后需重新载入（已导出的文件不受影响）。
 - **要素不抽样**：视口内的要素会全量进渲染集，没有「超过 N 个就抽稀」的开关 ——
   抽样是有意去掉的，它会在屏幕上留下成块的空洞。性能靠「1px 笔宽、按批合并路径、
   亚像素要素降为点」而不是靠少画要素。
-- 大图层（77 万要素）载入约 20 s，其中约 15 s 是 Shapefile 解析；渲染本身见上面的性能表。
-- 底图是经纬网，不含在线瓦片；要接底图可自行往 `MapView.paintEvent` 里插瓦片图层。
+- provider 支持的源文件图层导入只读文件头（毫秒级）；首屏要按屏幕 bbox 从源文件取一次窗口。
+  Shapefile 没有空间索引时这一步仍会顺序扫描 `.shp`（只是不把范围外要素读进内存），
+  77 万要素的道路首屏通常要几秒；GPKG 有空间索引时会快很多。
+  CSV、FileGDB、ZIP 解压临时文件仍回退整份读取。
+- 默认底图是经纬网；需要在线底图时用工具库「底图 → 在线地图」添加 XYZ/WMTS/WMS，
+  天地图选 WMTS、Token 参数名填 `tk`；不添加就不联网。在线瓦片依赖网络与目标服务可用性，服务端限流/证书问题会在图层上
+  显示为空，不会影响本地矢量数据。需要鉴权的服务在弹窗里填 Token/自定义请求头；开启
+  会话持久化时 Token 随会话状态保存在本地 SQLite（不写入日志/聊天消息），恢复会话时
+  会重新用于请求。
 - 规则引擎覆盖常见中文表达，长句、口语化、多目标推理建议接大模型。
-- 网页版（`run.py` + `web/`）本分支暂缓维护；接口与算子仍共用，桌面端优先。

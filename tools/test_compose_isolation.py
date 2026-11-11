@@ -225,7 +225,8 @@ def main() -> int:
                         world=(0.0, 0.0, 1.0, 1.0))
     orig_read = rv.read_window
 
-    def fake_read(layer, ext, out_w, out_h, bands=None, resampling="bilinear"):
+    def fake_read(layer, ext, out_w, out_h, bands=None, resampling="bilinear",
+                  cancel=None):
         return np.full((1, max(1, out_h), max(1, out_w)), 200, dtype=np.uint8), ext
 
     rv.read_window = fake_read

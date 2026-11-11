@@ -8,14 +8,16 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-                               QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
-                               QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
-                               QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+                               QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout,
+                               QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
+                               QScrollArea, QSizePolicy, QTableWidget, QTableWidgetItem,
+                               QVBoxLayout, QWidget)
 
 from app import api_formats
 from app import conn_test
 from app.gdb import gdb_layer_infos
 from app.io_utils import VECTOR_EXTS, extract_zip, file_info
+from app.online_map import METHOD_LABELS, TOKEN_KEY_PRESETS, validate_config
 from app.raster import RASTER_EXTS, read_info
 from app.tool_registry import CUSTOM_GROUP
 
@@ -26,8 +28,8 @@ from .theme import QSS
 class TableDialog(QDialog):
     """属性表：分页 + 排序 + 筛选，点一行地图跟着高亮定位。
 
-    和地图的联动靠 `on_pick(位置下标)` 回调 —— 传的是**行在 gdf 里的位置**，
-    不是索引标签，因为框选/高亮用的都是位置。
+    和地图的联动靠 `on_pick(位置下标)` 回调 —— 传的是**行在数据源里的位置**，
+    不是索引标签。provider 图层的行序就是源文件行号，可以直接拿去单要素读取。
     """
 
     PAGE = 200
@@ -39,10 +41,11 @@ class TableDialog(QDialog):
         self.setWindowTitle(f"属性表 · {layer.name}")
         self.resize(900, 580)
 
-        g = layer.gdf
-        self._cols = [str(c) for c in g.columns if c != g.geometry.name]
-        # reset_index 让「标签」等于「位置」，后面 loc/iloc 和地图下标才能对得上
-        self._data = g.drop(columns=[g.geometry.name]).reset_index(drop=True)
+        # 只取属性列。provider 图层这里读 Parquet/OGR 的非几何列，不能走
+        # layer.gdf —— 那会把整层 WKB 几何解码进内存，21k 块 / 4480 万顶点
+        # 的图层仅打开属性表就会多出数 GB。
+        self._data = layer.attrs_frame().reset_index(drop=True)
+        self._cols = [str(c) for c in self._data.columns]
         self._order = list(range(len(self._data)))     # 当前显示顺序（位置下标）
         self._sort = (None, False)                     # (列名, 是否降序)
         self._page = 0
@@ -146,7 +149,7 @@ class TableDialog(QDialog):
         pages = max(1, (len(self._order) + self.PAGE - 1) // self.PAGE)
         self._page = min(self._page, pages - 1)
         chunk = self._order[self._page * self.PAGE:(self._page + 1) * self.PAGE]
-        self.tw_pos = chunk                            # 表格行 → gdf 位置
+        self.tw_pos = chunk                            # 表格行 → 数据源行号
         df = self._data.iloc[chunk] if chunk else self._data.iloc[[]]
 
         self.tw.setRowCount(len(chunk))
@@ -922,28 +925,51 @@ class OperatorDialog(QDialog):
     """预览「按文字描述生成的工具」：看得到代码、试跑结果，再决定要不要入库。
 
     还能挑它进工具库的哪个分组；不挑就放「我的工具」。
+
+    ``editing=True`` 时是「Agent 设置 → 工具」里的编辑入口：名称和说明
+    改成可编辑（改显示名不影响算子名，避免把已有调用链改断），
+    窗口标题和确认按钮文案也换成编辑口径。
     """
 
-    def __init__(self, spec: dict, parent=None, group_choices: list[str] | None = None):
+    def __init__(self, spec: dict, parent=None, group_choices: list[str] | None = None,
+                 editing: bool = False):
         super().__init__(parent)
         self.spec = dict(spec or {})
+        self.editing = bool(editing)
         title = self.spec.get("title") or self.spec.get("name") or "新工具"
-        self.setWindowTitle(f"新工具预览 · {title}")
+        self.setWindowTitle(f"编辑工具 · {title}" if self.editing
+                            else f"新工具预览 · {title}")
         self.resize(720, 620)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 14, 16, 12)
         root.setSpacing(8)
 
-        head = QLabel(f"<b>{title}</b>　<span style='color:#6b7c93'>{self.spec.get('name', '')}</span>")
-        head.setTextFormat(Qt.RichText)
-        head.setStyleSheet("font-size:13px;")
-        root.addWidget(head)
+        if self.editing:
+            form = QFormLayout()
+            form.setSpacing(7)
+            self.title_edit = QLineEdit(title)
+            self.title_edit.setPlaceholderText("工具库里的显示名")
+            self.desc_edit = QLineEdit(str(self.spec.get("desc") or ""))
+            self.desc_edit.setPlaceholderText("一句话说明这个工具做什么")
+            form.addRow("名称", self.title_edit)
+            form.addRow("说明", self.desc_edit)
+            root.addLayout(form)
+            rid = QLabel(f"算子名：{self.spec.get('name', '')}（不能改；"
+                         "调用方按它找工具，改了会变成另一个工具）")
+            rid.setObjectName("tiny")
+            rid.setWordWrap(True)
+            root.addWidget(rid)
+        else:
+            head = QLabel(f"<b>{title}</b>　<span style='color:#6b7c93'>{self.spec.get('name', '')}</span>")
+            head.setTextFormat(Qt.RichText)
+            head.setStyleSheet("font-size:13px;")
+            root.addWidget(head)
 
-        desc = QLabel(self.spec.get("desc") or "（没有说明）")
-        desc.setWordWrap(True)
-        desc.setObjectName("muted")
-        root.addWidget(desc)
+            desc = QLabel(self.spec.get("desc") or "（没有说明）")
+            desc.setWordWrap(True)
+            desc.setObjectName("muted")
+            root.addWidget(desc)
 
         # ---- 分组：放进工具库的哪一组
         self.group_combo = QComboBox()
@@ -1011,7 +1037,8 @@ class OperatorDialog(QDialog):
         root.addWidget(note)
 
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        btns.button(QDialogButtonBox.Ok).setText("保存并加入工具库")
+        btns.button(QDialogButtonBox.Ok).setText(
+            "保存修改" if self.editing else "保存并加入工具库")
         btns.button(QDialogButtonBox.Cancel).setText("取消")
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
@@ -1023,4 +1050,179 @@ class OperatorDialog(QDialog):
         # 分组：用户选了就用选的；下拉框为空（理论上不会）则回落到默认组
         picked = str(self.group_combo.currentText() or "").strip()
         spec["group"] = picked or CUSTOM_GROUP
+        if self.editing:
+            # 名称/说明可改，算子名不动：已有计划、记忆和调用链都按算子名找工具
+            spec["title"] = (self.title_edit.text().strip()
+                             or self.spec.get("title") or self.spec.get("name") or "")
+            spec["desc"] = self.desc_edit.text().strip()
         return spec
+
+
+class OnlineMapDialog(QDialog):
+    """添加在线地图：地址 / 加载方式 / 名称 + 可选鉴权与自定义参数。
+
+    基础三项严格按需求顺序排列；Token、自定义查询参数和自定义请求头放在
+    后面的「鉴权与自定义参数（可选）」分组里。确认后由主窗口登记一个
+    `RasterLayer(online=...)`，渲染线程按 XYZ/WMTS/WMS 取图。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("添加在线地图")
+        self.resize(640, 540)
+        self.setMinimumWidth(560)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 14, 16, 12)
+        root.setSpacing(9)
+
+        head = QLabel("在线地图")
+        head.setStyleSheet("font-size:14px;font-weight:600;")
+        root.addWidget(head)
+        sub = QLabel("填写瓦片或 WMS 地址，加载后会作为栅格底图出现在图层列表。")
+        sub.setObjectName("muted")
+        sub.setWordWrap(True)
+        root.addWidget(sub)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+        form.setLabelAlignment(Qt.AlignLeft)
+
+        # 严格按需求顺序：1 地址 → 2 加载方式 → 3 名称
+        self.url_edit = QLineEdit()
+        self.url_edit.setClearButtonEnabled(True)
+        form.addRow("在线地图地址", self.url_edit)
+
+        self.method_combo = QComboBox()
+        for key, label in METHOD_LABELS.items():
+            self.method_combo.addItem(label, key)
+        form.addRow("加载方式", self.method_combo)
+
+        self.name_edit = QLineEdit("在线地图")
+        self.name_edit.setClearButtonEnabled(True)
+        form.addRow("在线地图名称", self.name_edit)
+        root.addLayout(form)
+
+        # 鉴权/自定义参数：放在基础三项之后，不打断 1→2→3 的顺序。
+        adv = QGroupBox("鉴权与自定义参数（可选）")
+        adv_form = QFormLayout(adv)
+        adv_form.setSpacing(8)
+        adv_form.setLabelAlignment(Qt.AlignLeft)
+
+        self.token_key = QComboBox()
+        self.token_key.setEditable(True)
+        for key in TOKEN_KEY_PRESETS:
+            self.token_key.addItem(key)
+        self.token_key.setCurrentText("token")
+        self.token_key.setToolTip(
+            "Token 作为查询参数时使用的参数名；可手动输入（如 access_token、key、tk）。\n"
+            "留空则只通过地址/参数/请求头里的 {token} 引用发送。")
+        adv_form.addRow("Token 参数名", self.token_key)
+
+        self.token_edit = QLineEdit()
+        self.token_edit.setEchoMode(QLineEdit.Password)
+        self.token_edit.setClearButtonEnabled(True)
+        self.token_edit.setPlaceholderText("可留空；未用 {token} 引用时按上面的参数名附加")
+        self.token_edit.setToolTip("Token 只随会话状态本地保存，不写入日志/聊天消息。")
+        self.show_token = QCheckBox("显示")
+        self.show_token.toggled.connect(
+            lambda on: self.token_edit.setEchoMode(
+                QLineEdit.Normal if on else QLineEdit.Password))
+        token_row = QWidget()
+        token_row.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        token_layout = QHBoxLayout(token_row)
+        token_layout.setContentsMargins(0, 0, 0, 0)
+        token_layout.setSpacing(6)
+        token_layout.addWidget(self.token_edit, 1)
+        token_layout.addWidget(self.show_token)
+        # QFormLayout 会按行剩余高度拉伸 QWidget 容器；不锁高度会在 Token
+        # 和输入框之间留出一大片空白。
+        token_row.setFixedHeight(self.token_edit.sizeHint().height())
+        adv_form.addRow("Token", token_row)
+
+        self.params_edit = QPlainTextEdit()
+        self.params_edit.setFixedHeight(58)
+        self.params_edit.setPlaceholderText(
+            "key=value，每行一个（也可用 & 分隔）\n例如：style=dark&lang=zh")
+        self.params_edit.setToolTip(
+            "会附加到每次瓦片/WMS 请求；可用 {token} 引用 Token。")
+        adv_form.addRow("自定义参数", self.params_edit)
+
+        self.headers_edit = QPlainTextEdit()
+        self.headers_edit.setFixedHeight(58)
+        self.headers_edit.setPlaceholderText(
+            "Name: value，每行一个\n例如：Authorization: Bearer {token}")
+        self.headers_edit.setToolTip(
+            "会随每次请求发送；可用 {token} 引用 Token，适合 Bearer/API-Key。")
+        adv_form.addRow("自定义请求头", self.headers_edit)
+        adv.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        root.addWidget(adv)
+        root.addStretch(1)
+
+        self.hint = QLabel()
+        self.hint.setObjectName("tiny")
+        self.hint.setWordWrap(True)
+        root.addWidget(self.hint)
+
+        adv_hint = QLabel(
+            "自定义参数/请求头会附加到每次请求；Token 也可在地址、参数或请求头里用 "
+            "{token} 引用（此时不再自动追加查询参数；参数名留空也不追加）。")
+        adv_hint.setObjectName("tiny")
+        adv_hint.setWordWrap(True)
+        root.addWidget(adv_hint)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.button(QDialogButtonBox.Ok).setText("确认加载")
+        btns.button(QDialogButtonBox.Cancel).setText("取消")
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        root.addWidget(btns)
+
+        self.method_combo.currentIndexChanged.connect(self._sync_method)
+        # 天地图的 Token 查询参数名固定是 tk；贴入天地图地址时自动带出来，
+        # 用户仍可以改回自定义值。
+        self.url_edit.textChanged.connect(self._sync_token_key_for_url)
+        self._sync_method()
+
+    def _sync_token_key_for_url(self) -> None:
+        url = self.url_edit.text().strip().lower()
+        if ("tianditu.gov.cn" in url
+                and self.token_key.currentText().strip() in ("", "token")):
+            self.token_key.setCurrentText("tk")
+
+    def _sync_method(self) -> None:
+        method = self.method_combo.currentData()
+        if method == "wms":
+            self.url_edit.setPlaceholderText(
+                "https://example.com/geoserver/wms?LAYERS=workspace:layer"
+                "&STYLES=&FORMAT=image/png")
+            self.hint.setText("WMS：每次视图变化按当前范围请求一张图；地址或自定义参数里"
+                              "要带 LAYERS，也可以写 {bbox}/{width}/{height} 占位符。")
+        elif method == "wmts":
+            self.url_edit.setPlaceholderText(
+                "https://example.com/wmts/{TileMatrix}/{TileCol}/{TileRow}.png")
+            self.hint.setText(
+                "WMTS：REST 用 {TileMatrix}/{TileCol}/{TileRow}；天地图把 "
+                "TILEMATRIX/TILEROW/TILECOL 写成 {z}/{y}/{x}，Token 参数名填 tk。")
+        else:
+            self.url_edit.setPlaceholderText(
+                "https://tile.openstreetmap.org/{z}/{x}/{y}.png")
+            self.hint.setText("XYZ 瓦片：地址里必须有 {z}/{x}/{y}；"
+                              "TMS 的 Y 轴写成 {-y}，子域轮询写成 {s}。")
+
+    def config(self) -> dict:
+        method = str(self.method_combo.currentData() or "xyz")
+        return validate_config(
+            method, self.url_edit.text(), self.name_edit.text(),
+            token=self.token_edit.text(),
+            token_key=self.token_key.currentText(),
+            params=self.params_edit.toPlainText(),
+            headers=self.headers_edit.toPlainText())
+
+    def accept(self) -> None:  # noqa: D401 - Qt override
+        try:
+            self.config()
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "在线地图", str(e))
+            return
+        super().accept()

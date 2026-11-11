@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QFileDialog, QF
                                QPushButton, QProgressDialog, QScrollArea, QSizeGrip,
                                QSizePolicy, QTabWidget, QToolTip, QVBoxLayout, QWidget)
 
-from app import custom_ops
+from app import custom_ops, tool_prefs
 from app.agent import Planner, run_agent, run_plan
 from app.config import explain, is_ready, load_cfg, save_cfg
 from app.engine import Layer, Store
@@ -25,7 +25,7 @@ from app.gdb import is_gdb_path, read_gdb_layers
 from app.io_utils import export_layer as write_layer_file
 from app.io_utils import extract_zip, file_info, load_any, read_layer
 from app.raster import RASTER_EXTS, RasterError, is_raster_path, read_info
-from app.models import LayerRecord
+from app.models import LayerRecord, Message, Part
 from app.memory import MemoryManager
 from app.mentions import (ambiguity_question, mentions_note, not_found_note,
                           parse_mentions, resolve_mentions, strip_mentions)
@@ -33,16 +33,18 @@ from app.runtime import (AgentRuntime, PRIORITY_CHAT, PRIORITY_EXPORT, PRIORITY_
                          PRIORITY_OPGEN, TaskScheduler, recover_interrupted_runs)
 from app.samples import ensure_samples
 from app.storage import AgentStore
-from app.tool_registry import CUSTOM_GROUP, GROUP_CHOICES, template_map
+from app.tool_registry import GROUP_CHOICES, template_map
+from app.tool_catalog import tool_tree
 
 from .chat import ChatPanel, PlanCard, Worker
 from .agent_settings import AgentSettingsDialog
 from .compare import MapCompareDialog, MapCompareWidget
-from .dialogs import (ImportDataDialog, ImportDialog, NewToolDialog, OperatorDialog,
-                      SettingsDialog, TableDialog)
+from .dialogs import (ImportDataDialog, ImportDialog, NewToolDialog, OnlineMapDialog,
+                      OperatorDialog, SettingsDialog, TableDialog)
 from .format import fmt_num
 from .mapview import MapView
 from .memory_panel import MemoryPanel
+from .style_dialog import LayerStyleDialog
 from .taskcenter import TaskNotice
 from .theme import QSS
 from .workspace import WorkspacePanel
@@ -88,7 +90,10 @@ TOOL_TEMPLATES = template_map()
 
 
 def describe_layer(lay) -> str:
-    """一句话描述图层（矢量说要素数，栅格说像元尺寸）。"""
+    """一句话描述图层（矢量说要素数，栅格说像元尺寸，在线地图说加载方式）。"""
+    if getattr(lay, "online", None):
+        from app.online_map import method_label
+        return f"「{lay.name}」（在线地图 · {method_label(lay.online.get('method'))}）"
     if getattr(lay, "is_raster", False):
         i = lay.info
         return f"「{lay.name}」（{i.width}×{i.height} 像元 · {i.bands} 波段）"
@@ -160,22 +165,8 @@ def _icon_pixmap(size: int) -> QPixmap:
 
 
 # 工具库的两级分类（只影响展示顺序；不在这里的算子会落到「其它 / 我的工具」）
-#: 一级「矢量」下的功能分组。自定义矢量工具按 TOOL_SPEC_GROUP 归位。
-TOOL_GROUPS = [
-    ("概览", ["describe", "highlight"]),
-    ("几何构造", ["buffer", "centroid", "convex_hull", "min_rect", "voronoi", "grid"]),
-    ("叠加分析", ["clip", "intersect", "union", "erase"]),
-    ("邻近与连接", ["sjoin", "nearest", "bbox_select"]),
-    ("属性与统计", ["filter", "field_calc", "area_stats", "shape_metrics"]),
-    ("整理", ["dissolve", "merge", "dedupe", "simplify", "reproject", "fix_geometry", "explode"]),
-]
-#: 一级「栅格」下的功能分组。栅格算子不再和矢量混在一个平铺列表里。
-RASTER_TOOL_GROUPS = [
-    ("概览", ["raster_info"]),
-    ("处理", ["raster_clip", "raster_reproject", "raster_resample", "raster_merge"]),
-    ("分析", ["raster_calc", "zonal_stats"]),
-    ("转换", ["raster_to_vector"]),
-]
+# 分组表放在 app/tool_catalog.py：左栏工具库和 Agent 设置里的「工具」页共用一份，
+# 否则设置页删/停用了工具、左栏还按旧清单显示，两边会打架。
 TOOL_SPEC_BY_NAME: dict[str, str] = {}
 #: 算子名 → 分组（自定义算子按新建时选的分组归位；没选就是「我的工具」）
 TOOL_SPEC_GROUP: dict[str, str] = {}
@@ -284,10 +275,15 @@ class CollapsibleSection(QFrame):
     def _on_toggled(self, expanded: bool) -> None:
         self._sync()
 
-    def add_chip(self, button: QPushButton) -> None:
+    def add_chip(self, button: QPushButton, span: int = 1) -> None:
         row, col = divmod(self._chip_count, 2)
-        self.body_layout.addWidget(button, row, col)
-        self._chip_count += 1
+        if span >= 2:
+            # 单入口（例如「在线地图」）横跨两列，点击区更明显，也不像半空一行。
+            self.body_layout.addWidget(button, row, 0, 1, 2)
+            self._chip_count += 2
+        else:
+            self.body_layout.addWidget(button, row, col)
+            self._chip_count += 1
 
     def add_section(self, section: "CollapsibleSection") -> None:
         self.body_layout.addWidget(section)
@@ -329,7 +325,10 @@ class LayerRow(QWidget):
         meta = layer.meta()
         # 栅格的 meta["count"] 是像元数，显示成「要素」会误导（288,000 像元 ≠ 288,000 要素）
         ras = meta.get("raster")
-        if ras:
+        if ras and ras.get("online"):
+            from app.online_map import method_short
+            sub_text = f"在线地图 · {method_short(ras['online'].get('method'))}"
+        elif ras:
             sub_text = (f"{ras['width']}×{ras['height']} · {ras['bands']} 波段"
                         f" · {meta['crs']}")
         else:
@@ -390,6 +389,86 @@ class _TitleBar(QFrame):
         super().mouseDoubleClickEvent(e)
 
 
+class ResizeHandle(QFrame):
+    """右栏左边缘的拖拽把手：左右拖动即可改对话面板宽度。
+
+    对话面板以前是写死 412px 的，窄屏上不够用、宽屏上又浪费地方。
+    这里给它一条 6px 的把手，行为和常见 IDE 的分隔条一致：
+    · 按住左键左右拖 → 实时改宽度；
+    · 双击 → 恢复默认宽度；
+    · 松手 → 把宽度记到本地设置里，下次打开还在。
+    """
+
+    MIN_W = 340
+    MAX_W = 640
+    DEFAULT_W = 412
+
+    def __init__(self, on_width=None, parent=None):
+        super().__init__(parent)
+        self.setObjectName("resizeHandle")
+        self.setFixedWidth(6)
+        # SizeHorCursor：左右双箭头，正是「横向调宽」的语义
+        # （Qt 6 里已经没有 SplitCursor 这个形状了）
+        self.setCursor(Qt.SizeHorCursor)
+        self.setToolTip("拖动调整对话面板宽度 · 双击恢复默认")
+        self._on_width = on_width
+        self._panel_ref = None
+        self._press_x = 0
+        self._press_w = 0
+        self._dragging = False
+
+    # ------------------------------------------------------------------ 事件
+    def mousePressEvent(self, e):  # noqa: N802
+        if e.button() == Qt.LeftButton:
+            self._press_x = e.globalPosition().x()
+            self._press_w = self._panel_width()
+            self._dragging = True
+            self.setCursor(Qt.ClosedHandCursor)
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):  # noqa: N802
+        if self._dragging and e.buttons() & Qt.LeftButton:
+            # 往左拖 = 面板变宽
+            delta = self._press_x - e.globalPosition().x()
+            self._set_width(self._press_w + delta)
+            e.accept()
+            return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):  # noqa: N802
+        if self._dragging:
+            self._dragging = False
+            self.setCursor(Qt.SizeHorCursor)
+            if self._on_width:
+                self._on_width(self._panel_width())
+            e.accept()
+            return
+        super().mouseReleaseEvent(e)
+
+    def mouseDoubleClickEvent(self, e):  # noqa: N802
+        if e.button() == Qt.LeftButton:
+            self._set_width(self.DEFAULT_W)
+            if self._on_width:
+                self._on_width(self.DEFAULT_W)
+            e.accept()
+            return
+        super().mouseDoubleClickEvent(e)
+
+    # ------------------------------------------------------------------ 宽度
+    def _panel_width(self) -> int:
+        return self._panel_ref.width() if self._panel_ref is not None else self.DEFAULT_W
+
+    def _set_width(self, width: int) -> None:
+        w = max(self.MIN_W, min(self.MAX_W, int(width)))
+        if self._panel_ref is not None:
+            self._panel_ref.setFixedWidth(w)
+
+    def set_panel(self, panel) -> None:
+        self._panel_ref = panel
+
+
 class MainWindow(QMainWindow):
     #: Agent 执行过程中的流事件： (run_uid, kind, payload)
     #: kind = "plan" / "step"；后台线程 emit，Qt 自动排队到主线程。
@@ -404,6 +483,7 @@ class MainWindow(QMainWindow):
         self._active_plan_uid = ""
         self._tool_rerun_inflight = False
         self._pyramid_asked: set[str] = set()
+        self._overview_workers: dict[str, PyramidWorker] = {}
         self._pending_confirm = None          # (StepConfirmGate, StepConfirmDialog)
         self._confirm_dialog = None
         self.setWindowTitle("GIS 矢量数据 Agent")
@@ -497,6 +577,12 @@ class MainWindow(QMainWindow):
         self._clarify_answer: dict | None = None
         #: 工具库折叠状态：key = "矢量|整理" / "kind|栅格"。刷新工具库时保留。
         self._tool_collapsed: set[str] = set()
+        # Agent 设置 →「工具」里停用的工具：启动先按磁盘配置恢复。
+        # 工具库渲染、大模型候选、执行前检查都读 app.tool_prefs 这一份状态。
+        try:
+            tool_prefs.set_disabled(load_cfg().get("tools_disabled") or [])
+        except Exception:
+            pass
 
         self.setStyleSheet(QSS)
         self._build()
@@ -588,6 +674,13 @@ class MainWindow(QMainWindow):
             self._persist_state(force_cache=True)
         except Exception:
             pass
+        for worker in list(self._overview_workers.values()):
+            try:
+                worker.cancel()
+                worker.wait(2000)
+            except Exception:  # noqa: BLE001
+                pass
+        self._overview_workers.clear()
         try:
             self.map_compare.shutdown()
         except Exception:
@@ -739,7 +832,7 @@ class MainWindow(QMainWindow):
         # 头部最右侧：Agent 自己的设置（技能、逐步确认），和模型接口设置分开
         self.btn_agent_settings = QPushButton("⚙ Agent 设置")
         self.btn_agent_settings.setObjectName("ghost")
-        self.btn_agent_settings.setToolTip("技能、逐步确认和 Agent 行为配置")
+        self.btn_agent_settings.setToolTip("技能、工具库管理、逐步确认和 Agent 行为配置")
         self.btn_agent_settings.clicked.connect(self.open_agent_settings)
         hl.addWidget(self.btn_agent_settings)
 
@@ -923,13 +1016,13 @@ class MainWindow(QMainWindow):
 
         self.map = MapView()
         self.map.visible = self.visible
-        self.map.hoverChanged.connect(self._on_hover)
         self.map.picked.connect(self._on_pick)
         self.map.viewChanged.connect(self._on_view)
         self.map.cursorMoved.connect(self._on_cursor)
         self.map.progress.connect(self._on_map_progress)
         self.map.selectionChanged.connect(self._on_selection_changed)
         self.map.mapMenu.connect(self._map_menu)
+        self.map.overviewNeeded.connect(self._on_overview_needed)
         self.map_compare = MapCompareWidget(self.map, card)
         grid.addWidget(self.map_compare, 0, 0)
 
@@ -1035,17 +1128,61 @@ class MainWindow(QMainWindow):
         self.set_status("已退出地图对比")
 
     # ---------------------------------------------------------------- 右栏
+    def _chat_width(self) -> int:
+        """对话面板宽度：从本地设置读，夹在合理范围内。"""
+        try:
+            w = int(load_cfg().get("chat_panel_width") or 0)
+        except Exception:
+            w = 0
+        if w <= 0:
+            w = ResizeHandle.DEFAULT_W
+        return max(ResizeHandle.MIN_W, min(ResizeHandle.MAX_W, w))
+
+    def _save_chat_width(self, width: int) -> None:
+        """记住对话面板宽度，下次打开还是这个宽度。"""
+        try:
+            cfg = load_cfg()
+            cfg["chat_panel_width"] = int(width)
+            save_cfg(cfg)
+        except Exception:
+            pass
+        self._sync_min_window_width()
+
+    def _sync_min_window_width(self) -> None:
+        """窗口最小宽度要装得下左栏 + 地图 + 对话面板。"""
+        try:
+            chat_w = self.chat_panel.width() if getattr(self, "chat_panel", None) else 412
+            need = 272 + 320 + chat_w + 60
+            self.setMinimumSize(max(1080, need), 640)
+        except Exception:
+            pass
+
     def _build_right(self) -> QWidget:
+        holder = QWidget()
+        holder.setObjectName("chatArea")
+        hl = QHBoxLayout(holder)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(0)
+
+        # 左边一条拖拽把手：左右拖动改对话面板宽度（双击回默认）
+        self.chat_handle = ResizeHandle(self._save_chat_width)
+        hl.addWidget(self.chat_handle)
+
         panel = QFrame()
         panel.setObjectName("chatPanel")
-        panel.setFixedWidth(412)
+        panel.setFixedWidth(self._chat_width())
+        hl.addWidget(panel, 1)
+        self.chat_panel = panel
+        self.chat_handle.set_panel(panel)
+
         vl = QVBoxLayout(panel)
         vl.setContentsMargins(0, 0, 0, 0)
         self.chat = ChatPanel(self)
         self.chat.sent.connect(self.on_send)
         self.chat.clear_btn.clicked.connect(self.clear_all)
         vl.addWidget(self.chat, 1)
-        return panel
+        self._sync_min_window_width()
+        return holder
 
     # ---------------------------------------------------------------- 状态栏
     def _build_statusbar(self) -> None:
@@ -1181,6 +1318,9 @@ class MainWindow(QMainWindow):
         self.map.invalidate()
         if getattr(self, "map_compare", None) is not None and self.map_compare.active:
             self.map_compare.set_layer_visibility(layer_id, bool(visible))
+        # 显隐也立刻持久化：否则用户关掉大图层后直接关窗/崩溃，下次启动
+        # 仍按旧的 visible 重建一次大图层的 LOD，出现一次 1 GB 瞬时峰值。
+        QTimer.singleShot(0, self._persist_state)
         # 延后刷新图例：图例行自己也能触发这里，不能当场把它删掉
         QTimer.singleShot(0, self._refresh_legend)
 
@@ -1223,6 +1363,7 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         menu.addAction("缩放到图层", lambda: self.map.fit_layer(lid))
         menu.addAction("属性表", lambda: self.open_table(lid))
+        menu.addAction("图层样式…", lambda: self.open_layer_style(lid))
         menu.addAction("重命名…", lambda: self.rename_layer(lid))
         menu.addAction("复制图层", lambda: self.duplicate_layer(lid))
         show = menu.addMenu("显示")
@@ -1243,6 +1384,46 @@ class MainWindow(QMainWindow):
         for label, fmt in (("GeoJSON", "geojson"), ("GeoPackage", "gpkg"),
                            ("Shapefile (zip)", "shp"), ("CSV 属性表", "csv")):
             menu.addAction(label, lambda _=False, f=fmt: self.export_layer(lid, f))
+
+    def open_layer_style(self, layer_id: str) -> None:
+        """图层右键 →「图层样式…」：改渲染符号 / 要素标注。"""
+        lay = self.store.get(layer_id)
+        if lay is None:
+            return
+        dlg = LayerStyleDialog(lay, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        self.apply_layer_style(layer_id, dlg.style())
+        self.set_status(f"已更新「{lay.name}」的样式")
+
+    def apply_layer_style(self, layer_id: str, style: dict) -> None:
+        """把弹窗结果写回图层，并让地图立刻按新样式重画。"""
+        lay = self.store.get(layer_id)
+        if lay is None or not isinstance(style, dict):
+            return
+        from app.layer_style import geom_kind, normalize_raster_style, normalize_vector_style
+
+        if getattr(lay, "is_raster", False):
+            lay.style = normalize_raster_style(style, getattr(lay, "style", None))
+            lay.rev = int(getattr(lay, "rev", 0) or 0) + 1
+            lay.stats = None
+        else:
+            try:
+                geom = str((lay.meta() or {}).get("geomType") or "")
+            except Exception:  # noqa: BLE001
+                geom = ""
+            st = normalize_vector_style(style, getattr(lay, "op", "") or "",
+                                        getattr(lay, "color", "#2f6fed"), geom)
+            lay.style = st
+            # 图例小块 / 图层行左侧色块跟着主色走，否则「改了样式但色块没变」很怪
+            kind = geom_kind(geom)
+            lay.color = (st["point_color"] if kind == "point"
+                         else st["stroke_color"] if kind == "line"
+                         else st["fill_color"])
+        self.map.refresh_layer_style(layer_id)
+        # 图例/图层行要按新颜色重画
+        self.refresh_layers()
+        QTimer.singleShot(0, self._persist_state)
 
     def rename_layer(self, layer_id: str) -> None:
         lay = self.store.get(layer_id)
@@ -1271,7 +1452,10 @@ class MainWindow(QMainWindow):
             # 栅格复制等于再挂一份同一个文件，没有意义；直接说清楚
             self.chat.add_agent(f"「{lay.name}」是栅格图层，不支持复制图层。")
             return
-        new = self.store.add(lay.gdf.copy(), f"{lay.name}_副本", source=lay.id, op="copy")
+        new = self.store.add(lay.gdf.copy(), f"{lay.name}_副本", source=lay.id, op="copy",
+                             color=getattr(lay, "color", None))
+        # 复制图层 = 复制显示效果；样式不跟过去的话用户还得再配一遍标注
+        new.style = dict(getattr(lay, "style", None) or {})
         self.visible[new.id] = True
         self.current_layer = new.id
         self._push_undo({"kind": "add", "lids": [new.id], "layers": [(new.id, new)]})
@@ -1306,6 +1490,7 @@ class MainWindow(QMainWindow):
         if getattr(self, "map_compare", None) is not None and self.map_compare.active:
             for lid, vis in self.visible.items():
                 self.map_compare.set_layer_visibility(lid, bool(vis))
+        QTimer.singleShot(0, self._persist_state)
         self._refresh_legend()
 
     def export_view(self) -> None:
@@ -1442,15 +1627,6 @@ class MainWindow(QMainWindow):
                 continue
             out[str(k)] = s[:60]
         return out
-
-    def _on_hover(self, info) -> None:
-        if not info:
-            QToolTip.hideText()
-            return
-        props = self._clean_props(info.get("props"))
-        lines = [f"<b>{k}</b> {v}" for k, v in list(props.items())[:3]]
-        html = f"<div style='color:#9fc2ff'>{info['layer'].name}</div>" + "<br>".join(lines)
-        QToolTip.showText(QCursor.pos(), html, self.map)
 
     def _on_pick(self, info) -> None:
         """点击要素：用浮动提示展示属性，不弹模态框打断操作。"""
@@ -1746,8 +1922,8 @@ class MainWindow(QMainWindow):
                 box.setWindowTitle("生成栅格金字塔")
                 box.setText(f"「{Path(f).name}」没有栅格金字塔。")
                 box.setInformativeText(
-                    "生成金字塔后缩放/渲染会快很多。会在 TIFF 旁创建 .ovr 文件，"
-                    "不修改原始影像。")
+                    "生成金字塔后缩放/渲染会快很多，也能显著降低大栅格的内存峰值。"
+                    "会在 TIFF 旁创建 .ovr 文件，不修改原始影像。")
                 gen = box.addButton("生成金字塔", QMessageBox.AcceptRole)
                 box.addButton("暂不", QMessageBox.RejectRole)
                 box.exec()
@@ -1756,6 +1932,100 @@ class MainWindow(QMainWindow):
                 self._generate_pyramids(Path(f), factors)
             except Exception:
                 continue
+
+    def _on_overview_needed(self, path: str) -> None:
+        """可见大栅格没有 overview：后台生成，不阻塞地图交互。
+
+        这是 overview 管理的“自动补层”：首屏/首次缩放发现缺层时启动一次
+        `PyramidWorker`，状态栏显示进度；完成后刷新该栅格所有图层的
+        `info.overviews` 并让源块缓存失效，下一次缩放就会选到缩减层。
+        """
+        try:
+            p = Path(path)
+            if not p.is_file():
+                return
+            key = str(p.resolve())
+            if key in self._pyramid_asked or key in self._overview_workers:
+                return
+            info = read_info(p)
+            factors = overview_factors(info.width, info.height)
+            if not factors:
+                return
+            if info.overviews:
+                # 文件其实已有 overview，只是会话里的旧元信息没刷新。
+                self._apply_overview_info(key, info)
+                return
+            self._pyramid_asked.add(key)
+            worker = PyramidWorker(p, factors, self)
+            worker._overview_key = key
+            worker._overview_path = p
+            self._overview_workers[key] = worker
+            # 绑定到 MainWindow 的实例方法，Qt 会把回调排队回 GUI 线程；
+            # 不要用无上下文的 lambda，否则状态栏/图层更新可能在 worker 线程执行。
+            worker.progress.connect(self._on_overview_progress)
+            worker.done.connect(self._on_overview_worker_done)
+            self.set_status(f"后台生成栅格概览：{p.name}")
+            worker.start()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_overview_progress(self, value: int) -> None:
+        worker = self.sender()
+        key = getattr(worker, "_overview_key", "")
+        if key:
+            self.set_status(f"后台生成栅格概览 {Path(key).name}：{int(value)}%")
+
+    def _on_overview_worker_done(self, ok: bool, msg: str) -> None:
+        worker = self.sender()
+        key = getattr(worker, "_overview_key", "")
+        path = getattr(worker, "_overview_path", None)
+        if key and path is not None:
+            self._on_overview_done(key, path, bool(ok), str(msg))
+
+    def _on_overview_done(self, key: str, path: Path, ok: bool, msg: str) -> None:
+        worker = self._overview_workers.pop(key, None)
+        if worker is not None:
+            try:
+                worker.deleteLater()
+            except Exception:  # noqa: BLE001
+                pass
+        if not ok:
+            if "取消" not in (msg or ""):
+                self.set_status(f"栅格概览生成失败：{Path(key).name}")
+            return
+        try:
+            new_info = read_info(path)
+        except Exception:  # noqa: BLE001
+            return
+        self._apply_overview_info(key, new_info)
+
+    def _apply_overview_info(self, key: str, new_info) -> int:
+        """把新读到的 overview 列表刷到所有引用同一文件的栅格图层。"""
+        updated = 0
+        for lay in list(self.store.layers.values()):
+            if not getattr(lay, "is_raster", False):
+                continue
+            try:
+                same = str(Path(lay.info.path).resolve()) == key
+            except Exception:
+                same = False
+            if not same:
+                continue
+            lay.info.overviews = tuple(new_info.overviews or ())
+            lay.stats = None
+            lay.rev = int(getattr(lay, "rev", 0)) + 1
+            try:
+                self.map._raster.bump_rev(lay.id)
+            except Exception:  # noqa: BLE001
+                pass
+            updated += 1
+        if updated:
+            self.set_status(f"栅格概览已就绪：{Path(key).name}")
+            try:
+                self.map.invalidate()
+            except Exception:  # noqa: BLE001
+                pass
+        return updated
 
     def _generate_pyramids(self, path: Path, factors: list[int]) -> None:
         """QThread 生成 .ovr，QProgressDialog 显示真实 GDAL 进度。"""
@@ -1816,10 +2086,51 @@ class MainWindow(QMainWindow):
 
         def job(token):
             out, errors = [], []
+
+            def tmp_source(f) -> bool:
+                """压缩包解压目录在导入完成后会被清理，不能留给 provider 引用。"""
+                roots = [self._tmp_root, *self._tmp_roots]
+                try:
+                    fp = Path(f).resolve()
+                except Exception:
+                    return False
+                for root in roots:
+                    if not root:
+                        continue
+                    try:
+                        fp.relative_to(Path(root).resolve())
+                        return True
+                    except ValueError:
+                        continue
+                return False
+
+            def add_vector(f, name, layer_name=None):
+                """优先按 provider 登记（不读全量），失败再退回整份读取。
+
+                ZIP 内的临时文件不能走 provider：导入结束 `_cleanup_tmp()` 会删目录。
+                这类数据回退为整份读取，保证图层生命周期不依赖临时目录。
+                """
+                if tmp_source(f):
+                    if layer_name:
+                        gdf = read_layer(f, layer_name)
+                    else:
+                        gdf = load_any(f)
+                    return self.store.add(gdf, name, source=source, op="load")
+                try:
+                    return self.store.add_source(
+                        f, name, layer=layer_name, source=source, op="load")
+                except Exception:
+                    if layer_name:
+                        gdf = read_layer(f, layer_name)
+                    else:
+                        gdf = load_any(f)
+                    return self.store.add(gdf, name, source=source, op="load")
+
             for f in files:
                 token.raise_if_cancelled()
                 try:
-                    # 栅格只读头信息（像素等渲染时按视口取），矢量照旧整份读入
+                    # 栅格只读头信息；矢量优先 provider（只读文件头，渲染按 bbox 取），
+                    # CSV / FileGDB 等没有 provider 的格式才退回整份读取
                     if is_raster_path(f):
                         info = read_info(f)
                         lay = self.store.add_raster(info, f.stem, source=source, op="load")
@@ -1849,13 +2160,11 @@ class MainWindow(QMainWindow):
                                 self.map.progress.emit(f"读取 {f.name} · {layer_name}")
                             except Exception:
                                 pass
-                            gdf = read_layer(f, layer_name)
-                            lay = self.store.add(
-                                gdf, f"{f.stem}/{layer_name}", source=source, op="load")
+                            lay = add_vector(
+                                f, f"{f.stem}/{layer_name}", layer_name=layer_name)
                             out.append(lay)
                     else:
-                        gdf = load_any(f)
-                        lay = self.store.add(gdf, f.stem, source=source, op="load")
+                        lay = add_vector(f, f.stem)
                         out.append(lay)
                 except Exception as e:
                     errors.append(f"{f.name}：{e}")
@@ -1976,7 +2285,12 @@ class MainWindow(QMainWindow):
 
     # ================================================================== 对话
     def _restore_chat(self) -> None:
-        """把上次会话的消息回填到对话面板（不重建步骤卡片，只保留文本）。"""
+        """把上次会话的消息回填到对话面板。
+
+        文本之外还要重建 `clarify` / `plan` / `steps` 三类 part：用户截图里的
+        问题卡和工具调用计划卡，重启后如果只剩一行普通文字，等于上下文丢了。
+        旧会话没有这些 part（当时只存了 text），仍按纯文本恢复。
+        """
         if not self.persist or self.agent_db is None:
             self._greet()
             return
@@ -1987,16 +2301,72 @@ class MainWindow(QMainWindow):
         if not msgs:
             self._greet()
             return
+        restored = 0
         for m in msgs:
-            txt = m.text()
-            if not txt:
-                continue
             if m.role == "user":
-                self.chat.add_user(txt)
+                txt = m.text()
+                if txt:
+                    self.chat.add_user(txt)
+                    restored += 1
             elif m.role == "assistant":
-                self.chat.add_agent(txt)
-        self._refresh_chips()
-        self.set_status(f"已恢复上次会话（{len(msgs)} 条消息）")
+                self._restore_assistant(m)
+                restored += 1
+        self.set_status(f"已恢复上次会话（{restored} 条消息）")
+
+    @staticmethod
+    def _part(m, kind: str) -> Part | None:
+        for p in (m.parts or []):
+            if p.type == kind:
+                return p
+        return None
+
+    def _restore_assistant(self, m: Message) -> None:
+        """恢复一条 assistant 消息，按 part 顺序重建卡片和文本。"""
+        clarify = self._part(m, "clarify")
+        if clarify is not None:
+            content = clarify.content or {}
+            opts = [str(o) for o in (content.get("options") or []) if str(o).strip()]
+            try:
+                card = self.chat.add_clarify(str(content.get("question") or "需要确认一下："),
+                                            opts, lambda _text: None)
+                self.chat.restore_clarify(
+                    card, str(content.get("chosen") or "") or None,
+                    str(content.get("state") or "open"),
+                    str(content.get("note") or ""))
+                # 问题卡的题干就是这一条文本，不要再在下面重复一个气泡
+                return
+            except Exception:
+                # 卡片坏了也至少把文本恢复出来，不能整条消息消失
+                pass
+
+        plan = self._part(m, "plan")
+        if plan is not None:
+            content = plan.content or {}
+            plan_rows = content.get("plan") or []
+            if plan_rows:
+                try:
+                    card = PlanCard(plan_rows, str(content.get("source") or ""), self)
+                    for i, st in enumerate(plan_rows):
+                        card.update_step(i, st if isinstance(st, dict) else {})
+                    card.finish(failed=any(
+                        str(st.get("status") or "") == "error"
+                        for st in plan_rows if isinstance(st, dict)))
+                    self.chat.add_plan(card)
+                except Exception:
+                    pass
+
+        steps_part = self._part(m, "steps")
+        steps = []
+        if steps_part is not None:
+            steps = [s for s in (steps_part.content or {}).get("steps") or []
+                     if isinstance(s, dict)]
+        txt = m.text()
+        if txt and steps:
+            self.chat.add_agent(txt, steps)
+        elif txt:
+            self.chat.add_agent(txt)
+        elif steps:
+            self.chat.add_steps(steps)
 
     def _persist_state(self, force_cache: bool = False) -> None:
         """保存会话状态。
@@ -2037,6 +2407,12 @@ class MainWindow(QMainWindow):
                 "created_at": getattr(lay, "created_at", 0),
                 "kind": "raster" if getattr(lay, "is_raster", False) else "vector",
                 "count": meta.get("count") or 0,
+                # 样式（颜色/线宽/标注字段）：随会话保存，切换/重开都还在
+                "style": dict(getattr(lay, "style", None) or {}),
+                "source_path": getattr(lay, "source_path", "") or "",
+                "source_layer": getattr(lay, "source_layer", "") or "",
+                # 在线地图：URL/加载方式随会话保存，恢复时重新取瓦片，不缓存图片
+                "online": dict(getattr(lay, "online", None) or {}) or None,
             }
             if desc["kind"] == "raster":
                 try:
@@ -2044,9 +2420,17 @@ class MainWindow(QMainWindow):
                 except Exception:
                     desc["info"] = {}
                 desc["path"] = (desc["info"] or {}).get("path") or ""
+                if desc["online"]:
+                    # 在线图层没有本地文件；info 里的 path 只是显示用的 URL，
+                    # 以当前 online.url 为准，避免修复/编辑配置后仍保存旧地址。
+                    online_url = str(desc["online"].get("url") or "")
+                    if online_url:
+                        desc["path"] = online_url
+                        desc["info"]["path"] = online_url
             else:
                 path = getattr(lay, "cache_path", "") or ""
-                if force_cache and not (path and Path(path).exists()):
+                if (force_cache and not (path and Path(path).exists())
+                        and not desc.get("source_path")):
                     path = self.store.cache_layer(lay) or path
                 desc["cache_path"] = path
             out.append(desc)
@@ -2089,20 +2473,62 @@ class MainWindow(QMainWindow):
                         source=str(d.get("source") or ""),
                         parent=str(d.get("parent") or ""),
                         op=str(d.get("op") or "raster"),
-                        created_at=float(d.get("created_at") or time.time()))
-                else:
-                    cache = str(d.get("cache_path") or "")
-                    if not cache or not Path(cache).is_file():
-                        errors.append(f"{name}（缓存不存在）")
-                        continue
-                    lay = Layer(
-                        id=lid, name=name, gdf=None,
-                        color=str(d.get("color") or "#2f6fed"),
-                        source=str(d.get("source") or ""),
-                        parent=str(d.get("parent") or ""),
-                        op=str(d.get("op") or ""),
                         created_at=float(d.get("created_at") or time.time()),
-                        cache_path=cache)
+                        style=d.get("style"),
+                        online=d.get("online"))
+                else:
+                    source_path = str(d.get("source_path") or "")
+                    cache = str(d.get("cache_path") or "")
+                    if source_path and Path(source_path).exists():
+                        # provider 恢复：只记源文件，不依赖全量缓存
+                        lay = Layer(
+                            id=lid, name=name, gdf=None,
+                            color=str(d.get("color") or "#2f6fed"),
+                            source=str(d.get("source") or ""),
+                            parent=str(d.get("parent") or ""),
+                            op=str(d.get("op") or ""),
+                            created_at=float(d.get("created_at") or time.time()),
+                            source_path=source_path,
+                            source_layer=str(d.get("source_layer") or "") or None,
+                            style=d.get("style"))
+                    elif cache and Path(cache).is_file():
+                        lay = Layer(
+                            id=lid, name=name, gdf=None,
+                            color=str(d.get("color") or "#2f6fed"),
+                            source=str(d.get("source") or ""),
+                            parent=str(d.get("parent") or ""),
+                            op=str(d.get("op") or ""),
+                            created_at=float(d.get("created_at") or time.time()),
+                            cache_path=cache,
+                            style=d.get("style"))
+                    else:
+                        errors.append(f"{name}（源文件和缓存都不存在）")
+                        continue
+                if not getattr(lay, "is_raster", False):
+                    # 关窗前的会话把矢量元信息也存了 count；恢复时先用
+                    # provider 文件头/parquet 元数据填 `_meta`，绝不要为了
+                    # 图层列表里的 “21,217 个要素” 去 `gpd.read_parquet()`，
+                    # 那种缓存（几千万顶点）会把内存直接推到 GB 级。
+                    pm: dict = {}
+                    try:
+                        if lay.provider is not None:
+                            pm = lay.provider.meta()
+                    except Exception:
+                        pm = {}
+                    lay._meta = {
+                        "id": lid,
+                        "name": name,
+                        "color": lay.color,
+                        "count": int(d.get("count") or pm.get("count") or 0),
+                        "geomType": str(pm.get("geomType") or "Unknown"),
+                        "crs": str(pm.get("crs") or "未定义"),
+                        "crsName": str(pm.get("crsName") or pm.get("crs") or "未定义"),
+                        "bounds": list(pm.get("bounds") or []),
+                        "fields": list(pm.get("fields") or []),
+                        "source": lay.source,
+                        "parent": lay.parent,
+                        "op": lay.op,
+                    }
                 self.store.layers[lid] = lay
                 self.store._n += 1
             except Exception as e:  # noqa: BLE001
@@ -2301,11 +2727,6 @@ class MainWindow(QMainWindow):
             "· 用「行政区」裁剪「地块」，再统计各类面积\n"
             "· 给「学校」做 1 公里覆盖圈，看覆盖了哪些地块\n\n"
             "每一步运算都会生成新图层，原数据只读不改。")
-        self._refresh_chips()
-
-    def _refresh_chips(self) -> None:
-        from app.agent import SUGGESTIONS
-        self.chat.set_suggestions(SUGGESTIONS)
 
     def _refresh_tools(self) -> None:
         """工具库：先分「矢量 / 栅格」，再按功能分组，每组可收缩。
@@ -2331,6 +2752,24 @@ class MainWindow(QMainWindow):
         TOOL_SPEC_GROUP.update(TOOL_GROUP)
 
         self.tool_box.setContentsMargins(12, 0, 12, 10)
+
+        # 在线地图不是 Agent 算子（不需要大模型、也不经过 OPERATIONS），
+        # 单独放一个固定入口；放在最上面，找底图时不用先展开矢量/栅格。
+        online_key = "base|在线底图"
+        online_sec = CollapsibleSection(
+            "底图", 1, level="group",
+            collapsed=online_key in self._tool_collapsed)
+        online_btn = QPushButton("＋ 在线地图")
+        online_btn.setObjectName("chip")
+        online_btn.setCursor(Qt.PointingHandCursor)
+        online_btn.setToolTip(
+            "添加 XYZ / WMTS / WMS 在线底图（含天地图；支持 Token、自定义参数和请求头）")
+        online_btn.clicked.connect(self.open_online_map_dialog)
+        online_sec.add_chip(online_btn, span=2)
+        online_sec.header.toggled.connect(
+            lambda checked, k=online_key: self._remember_tool_section(k, checked))
+        self.tool_box.addWidget(online_sec)
+
         total = 0
         for kind, sections in self._tool_tree():
             sections = [(title, names) for title, names in sections if names]
@@ -2361,6 +2800,13 @@ class MainWindow(QMainWindow):
             self.tool_box.addWidget(kind_sec)
             total += kind_count
         self.tool_badge.setText(str(total))
+        # 停用的工具不显示，但要让用户知道它们去哪了，否则会以为工具「丢了」。
+        from app.engine import OPERATIONS
+        hidden = len([n for n in tool_prefs.disabled_names() if n in OPERATIONS])
+        self.tool_badge.setToolTip(
+            f"共 {total + hidden} 个工具" +
+            (f"，其中 {hidden} 个已停用（Agent 设置 →「工具」）" if hidden else "") +
+            "；底图「在线地图」是独立入口，不计入算子数")
         # 让 QScrollArea 的 host 立刻按新内容算高度；否则首次刷新后
         # 面板会停留在视口高度，折叠/展开也不跟手。
         self.tool_box.activate()
@@ -2376,60 +2822,13 @@ class MainWindow(QMainWindow):
         self.tool_host.adjustSize()
 
     @staticmethod
-    def _tool_tree() -> list[tuple[str, list[tuple[str, list[str]]]]]:
+    def _tool_tree(include_disabled: bool = False) -> list[tuple[str, list[tuple[str, list[str]]]]]:
         """返回两级工具分类：[("矢量", [("概览", [...]), ...]), ("栅格", [...])]。
 
-        一级按数据类型，二级按功能。自定义工具都是矢量算子，按它新建时选的
-        功能分组归位；分组不合法 / 选成栅格分组的，落到「我的工具」。
+        具体分类在 `app.tool_catalog.tool_tree()`，和 Agent 设置里的「工具」页
+        共用同一份，避免两边显示的工具集合不一致。默认隐藏被停用的工具。
         """
-        from app.agent import OPERATIONS
-        vector: list[tuple[str, list[str]]] = []
-        for title, names in TOOL_GROUPS:
-            present = [n for n in names if n in OPERATIONS]
-            if present:
-                vector.append((title, present))
-        grouped = {n for _, names in vector for n in names}
-
-        custom = [n for n in OPERATIONS
-                  if n not in grouped
-                  and getattr(OPERATIONS[n], "__name__", "").startswith("custom_")]
-        names_of_group = dict(TOOL_GROUPS)
-        by_group: dict[str, list[str]] = {}
-        mine: list[str] = []
-        for n in custom:
-            g = (TOOL_SPEC_GROUP.get(n) or "").strip()
-            if g and g in names_of_group and n not in names_of_group[g]:
-                by_group.setdefault(g, []).append(n)
-            else:
-                mine.append(n)
-        if by_group:
-            vector = [(title, names + by_group.get(title, []))
-                      for title, names in vector]
-        if mine:
-            vector.append((CUSTOM_GROUP, mine))
-
-        raster: list[tuple[str, list[str]]] = []
-        raster_names: set[str] = set()
-        for title, names in RASTER_TOOL_GROUPS:
-            present = [n for n in names if n in OPERATIONS]
-            if present:
-                raster.append((title, present))
-                raster_names.update(present)
-        # 以后新增的栅格算子即使忘了登记到 RASTER_TOOL_GROUPS，也不会掉进矢量组。
-        extra_raster = [n for n in OPERATIONS
-                        if (n.startswith("raster_") or n == "zonal_stats")
-                        and n not in raster_names]
-        if extra_raster:
-            raster.append(("其它", extra_raster))
-            raster_names.update(extra_raster)
-
-        other = [n for n in OPERATIONS
-                 if n not in grouped and n not in custom and n not in raster_names]
-        if other:
-            vector.append(("其它", other))
-
-        tree = [("矢量", vector), ("栅格", raster)]
-        return [(kind, sections) for kind, sections in tree if sections]
+        return tool_tree(include_disabled=include_disabled)
 
     @staticmethod
     def _tool_groups() -> list[tuple[str, list[str]]]:
@@ -2450,6 +2849,48 @@ class MainWindow(QMainWindow):
         self.chat.input.setPlainText(tpl.replace("{L}", lname).replace("{O}", other))
         self.chat.input.setFocus()
 
+    def open_online_map_dialog(self) -> None:
+        """工具库 →「底图 / 在线地图」：填地址、加载方式、名称后加入图层。"""
+        dlg = OnlineMapDialog(self)
+        accepted = dlg.exec() == QDialog.Accepted
+        if not accepted:
+            dlg.deleteLater()
+            self.set_status("已取消添加在线地图")
+            return
+        try:
+            cfg = dlg.config()
+        except Exception as e:  # noqa: BLE001
+            dlg.deleteLater()
+            self._error("在线地图", str(e))
+            return
+        dlg.deleteLater()
+        self.add_online_map(cfg)
+
+    def add_online_map(self, cfg: dict) -> None:
+        """登记一个在线底图图层，并放在图层栈最底部（底图不压住矢量）。"""
+        from app.online_map import method_label, online_raster_info
+
+        cfg = dict(cfg or {})
+        info = online_raster_info(cfg)
+        had_layers = bool(self.store.layers)
+        lay = self.store.add_raster(
+            info, str(cfg.get("name") or "在线地图"),
+            source=str(cfg.get("url") or ""), op="online", online=cfg)
+        # 新图层默认追加在列表尾部（图层面板里显示在最上面）。底图应该排在
+        # 图层栈最下面，否则会盖住已有的地块/道路；这里把字典顺序调整一下。
+        items = [(lid, l) for lid, l in self.store.layers.items() if lid != lay.id]
+        items.insert(0, (lay.id, lay))
+        self.store.layers = dict(items)
+        self.visible[lay.id] = True
+        self.current_layer = lay.id
+        self._push_undo({"kind": "add", "lids": [lay.id], "layers": [(lay.id, lay)]})
+        self.refresh_layers(fit=not had_layers)
+        self.chat.add_agent(
+            f"已加载在线地图「{lay.name}」（{method_label(cfg.get('method'))}）。"
+            "它在图层面板里可以像普通底图一样显隐、缩放定位和删除。")
+        self.set_status(f"已加载在线地图「{lay.name}」")
+        self._persist_state()
+
     def on_send(self, text: str, display: str | None = None,
                 _auto_tool_retry: bool = False) -> None:
         """处理一条用户输入。
@@ -2460,6 +2901,13 @@ class MainWindow(QMainWindow):
         """
         if not _auto_tool_retry:
             self._tool_rerun_inflight = False
+        # 用户没点选项、直接在输入框回答：把旧问题卡落成“已回答”，
+        # 下次恢复时不再是一张能点的过期待办。
+        if self._pending_clarify is not None and self._clarify_answer is None:
+            pending = self._pending_clarify
+            self._save_clarify_state(pending, "answered", None,
+                                     "用户在输入框里回答了这个问题。")
+            self._pending_clarify = None
         self.chat.add_user(display if display is not None else text)
         sel_note = self._apply_selection_as_layer()
         cfg = load_cfg()
@@ -2898,13 +3346,34 @@ class MainWindow(QMainWindow):
         self._pending_clarify = {"question": question, "options": options,
                                  "origin": origin}
         self.chat.add_clarify(question, options, self._on_clarify_picked)
-        self._remember(origin, question)
+        msg = self._remember(origin, question, clarify={
+            "question": question, "options": options,
+            "state": "open", "chosen": None, "note": "",
+        })
+        if msg is not None:
+            self._pending_clarify["message_id"] = msg.id
         self.set_status("需要你确认一下")
         self._refresh_planner_pill(res.get("source"))
+
+    def _save_clarify_state(self, pending: dict, state: str,
+                            chosen: str | None = None, note: str = "") -> None:
+        mid = str(pending.get("message_id") or "")
+        if not (mid and self.persist and self.agent_db is not None):
+            return
+        try:
+            self.agent_db.update_part(mid, "clarify", {
+                "question": str(pending.get("question") or ""),
+                "options": list(pending.get("options") or []),
+                "state": state, "chosen": chosen, "note": note,
+            })
+        except Exception:
+            pass
 
     def _on_clarify_picked(self, option: str) -> None:
         """用户点了某个澄清选项：把答案送回 Agent 重新规划。"""
         pending = self._pending_clarify or {}
+        self._save_clarify_state(pending, "picked", option,
+                                 "已选好，按这个答案继续。")
         self._pending_clarify = None
         origin = pending.get("origin") or ""
         question = pending.get("question") or ""
@@ -2933,7 +3402,16 @@ class MainWindow(QMainWindow):
         steps = res.get("steps") or []
         lines = res.get("lines") or []
         uid = str(res.get("_run_uid") or "")
+        plan_state = None
         if uid:
+            # 先把计划卡最终状态取下来，再 _finish_live_plan() 把它从 live 表里摘掉；
+            # 否则重启后只剩结果文字，看不到「哪一步失败了」。
+            live = self._live_plans.get(uid)
+            if live is not None:
+                try:
+                    plan_state = live.to_state()
+                except Exception:
+                    plan_state = None
             self._finish_live_plan(
                 uid, failed=any(s.get("status") == "error" for s in steps),
                 cancelled=bool(res.get("cancelled")))
@@ -3009,7 +3487,7 @@ class MainWindow(QMainWindow):
         body = "\n".join(f"{i + 1}. {l}" for i, l in enumerate(lines))
         text = res.get("reply") or ((res.get("note") + "\n" if res.get("note") else "") + head + "\n" + body)
         self.chat.add_agent(text, steps)
-        self._remember(user, text)
+        self._remember(user, text, steps=steps, plan=plan_state)
 
         created = [s["layer"] for s in steps if s.get("layer")]
         if created:
@@ -3097,6 +3575,34 @@ class MainWindow(QMainWindow):
             return
         if getattr(lay, "is_raster", False):
             # 栅格没有属性表，但有元信息；给个直接的说明比弹空表好
+            if getattr(lay, "online", None):
+                from app.online_map import method_label
+                cfg = lay.online
+                extras = []
+                params = cfg.get("params") or {}
+                headers = cfg.get("headers") or {}
+                if isinstance(params, dict) and params:
+                    extras.append(f"自定义参数：{len(params)} 项")
+                if isinstance(headers, dict) and headers:
+                    extras.append(f"自定义请求头：{len(headers)} 项")
+                if cfg.get("token"):
+                    token_key = str(cfg.get("token_key") or "").strip()
+                    extras.append("Token：已配置" +
+                                  (f"（参数名 {token_key}）" if token_key else ""))
+                extra_text = ("\n" + "\n".join(extras)) if extras else ""
+                display_url = str(cfg.get("url") or "")
+                token_value = str(cfg.get("token") or "")
+                if len(token_value) >= 4:
+                    # 用户若把 Token 直接写进地址，信息框里也不露出明文。
+                    # 太短的值不做替换，避免把地址里的普通字符全打成星号。
+                    display_url = display_url.replace(token_value, "***")
+                QMessageBox.information(
+                    self, f"在线地图 · {lay.name}",
+                    f"加载方式：{method_label(cfg.get('method'))}\n"
+                    f"地址：{display_url}\n"
+                    f"坐标系：{lay.info.crs_name}{extra_text}\n\n"
+                    "在线底图由网络瓦片/服务实时渲染，没有本地属性表。")
+                return
             i = lay.info
             QMessageBox.information(
                 self, f"栅格信息 · {lay.name}",
@@ -3104,7 +3610,8 @@ class MainWindow(QMainWindow):
                 f"波段：{i.bands}（{(i.dtypes or [''])[0]}）\n"
                 f"坐标系：{i.crs_name}\n"
                 f"范围：{tuple(round(v, 4) for v in (i.bounds or ()))}\n"
-                f"驱动：{i.driver}\n\n"
+                f"驱动：{i.driver}\n"
+                f"概览：{('、'.join(str(x) for x in (i.overviews or ())) or '无')}\n\n"
                 "栅格没有属性表。")
             return
 
@@ -3121,6 +3628,12 @@ class MainWindow(QMainWindow):
 
     def _export_raster(self, lay) -> None:
         """栅格导出 = 复制原始文件（不支持重投影/裁剪导出）。"""
+        if getattr(lay, "online", None):
+            self.chat.add_agent(
+                f"「{lay.name}」是在线地图，没有本地原文件可导出；"
+                "可以用「导出当前视图」保存屏幕上的画面。")
+            self.set_status("在线地图不支持导出原文件")
+            return
         src = Path(lay.info.path)
         default = str(Path.home() / src.name)
         path, _ = QFileDialog.getSaveFileName(self, "导出栅格", default,
@@ -3180,9 +3693,39 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "导出完成", f"已保存到：\n{path}")
 
     def open_agent_settings(self) -> None:
-        """头部最右侧的 Agent 设置：技能 + 逐步确认 + 模型设置入口。"""
+        """头部最右侧的 Agent 设置：技能 + 工具 + 逐步确认 + 模型设置入口。"""
         dlg = AgentSettingsDialog(self)
-        dlg.exec()
+        # 设置里删/改/停用工具后，左栏工具库要立刻跟着变；不用用户关掉窗口再刷新。
+        dlg.tools_changed.connect(self._apply_tool_settings)
+        accepted = dlg.exec() == QDialog.Accepted
+        if accepted and dlg.new_tool_requested:
+            # 生成工具有自己的弹窗流程，等设置窗口关掉再走，避免两层模态叠在一起。
+            QTimer.singleShot(0, self.prompt_new_operator)
+
+    def _apply_tool_settings(self) -> None:
+        """把设置页保存的「停用工具」同步到运行时，并刷新左栏工具库。"""
+        try:
+            tool_prefs.set_disabled(load_cfg().get("tools_disabled") or [])
+        except Exception:
+            pass
+        self._refresh_tools()
+
+    def _enable_tool_after_install(self, name: str) -> None:
+        """新建/重装工具后保证它是启用的。
+
+        边界情况：用户曾停用某个自定义工具，删掉后大模型又生成了一个同名工具
+        —— 如果只沿用停用列表，新工具会一出生就被隐藏，用户找不到还得再进设置翻。
+        """
+        tool_prefs.enable(name)
+        try:
+            cfg = load_cfg()
+            old = list(cfg.get("tools_disabled") or [])
+            keep = [n for n in old if n != name]
+            if len(keep) != len(old):
+                cfg["tools_disabled"] = keep
+                save_cfg(cfg)
+        except Exception:
+            pass
 
     def open_settings(self) -> None:
         cfg = load_cfg()
@@ -3215,20 +3758,41 @@ class MainWindow(QMainWindow):
         dlg = MemoryPanel(self.memory, self)
         dlg.exec()
 
-    def _remember(self, user: str, reply: str) -> None:
-        """记下这一轮对话：内存 history 给模型，SQLite 给下次启动。"""
+    def _remember(self, user: str, reply: str, *, steps: list[dict] | None = None,
+                  plan: dict | None = None,
+                  clarify: dict | None = None) -> Message | None:
+        """记下这一轮对话：内存 history 给模型，SQLite 给下次启动。
+
+        ``plan`` / ``clarify`` 是结构化卡片数据，作为 assistant 消息的 part
+        与文本一起落库；重启时由 `_restore_chat()` 按原顺序重建成卡片。
+        只传文本的旧调用行为不变。
+        """
         if user:
             self.history.append({"role": "user", "content": user})
         if reply:
             self.history.append({"role": "assistant", "content": reply})
         if len(self.history) > 20:
             del self.history[:-20]
+        out: Message | None = None
         if self.persist and self.agent_db is not None:
             try:
                 if user:
                     self.agent_db.append_text(self.session_id, "user", user)
+                parts: list[Part] = []
+                if plan:
+                    parts.append(Part(type="plan", content=plan))
                 if reply:
-                    self.agent_db.append_text(self.session_id, "assistant", reply)
+                    parts.append(Part(type="text", content={"text": reply}))
+                if steps:
+                    clean = [PlanCard._public_step(s) for s in steps
+                             if isinstance(s, dict)]
+                    if clean:
+                        parts.append(Part(type="steps", content={"steps": clean}))
+                if clarify:
+                    parts.append(Part(type="clarify", content=clarify))
+                if parts:
+                    out = self.agent_db.append_message(
+                        self.session_id, "assistant", parts)
                 sess = self.agent_db.get_session(self.session_id)
                 if user and sess is not None and sess.title in ("新会话", "默认会话"):
                     self.agent_db.touch_session(self.session_id, title=user[:30])
@@ -3238,6 +3802,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         self._update_chat_metrics()
+        return out
 
     def _refresh_planner_pill(self, source: str | None = None) -> None:
         cfg = load_cfg()
@@ -3324,6 +3889,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.chat.add_agent(f"保存失败：{e}")
             return
+        self._enable_tool_after_install(spec["name"])
         self._refresh_tools()
         try:
             self.workspace.refresh()

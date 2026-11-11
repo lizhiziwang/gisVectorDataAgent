@@ -19,6 +19,9 @@ shapely>=2.0,<3          # 2.x 的向量化 API（构建/简化/拾取全程依�
 pyproj>=3.6              # 坐标系转换（距离、面积统一投到 CGCS2000 3 度带）
 pandas>=2.2,<4
 numpy>=1.26,<3
+# 矢量流式渲染的核心：pyogrio.open_arrow 的 RecordBatch 由 pyarrow 消费。
+# 500 万要素不再整窗口物化成 GeoDataFrame，渲染线程按批解码 WKB。
+pyarrow>=15
 
 # Esri FileGDB（.gdb 文件夹数据库）：纯 Python 实现，不依赖 GDAL / fiona。
 # 如果暂时不打开 GDB，也可以先不装；打开 .gdb 时会给出安装提示。
@@ -36,16 +39,6 @@ PySide6>=6.5,<7          # 会一并装上 PySide6-Essentials / PySide6-Addons /
 rasterio>=1.4            # 自带 GDAL，按视口抽取像素；依赖 affine / cligj / attrs / pyparsing
 
 # ---------------------------------------------------------------------------
-# 可选：网页版 / 服务模式（run.py、desktop.py）
-# 只用桌面端（native_app.py）时这几行可以不装。
-# ---------------------------------------------------------------------------
-fastapi>=0.110
-uvicorn[standard]>=0.29
-python-multipart>=0.0.9  # FastAPI 收文件上传（UploadFile）必需
-pywebview>=5.0           # desktop.py 把网页版套进原生窗口
-
-# ---------------------------------------------------------------------------
 # 可选补充
 # ---------------------------------------------------------------------------
 # fiona>=1.9             # pyogrio 读不了的老格式兜底（app/io_utils.py 会自动尝试）
-# pyarrow>=15            # 需要读写 Parquet / GeoParquet 时再装

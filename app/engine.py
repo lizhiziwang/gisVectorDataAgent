@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -56,43 +57,100 @@ class Layer:
     created_at: float
     _gdf: Any = field(default=None, repr=False)
     cache_path: str | None = field(default=None, repr=False)
+    #: 源文件路径 / 源文件内的图层名。有它们就说明这个图层可以走 provider：
+    #: 元信息不读全量，渲染时按 bbox 从源文件取窗口。
+    source_path: str | None = field(default=None, repr=False)
+    source_layer: str | None = field(default=None, repr=False)
+    _provider: Any = field(default=None, repr=False, compare=False)
     _invalid: int | None = field(default=None, repr=False)
     _meta: dict | None = field(default=None, repr=False, compare=False)
+    _wgs_bounds: tuple[float, float, float, float] | None = field(default=None, repr=False, compare=False)
     _last_used: float = field(default_factory=time.time, repr=False, compare=False)
 
     def __init__(self, id: str, name: str, gdf=None, color: str = "#2f6fed",
                  source: str = "", parent: str = "", op: str = "",
-                 created_at: float | None = None, _gdf=None, cache_path: str | None = None):
+                 created_at: float | None = None, _gdf=None, cache_path: str | None = None,
+                 source_path: str | None = None, source_layer: str | None = None,
+                 _provider=None, style: dict | None = None):
         self.id = id
         self.name = name
         self._gdf = _gdf if _gdf is not None else gdf
         self.color = color
+        #: 渲染样式（见 `app.layer_style`）：空 dict = 全用默认值，
+        #: 所以老会话/老图层恢复出来和改造前完全一致。
+        self.style: dict = dict(style or {})
         self.source = source
         self.parent = parent
         self.op = op
         self.created_at = created_at if created_at is not None else time.time()
         self.cache_path = cache_path
+        self.source_path = source_path
+        self.source_layer = source_layer
+        self._provider = _provider
         self._invalid = None
         self._meta = None
+        self._wgs_bounds = None
         self._last_used = time.time()
+
+    @property
+    def provider(self):
+        """源文件 / 磁盘缓存 provider；打不开时返回 None。
+
+        `_gdf is None` 很关键：用户已经显式把数据读进内存（算子结果、
+        编辑中的图层）时仍用内存数据，不能被旧缓存覆盖。
+        """
+        if self._provider is None and self._gdf is None:
+            path = self.source_path or self.cache_path
+            if path:
+                try:
+                    from .vector_provider import VectorProvider
+                    layer = self.source_layer if self.source_path else None
+                    self._provider = VectorProvider(path, layer=layer)
+                except Exception:
+                    self._provider = None
+        return self._provider
 
     @property
     def gdf(self):
         if self._gdf is None:
-            if not self.cache_path:
-                raise ValueError(f"图层「{self.name}」的数据已被释放且没有磁盘缓存。")
-            path = Path(self.cache_path)
-            if path.suffix.lower() == ".parquet":
-                self._gdf = gpd.read_parquet(path)
+            if self.cache_path and Path(self.cache_path).exists():
+                path = Path(self.cache_path)
+                if path.suffix.lower() == ".parquet":
+                    self._gdf = gpd.read_parquet(path)
+                else:
+                    self._gdf = gpd.read_file(path)
             else:
-                self._gdf = gpd.read_file(path)
+                p = self.provider
+                if p is None:
+                    raise ValueError(f"图层「{self.name}」的数据已被释放，且没有可用的源文件或磁盘缓存。")
+                self._gdf = p.read_all()
         self._last_used = time.time()
         return self._gdf
+
+    def attrs_frame(self):
+        """属性表用的非几何表，不触发 `Layer.gdf` 的全量几何加载。
+
+        provider 图层只读非几何列；内存里已有 gdf 的图层才从这个 gdf 切一份
+        属性列。对应 QGIS 里 `QgsVectorDataProvider` 直接读字段、不取几何的路径。
+        """
+        if self._gdf is not None:
+            gdf = self._gdf
+            return gdf.drop(columns=[gdf.geometry.name]).reset_index(drop=True)
+        p = self.provider
+        if p is not None and hasattr(p, "attrs_frame"):
+            return p.attrs_frame()
+        gdf = self.gdf
+        return gdf.drop(columns=[gdf.geometry.name]).reset_index(drop=True)
 
     @gdf.setter
     def gdf(self, value) -> None:
         self._gdf = value
         self.cache_path = None
+        # 内存数据已替换：源文件路径不再代表这份数据
+        self.source_path = None
+        self.source_layer = None
+        self._provider = None
+        self._wgs_bounds = None
         self._meta = None
         self._invalid = None
         self._last_used = time.time()
@@ -115,34 +173,65 @@ class Layer:
 
     @property
     def geom_type(self) -> str:
+        p = self.provider
+        if p is not None and self._gdf is None:
+            return str(p.geom_type or "Unknown").replace("Multi", "")
         if len(self.gdf) == 0:
             return "Empty"
         types = {str(t).replace("Multi", "") for t in self.gdf.geom_type.dropna().unique()}
         return "/".join(sorted(types)) or "Empty"
 
+    @property
+    def wgs_bounds(self) -> tuple[float, float, float, float] | None:
+        """源文件范围（WGS84）；source provider 不读全量就能拿到。"""
+        if self._wgs_bounds is None:
+            p = self.provider
+            if p is not None:
+                self._wgs_bounds = p.wgs_bounds
+        return self._wgs_bounds
+
     def meta(self, with_invalid: bool = False) -> dict:
         """图层元信息（结果缓存，几何不变量只算一次）。
 
         缓存是磁盘换出的前提：换出后 UI 仍然能拿到 count/bounds/fields，
-        不需要把数据重新读回内存。
+        不需要把数据重新读回内存。source provider 图层直接从文件头生成，
+        也不会因为打开图层面板而触发全量读取。
         """
         if self._meta is None:
-            b = self.gdf.total_bounds if len(self.gdf) else [0, 0, 0, 0]
-            crs = self.gdf.crs
-            self._meta = {
-                "id": self.id,
-                "name": self.name,
-                "color": self.color,
-                "count": int(len(self.gdf)),
-                "geomType": self.geom_type,
-                "crs": f"EPSG:{crs.to_epsg()}" if crs is not None and crs.to_epsg() else (crs.name if crs is not None else "未定义"),
-                "crsName": crs.name if crs is not None else "未定义",
-                "bounds": [float(x) for x in b],
-                "fields": [str(c) for c in self.gdf.columns if c != self.gdf.geometry.name],
-                "source": self.source,
-                "parent": self.parent,
-                "op": self.op,
-            }
+            p = self.provider if self._gdf is None else None
+            if p is not None:
+                pm = p.meta()
+                self._meta = {
+                    "id": self.id,
+                    "name": self.name,
+                    "color": self.color,
+                    "count": int(pm.get("count") or 0),
+                    "geomType": str(pm.get("geomType") or "Unknown").replace("Multi", ""),
+                    "crs": pm.get("crs") or "未定义",
+                    "crsName": pm.get("crsName") or "未定义",
+                    "bounds": [float(x) for x in (pm.get("bounds") or [])],
+                    "fields": list(pm.get("fields") or []),
+                    "source": self.source,
+                    "parent": self.parent,
+                    "op": self.op,
+                }
+            else:
+                b = self.gdf.total_bounds if len(self.gdf) else [0, 0, 0, 0]
+                crs = self.gdf.crs
+                self._meta = {
+                    "id": self.id,
+                    "name": self.name,
+                    "color": self.color,
+                    "count": int(len(self.gdf)),
+                    "geomType": self.geom_type,
+                    "crs": f"EPSG:{crs.to_epsg()}" if crs is not None and crs.to_epsg() else (crs.name if crs is not None else "未定义"),
+                    "crsName": crs.name if crs is not None else "未定义",
+                    "bounds": [float(x) for x in b],
+                    "fields": [str(c) for c in self.gdf.columns if c != self.gdf.geometry.name],
+                    "source": self.source,
+                    "parent": self.parent,
+                    "op": self.op,
+                }
         d = dict(self._meta)
         if with_invalid:
             d["invalid"] = self.invalid_count() if d.get("count") else 0
@@ -200,6 +289,45 @@ class Store:
         self._trim_memory(keep={lid})
         return lay
 
+    def add_source(self, path: str | Path, name: str, layer: str | None = None,
+                   **kw) -> Layer:
+        """登记一个源文件图层，不把要素读进内存。
+
+        与 `add()` 的区别只有数据来源：`gdf` 等到算子/导出/拾取真正需要时
+        才懒加载；渲染走 provider 的 bbox 读取。元信息来自文件头，
+        所以打开大 Shapefile 不再先花几秒解析全量要素。
+        """
+        from .vector_provider import VECTOR_PROVIDER_EXTS, VectorProvider
+        path = Path(path).resolve()
+        if path.suffix.lower() not in VECTOR_PROVIDER_EXTS:
+            raise ValueError(f"{path.name} 不是 provider 支持的格式。")
+        p = VectorProvider(path, layer=layer)
+        if p.count <= 0:
+            raise ValueError(f"{path.name} 没有要素。")
+        lid = "L" + uuid.uuid4().hex[:8]
+        color = PALETTE[self._n % len(PALETTE)]
+        self._n += 1
+        existing = {l.name for l in self.layers.values()}
+        if name in existing:
+            base, k = name, 2
+            while f"{base}_{k}" in existing:
+                k += 1
+            name = f"{base}_{k}"
+        lay = Layer(
+            id=lid, name=name, gdf=None,
+            color=kw.pop("color", color),
+            source_path=str(Path(path)),
+            source_layer=p.layer,
+            _provider=p,
+            **kw,
+        )
+        self.layers[lid] = lay
+        try:
+            lay.meta()
+        except Exception:
+            pass
+        return lay
+
     def add_raster(self, info, name: str, **kw):
         """加入一个栅格图层。
 
@@ -247,6 +375,25 @@ class Store:
                     pass
         return total / 1e6
 
+    @staticmethod
+    def _write_bounds_sidecar(lay: Layer, path) -> None:
+        """缓存旁车记录 WGS84 范围，恢复时不必为判断视野扫整层几何。"""
+        try:
+            gdf = getattr(lay, "_gdf", None)
+            if gdf is None or len(gdf) == 0:
+                return
+            b = [float(v) for v in gdf.total_bounds]
+            crs = getattr(gdf, "crs", None)
+            if crs is not None and crs.to_epsg() != 4326:
+                t = Transformer.from_crs(crs, 4326, always_xy=True)
+                b = [float(v) for v in t.transform_bounds(*b, densify_pts=21)]
+            p = Path(str(path) + ".bounds.json")
+            tmp = p.with_suffix(p.suffix + ".tmp")
+            tmp.write_text(json.dumps({"wgs_bounds": b}), encoding="utf-8")
+            os.replace(tmp, p)
+        except Exception:  # noqa: BLE001
+            pass
+
     def cache_layer(self, lay: Layer, release: bool = False) -> str | None:
         """把矢量图层写到共享缓存目录（不按会话复制）。
 
@@ -269,11 +416,12 @@ class Store:
         try:
             if use_parquet:
                 tmp = path.with_suffix(".tmp.parquet")
-                lay.gdf.to_parquet(tmp, index=False)
+                lay.gdf.to_parquet(tmp, index=False, row_group_size=512)
             else:
                 tmp = path.with_suffix(".tmp.gpkg")
                 lay.gdf.to_file(tmp, driver="GPKG", layer="layer")
             os.replace(tmp, path)
+            self._write_bounds_sidecar(lay, path)
             lay.cache_path = str(path)
             if release:
                 lay._gdf = None
@@ -295,11 +443,12 @@ class Store:
         try:
             if use_parquet:
                 tmp = path.with_suffix(".tmp.parquet")
-                lay.gdf.to_parquet(tmp, index=False)
+                lay.gdf.to_parquet(tmp, index=False, row_group_size=512)
             else:
                 tmp = path.with_suffix(".tmp.gpkg")
                 lay.gdf.to_file(tmp, driver="GPKG", layer="layer")
             os.replace(tmp, path)
+            self._write_bounds_sidecar(lay, path)
             lay.cache_path = str(path)
             lay._gdf = None
             return True
@@ -474,19 +623,6 @@ def metric_crs(gdf: gpd.GeoDataFrame) -> tuple[str, list[str]]:
     epsg = (32600 if lat >= 0 else 32700) + zone
     warns.append(f"数据不在中国境内，已投影至 UTM {zone}{'N' if lat >= 0 else 'S'}（EPSG:{epsg}）。")
     return f"EPSG:{epsg}", warns
-
-
-def to_display_geojson(gdf: gpd.GeoDataFrame, limit: int | None = None) -> dict:
-    """转成 4326 的 GeoJSON 供前端渲染。"""
-    g = gdf if gdf.crs is None else gdf.to_crs(4326)
-    if limit and len(g) > limit:
-        g = g.head(limit)
-    return _dumps(g)
-
-
-def _dumps(g: gpd.GeoDataFrame) -> dict:
-    import json
-    return json.loads(g.to_json(drop_id=True, default=str))
 
 
 def _fmt(n: float, unit: str = "") -> str:

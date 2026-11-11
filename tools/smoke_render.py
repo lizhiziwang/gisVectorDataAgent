@@ -46,9 +46,12 @@ while True:
         print("!! 不收敛", flush=True)
         break
 print(f"构建完成 {time.perf_counter()-t0:.2f}s  sets={len(c.sets)}", flush=True)
-s = c.sets[-1]
-print(f"  容差 {s.tol:.5f} rect={tuple(round(float(v),3) for v in s.rect)} "
-      f"面批 {len(s.poly_paths)} 线批 {len(s.line_paths)} 点 {0 if s.dots is None else s.dots.size()}", flush=True)
+if c.stream:
+    print("  （大图层流式渲染：不建渲染集，按屏幕范围分块绘制）", flush=True)
+elif c.sets:
+    s = c.sets[-1]
+    print(f"  容差 {s.tol:.5f} rect={tuple(round(float(v),3) for v in s.rect)} "
+          f"面批 {len(s.poly_paths)} 线批 {len(s.line_paths)} 点 {0 if s.dots is None else s.dots.size()}", flush=True)
 
 t0 = time.perf_counter()
 mv._start_render()

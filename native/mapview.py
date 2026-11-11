@@ -28,26 +28,41 @@ qgsmaprendererparalleljob.cpp / qgsvectorlayerrenderer.cpp / qgssimplifymethod.h
    多条要素再按批合并（Qt 侧 drawPath 的固定开销远大于顶点数）。
 8. **拾取不建 STRtree**
    numpy 包围盒预筛 + shapely 向量化距离判断，几十万要素也不卡。
+9. **屏幕范围流式渲染**
+   源文件图层无论大小都走 provider；内存图层超过 `STREAM_MIN_FEATURES`
+   才走流式。两者都不预建整层路径，改为
+   `QgsVectorLayerRenderer::render()` 的做法：按 `setFilterRect(extent)`
+   取屏幕内要素，分块简化/建路径，立即画进图层 QImage，路径用完即丢；
+   每块画完按时间节流发 `layerProgress`，主线程先合成 provisional 帧显示，
+   整帧完成后再由 final 帧替换。小内存图层仍走渲染集缓存（平移/缩放复用更快）。
+   可用 `GIS_AGENT_STREAM_VECTOR=1/0` 强制开/关。
 """
 from __future__ import annotations
 
 import math
+import os
 import threading
 import time
 
 import numpy as np
 
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import (QBrush, QColor, QFont, QImage, QLinearGradient, QPainter,
-                           QPainterPath, QPen, QPixmap, QPolygonF)
+from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetricsF, QImage,
+                           QLinearGradient, QPainter, QPainterPath, QPen,
+                           QPixmap, QPolygonF)
 from PySide6.QtWidgets import QApplication, QWidget
 
+from app.layer_style import SOFT_OPS, resolve_vector_style, style_signature
+
+from .labels import (LABEL_CAP, LABEL_TABLE_MAX, _grid_pick, build_label_data,
+                     build_label_table)
 from .proj import project, unproject
 from .rasterview import RasterPipeline, RasterViewPort
 
 # --- 渲染参数（对照 QGIS 的默认值）-----------------------------------------
 BUILD_BUDGET_S = 0.010       # 每个事件循环片段的几何构建预算
-RENDER_DEBOUNCE_MS = 160     # 手势停下多久后重绘帧缓存
+RENDER_DEBOUNCE_MS = 160     # 手势停下多久后重绘帧缓存（矢量帧构建较贵）
+RASTER_RENDER_DEBOUNCE_MS = 60  # 纯栅格地图：源块命中快，少等一点更跟手
 PAN_RERENDER_RATIO = 0.3     # 平移超过视口的这个比例就重绘，避免露出空白边
 #: 但比例阈值在大窗口下太大了：900 px 宽的视口要拖 270 px 才重绘，
 #: 小幅拖拽永远等不到，右/下就留下一圈空边。所以再加一个绝对上限：
@@ -84,6 +99,68 @@ LINE_THIN_MPP = 45.0         # 每像素地面米数超过这个值（约 1:17 �
 
 LINE_WIDE_PX = 1.6           # 放大后道路的观感宽度
 
+# --- 流式渲染（大图层）-----------------------------------------------------
+# 小图层保留「渲染集」缓存：预建路径换来平移/缩放时的复用，更快。
+# 大图层预建整层路径的内存代价通常高于收益，改为像 QGIS 的
+# `QgsVectorLayerRenderer` 一样：按视口筛要素 → 分块简化/建路径 → 立即画，
+# 路径用完即丢。可用 GIS_AGENT_STREAM_VECTOR=1/0 强制开/关。
+STREAM_MIN_FEATURES = 250_000
+# 流式图层中间帧的最小间隔：再密会拖慢合成，再疏就看不出「一块块出现」。
+# 小窗口用更密的间隔，否则 30k 要素的图层只来得及出 1~2 帧，看起来仍像整层跳变；
+# 大/高 DPI 窗口合成成本高，保持 0.12 s 一帧。
+STREAM_PROGRESS_INTERVAL = 0.12
+STREAM_PROGRESS_INTERVAL_SMALL = 0.06
+STREAM_PROGRESS_SMALL_PIXELS = 1_500_000
+
+# 点图层在当前视口里超过这个数量时，用 1px 的 drawPoints 代替逐点 drawEllipse。
+# 500 万点逐点画 3.4px 圆会到几十秒；此时每点本来就不足一个像素，
+# 1px 点才是正确的制图表达（和 QGIS 在小比例尺下的 marker 密度观感一致）。
+POINT_DOT_THRESHOLD = 80_000
+
+# --- 源文件图层的整层粗路径缓存（宽视野 LOD）-------------------------------
+# shapefile / GPKG 没有空间索引：视口一旦盖住整个图层（省域、跨市），
+# `iter_bbox()` 每次都要把文件从头读一遍。实测 47 万条道路的整层读取
+# 3.2~3.6s，占整帧 6s 的六成；拖动/缩放时这类整帧要反复重来，就是
+# 「卡住 5~8 秒」的来源。
+# 这里在后台用固定粗容差把整层读**一次**建成一套路径（约 30MB / 47 万条），
+# 之后 mpp >= LOD_MIN_MPP 的宽视野直接画路径缓存，不再碰磁盘；
+# 更近的视野（城市级）本来就只有几万个要素，继续走按 bbox 读窗口的流式路径。
+LOD_MIN_MPP = 45.0           # 每像素地面米数达到这个值就切到整层缓存（约 1:17 万）
+LOD_TOL = LOD_MIN_MPP * SIMPLIFY_PX / 111320.0   # 建缓存用的经纬度容差（度）
+LOD_MIN_FEATURES = 40_000    # 少于这么多要素的源文件层不值得建缓存（读一次本来也快）
+LOD_READ_BATCH = 8192        # 建缓存时每次读多少要素
+LOD_MAX_VERTS = 4_000_000    # 缓存顶点上限（QPainterPath 每顶点约 24 字节）：超了就放弃
+
+# 并行图层 job（QgsMapRendererParallelJob）。单图层 5M 没有收益，但多图层
+# 时每层各画各的 QImage；`GIS_AGENT_PARALLEL_LAYERS=0` 可退回串行对照。
+PARALLEL_LAYERS = os.environ.get("GIS_AGENT_PARALLEL_LAYERS", "1").strip().lower() not in (
+    "0", "false", "no", "off")
+PARALLEL_MAX_WORKERS = max(1, min(4, os.cpu_count() or 1))
+
+
+def _stream_enabled(lay) -> bool:
+    """这个图层是否走屏幕范围内的流式渲染。
+
+    源文件图层（provider）一律按 bbox 流式读——只有这条路能避免首次
+    打开时把整份数据读进内存；内存图层仍按要素数决定。
+    """
+    env = os.environ.get("GIS_AGENT_STREAM_VECTOR", "").strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        return True
+    if env in ("0", "false", "no", "off"):
+        return False
+    try:
+        if (getattr(lay, "source_path", None) or getattr(lay, "cache_path", None)) \
+                and lay.provider is not None:
+            return True
+    except Exception:
+        pass
+    try:
+        count = int(lay.meta().get("count") or 0)
+    except Exception:
+        count = 0
+    return count >= STREAM_MIN_FEATURES
+
 
 def hex_alpha(hex_color: str, alpha: float) -> QColor:
     c = QColor(hex_color)
@@ -119,12 +196,16 @@ def _paint_layer(p: QPainter, lay: dict, view: tuple, scale: float,
     （对应 QGIS 的 `QgsRenderContext::extent()` 裁剪）。
     """
     op = lay["op"]
-    soft = op in ("buffer", "grid", "merge", "voronoi")
-    fill_a = 0.04 if soft else (0.08 if op == "dissolve" else 0.14)
-    stroke_a = 0.26 if soft else 0.7
-    # 亚像素要素的点：等价于「1 像素描边」，比填充重、比描边轻
+    raw = lay.get("style") or {}
+    st = resolve_vector_style(op, lay.get("color") or "#2f6fed", raw,
+                              lay.get("geom") or "")
+    soft = op in SOFT_OPS
+    fill_a = st["fill_opacity"] / 100.0
+    stroke_a = st["stroke_opacity"] / 100.0
+    # 亚像素要素的透明度不跟填充透明度联动：缩远后整片要素突然变淡会像「丢了数据」
     dot_a = 0.55 if soft else 0.85
-    color = lay["color"]
+    color = st["fill_color"]
+    stroke_color = st["stroke_color"]
 
     poly_paths = lay["poly_paths"]
     line_paths = lay["line_paths"]
@@ -133,8 +214,8 @@ def _paint_layer(p: QPainter, lay: dict, view: tuple, scale: float,
 
     if poly_paths:
         p.setBrush(QBrush(hex_alpha(color, fill_a)))
-        pen = QPen(hex_alpha(color, stroke_a))
-        pen.setWidth(1)
+        pen = QPen(hex_alpha(stroke_color, stroke_a))
+        pen.setWidthF(float(st["stroke_width"]))
         pen.setCosmetic(True)
         p.setPen(pen)
         for i in _visible_indices(lay["poly_bounds"], view, lay["npoly_b"]):
@@ -157,9 +238,13 @@ def _paint_layer(p: QPainter, lay: dict, view: tuple, scale: float,
 
     if line_paths:
         p.setBrush(Qt.NoBrush)
-        pen = QPen(QColor(color))
+        # 线图层默认不透明（原来就是全色）；只有用户显式调过描边透明度才跟着变
+        alpha = stroke_a if "stroke_opacity" in raw else 1.0
+        pen = QPen(hex_alpha(stroke_color, alpha))
         # 缩得远时用 1px：既正确又走 Qt 的整数宽度快速路径（见 LINE_THIN_MPP 注释）
-        pen.setWidthF(1.0 if mpp >= LINE_THIN_MPP else LINE_WIDE_PX)
+        width = (float(st["stroke_width"]) if "stroke_width" in raw
+                 else (1.0 if mpp >= LINE_THIN_MPP else LINE_WIDE_PX))
+        pen.setWidthF(width)
         pen.setCapStyle(Qt.RoundCap)
         pen.setCosmetic(True)
         p.setPen(pen)
@@ -168,17 +253,29 @@ def _paint_layer(p: QPainter, lay: dict, view: tuple, scale: float,
                 p.drawPath(line_paths[i])
 
     if points:
-        pen = QPen(QColor("#ffffff"))
-        pen.setWidthF(1.3)
-        pen.setCosmetic(True)
-        p.setPen(pen)
-        p.setBrush(QBrush(QColor(color)))
-        # 点是固定像素大小 → 世界坐标下半径要除以缩放比
-        r = 3.4 / max(scale, 1e-9)
-        for i in _visible_indices(lay["point_bounds"], view, lay["npt_b"]):
-            if i < lay["npt"]:
-                x, y = points[i]
-                p.drawEllipse(QPointF(x, y), r, r)
+        if lay.get("point_dots"):
+            # 高密度点：一个 drawPoints 批次画完，避免 500 万次 drawEllipse。
+            # 这个比例尺下每个点本来就不足一个像素，1px 点是正确的表达。
+            poly = QPolygonF([QPointF(float(x), float(y)) for x, y in points])
+            if not poly.isEmpty():
+                pen = QPen(hex_alpha(color, dot_a))
+                pen.setWidth(0)
+                pen.setCosmetic(True)
+                p.setPen(pen)
+                p.setBrush(Qt.NoBrush)
+                p.drawPoints(poly)
+        else:
+            pen = QPen(QColor("#ffffff"))
+            pen.setWidthF(1.3)
+            pen.setCosmetic(True)
+            p.setPen(pen)
+            p.setBrush(QBrush(QColor(st["point_color"])))
+            # 点是固定像素大小 → 世界坐标下半径要除以缩放比
+            r = float(st["point_size"]) * 0.5 / max(scale, 1e-9)
+            for i in _visible_indices(lay["point_bounds"], view, lay["npt_b"]):
+                if i < lay["npt"]:
+                    x, y = points[i]
+                    p.drawEllipse(QPointF(x, y), r, r)
 
 
 class _RenderSet:
@@ -272,11 +369,16 @@ class _LayerCache:
     · `extent`：全量包围盒的并集（决定「整个图层」的范围）；
     · `sets`：已构建好的渲染集（新的在后），最多保留 LOD_KEEP_SETS 套；
     · `rev`：这个图层的几何版本号，渲染集一提交就 +1
-      （图层图像缓存的键用它，跟别的图层互不影响）。
+      （图层图像缓存的键用它，跟别的图层互不影响）；
+    · `stream`：大图层标记。为真时不建 `sets`，每次按屏幕范围分块现画；
+      内存图层的 `geoms` / `bounds` 仍保留，供拾取、选区和范围筛选。
+    · `provider`：源文件图层。此时不建 `geoms` / `bounds`，每次渲染只让
+      provider 按 bbox 读窗口，内存里没有整层要素。
     """
 
     __slots__ = ("geoms", "types", "bounds", "extent", "wgs_ready", "total", "sets",
-                 "build", "bounds_out", "bounds_pos", "rev")
+                 "build", "bounds_out", "bounds_pos", "rev", "stream", "provider",
+                 "lod_state", "bounds_pending", "bounds_failed")
 
     def __init__(self) -> None:
         self.geoms = None        # 全量 4326 几何
@@ -290,6 +392,14 @@ class _LayerCache:
         self.bounds_out: list | None = None
         self.bounds_pos = 0
         self.rev = 0
+        self.stream = False      # 大图层：不建渲染集，屏幕范围内分块流式画
+        self.provider = None     # 源文件 provider（有则优先按 bbox 读）
+        # 源文件图层的「整层粗路径缓存」状态："" / "building" / "ready"
+        self.lod_state = ""
+        #: provider 的范围还在后台算：本帧先跳过，避免拿未知 extent 去扫全层
+        self.bounds_pending = False
+        #: 后台也算不出范围：不再重试，也不让这层退化成整层扫描
+        self.bounds_failed = False
 
 
 class _LayerJob:
@@ -401,13 +511,229 @@ class _ComposeWorker(QThread):
                 self.ready.emit(job, img)
 
 
+class _LabelJob:
+    """一次要素标注取数任务（对应 QGIS 里 render job 内部的 labeling stage）。"""
+
+    __slots__ = ("layer_id", "layer", "field", "rect", "gen", "kind")
+
+    def __init__(self, layer_id, layer, field, rect, gen, kind="view"):
+        self.layer_id = layer_id
+        self.layer = layer
+        self.field = field
+        self.rect = rect
+        self.gen = gen
+        #: "view" = 按当前视口取；"table" = 整层读一次建锚点表
+        #: （源文件图层在 614MB 村界面数据上 4.5s/次，整层只付一次）
+        self.kind = kind
+
+
+class _LabelWorker(QThread):
+    """常驻标注线程：按视口取锚点，不阻塞 UI。
+
+    为什么单独一条线程（而不是 `_rebuild_labels` 里直接算）：
+    QGIS 的标注是渲染 job 的一部分，在后台线程里跑；我们这里取数虽然只取视野内
+    的要素，但源文件图层（shapefile 无空间索引）在大范围下 `open_arrow` 本身就要
+    一秒多——放在 GUI 线程里就是「缩放到全省界面卡住不动」。
+
+    每个图层只保留最新一次任务（和渲染线程一样的最新优先），上一代结果回来时
+    由 `gen` 判断并丢弃，避免旧视野的标注盖到新视野上。正在跑的旧任务也会在
+    每批之间检查世代号并提前退出——否则拖动时新视野要等旧视野的整层扫描跑完
+    （实测能积到 10s 以上）。
+    """
+
+    # 图层 id, 世代号, 任务类型, (field, rect, xy, texts, angles)
+    ready = Signal(str, int, str, object)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._lock = threading.Lock()
+        self._jobs: dict[str, _LabelJob] = {}
+        self._latest: dict[str, int] = {}
+        self._wake = threading.Event()
+        self._stop = False
+
+    def submit(self, job: _LabelJob) -> None:
+        with self._lock:
+            self._jobs[job.layer_id] = job
+            self._latest[job.layer_id] = job.gen
+        self._wake.set()
+
+    def stop(self) -> None:
+        self._stop = True
+        self._wake.set()
+
+    def _superseded(self, lid: str, gen: int) -> bool:
+        with self._lock:
+            return self._latest.get(lid, gen) != gen
+
+    def run(self) -> None:
+        while True:
+            self._wake.wait(0.2)
+            if self._stop:
+                return
+            self._wake.clear()
+            with self._lock:
+                if not self._jobs:
+                    continue
+                lid = next(iter(self._jobs))
+                job = self._jobs.pop(lid, None)
+            if job is None:
+                continue
+            dead = lambda: self._stop or self._superseded(job.layer_id, job.gen)  # noqa: E731
+            try:
+                if job.kind == "table":
+                    xy, texts, angles, rect = build_label_table(
+                        job.layer, job.field, cancelled=dead)
+                else:
+                    xy, texts, angles = build_label_data(
+                        job.layer, job.field, job.rect, cancelled=dead)
+                    rect = job.rect
+            except Exception:  # noqa: BLE001
+                xy, texts, angles, rect = None, [], None, job.rect
+            self.ready.emit(job.layer_id, job.gen, job.kind,
+                            (job.field, rect, xy, texts, angles))
+
+
+
+class _LodJob:
+    """一次「整层粗路径」构建任务（源文件图层的宽视野缓存）。"""
+
+    __slots__ = ("layer_id", "provider", "rect", "tol")
+
+    def __init__(self, layer_id, provider, rect, tol):
+        self.layer_id = layer_id
+        self.provider = provider
+        self.rect = rect
+        self.tol = tol
+
+
+class _LodWorker(QThread):
+    """后台把源文件图层整层读一遍，建成宽视野用的粗路径缓存。
+
+    为什么要单独一条线程
+    --------------------
+    shapefile / GPKG 没有空间索引，整层读取实测 3.2~3.6s（47 万条道路）。
+    放在 GUI 线程里就是打开图层时界面直接停住；放在渲染线程里则每次宽视野
+    渲染都要付一遍。这里读一次、建成约 30MB 的路径缓存，之后宽视野的平移/
+    缩放都只在内存里筛批。
+
+    和 `_LabelWorker` 一样按图层「最新任务优先」；图层被删/换源时由
+    `_on_lod_ready` 按 provider 身份丢弃过期结果。
+    """
+
+    # 图层 id, 构建结果, rect, 容差, provider（身份校验用）
+    ready = Signal(str, object, tuple, float, object)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._lock = threading.Lock()
+        self._jobs: dict[str, _LodJob] = {}
+        self._wake = threading.Event()
+        self._stop = False
+
+    def submit(self, job: _LodJob) -> None:
+        with self._lock:
+            self._jobs[job.layer_id] = job
+        self._wake.set()
+
+    def stop(self) -> None:
+        self._stop = True
+        self._wake.set()
+
+    def run(self) -> None:
+        from .vectorstream import build_lod_paths
+        while True:
+            self._wake.wait(0.2)
+            if self._stop:
+                return
+            self._wake.clear()
+            with self._lock:
+                if not self._jobs:
+                    continue
+                lid = next(iter(self._jobs))
+                job = self._jobs.pop(lid, None)
+            if job is None:
+                continue
+            payload = None
+            batches = None
+            try:
+                batches = job.provider.iter_bbox(
+                    job.rect, batch_size=LOD_READ_BATCH, columns=[])
+                payload = build_lod_paths(batches, job.tol,
+                                          cancelled=lambda: self._stop,
+                                          max_verts=LOD_MAX_VERTS)
+            except Exception:  # noqa: BLE001
+                payload = None
+            finally:
+                close = getattr(batches, "close", None)
+                if close is not None:
+                    try:
+                        close()
+                    except Exception:  # noqa: BLE001
+                        pass
+            if self._stop:
+                return
+            self.ready.emit(job.layer_id, payload, job.rect, job.tol, job.provider)
+
+
+class _BoundsWorker(QThread):
+    """后台补 GeoParquet 等 provider 的 WGS84 范围。
+
+    旧缓存没有 `<cache>.bounds.json` 旁车时，`provider.bounds` 是空的；
+    如果直接在 UI/渲染线程里算，21k 块 / 4480 万顶点要十几秒，而且这层
+    可能根本在当前视口外。这里先标记 `bounds_pending`，本帧跳过该图层，
+    后台算完写旁车后只失效一次，下帧就能像普通图层一样裁剪。
+    """
+
+    ready = Signal(str, object, object)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._lock = threading.Lock()
+        self._jobs: dict[str, object] = {}
+        self._wake = threading.Event()
+        self._stop = False
+
+    def submit(self, lid: str, provider) -> None:
+        with self._lock:
+            self._jobs[lid] = provider
+        self._wake.set()
+
+    def stop(self) -> None:
+        self._stop = True
+        self._wake.set()
+
+    def run(self) -> None:
+        while True:
+            self._wake.wait(0.2)
+            if self._stop:
+                return
+            self._wake.clear()
+            with self._lock:
+                if not self._jobs:
+                    continue
+                lid = next(iter(self._jobs))
+                provider = self._jobs.pop(lid, None)
+            if provider is None:
+                continue
+            bounds = None
+            try:
+                value = getattr(provider, "wgs_bounds", None)
+                bounds = value() if callable(value) else value
+            except Exception:  # noqa: BLE001
+                bounds = None
+            if self._stop:
+                return
+            self.ready.emit(lid, provider, bounds)
+
+
 class _RenderJob:
     """一次渲染任务（对应 QGIS 的 QgsMapRendererJob / ParallelJob）。
 
     · `epoch`：世代号。视图一变就 +1，旧世代的结果回来时直接丢弃，
       避免「旧视图的帧覆盖新视图的帧」；
-    · `cancelled`：视图又变了就置位，渲染线程在图层间隙检查并提前收工
-      （对应 QGIS 的 `feedback()->cancel()`）；
+    · `cancelled`：视图又变了就置位，渲染线程在图层间隙、流式 batch/chunk
+      边界检查并提前收工（对应 QGIS 的 `feedback()->cancel()`）；
     · `jobs`：每个图层一个 `_LayerJob`，按渲染顺序排列。
     """
 
@@ -440,12 +766,17 @@ class _RenderWorker(QThread):
     · **最新任务优先**：队列里只保留最新一次请求（QGIS 是 `cancel()` 旧 job
       再 `start()` 新的），正在跑的旧任务标记 cancelled 后在图层间隙收工；
     · **按图层渲染**：每个图层画到自己的一张 QImage，主线程按顺序合成
-      （对应 `LayerRenderJob` + `composeImage`）；
-    · **渐进上屏**：一层画完就先发回去合成一次（对应 `renderingLayersFinished`）。
+      （对应 `LayerRenderJob` + `composeImage`）；多图层时用线程池并行画层，
+      但仍按原始图层顺序发 `layerReady`；
+    · **渐进上屏**：流式图层每画完一块就把当前图层图发一次，主线程合成出
+       provisional 帧；整层/整帧完成后才发 final 帧。这样用户能看到要素
+      一块块出现，而不是等所有图层都画完才一次性换图。
     """
 
     # 图层 id, 图层图像, epoch
     layerReady = Signal(str, object, int)
+    # 流式图层的中间结果（同一张图层图在绘制中的副本）
+    layerProgress = Signal(str, object, int)
     # 场景签名, 视图参数, epoch
     frameReady = Signal(object, tuple, int)
 
@@ -461,14 +792,19 @@ class _RenderWorker(QThread):
     def submit(self, job: _RenderJob) -> None:
         """提交一次渲染请求；同一时刻只保留最新的一次。
 
-        注意**不取消正在跑的任务**：让它自然收尾（并把已完成图层发回），
-        否则连续缩放时每一帧都半途而废，屏幕会一直停在旧画面上。
+        正在跑的任务也要标记取消：大矢量图层一帧可能画 3~5 秒，如果不取消，
+        新的缩放/平移只能排队等它自然收尾，用户看到的就是「松手后卡住几秒」。
+        取消是协作式的：流式层在每个 chunk 边界、并行层在 wait 循环里检查，
+        已经画出的部分保留；旧帧在屏上按新视口平移，不会被清空。
         """
         with self._lock:
             old = self._pending
+            cur = self._current
             self._pending = job
         if old is not None:
             old.cancelled = True
+        if cur is not None:
+            cur.cancelled = True
         self._wake.set()
 
     def stop(self) -> None:
@@ -509,27 +845,79 @@ class _RenderWorker(QThread):
                 break
 
     # ------------------------------------------------------------------ 渲染
-    def _render_job(self, job: _RenderJob) -> None:
-        """按图层依次渲染，每层画完就发回去（对应 renderLayerStatic）。"""
+    def _paint_layer_job(self, job: _RenderJob, lj: "_LayerJob",
+                         progress_gate=None) -> QImage | None:
+        """画一个图层到独立 QImage（对应 QGIS 的 LayerRenderJob）。
+
+        `progress_gate` 只在并行模式使用：`(lock, allowed, idx)`。并行时
+        只允许「最下面的未完成层」发中间帧，避免上层先上屏、下层还没画，
+        合成顺序看起来像图层顺序被打乱。
+        """
+        if lj.snap is None:
+            return None
         dpr = job.dpr
+        img = QImage(max(1, int(job.w * dpr)), max(1, int(job.h * dpr)),
+                     QImage.Format_ARGB32_Premultiplied)
+        img.setDevicePixelRatio(dpr)
+        img.fill(Qt.transparent)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, False)
+        p.translate(job.tx, job.ty)
+        p.scale(job.scale, job.scale)
+        try:
+            if lj.snap.get("stream"):
+                from .vectorstream import paint_stream_layer
+
+                last_emit = [0.0]
+
+                def _progress() -> None:
+                    # 只在中间块后面发：图层图还在同一张 QImage 上继续画，
+                    # 必须 copy 一份给主线程，否则合成线程会读到半张图。
+                    if job.cancelled:
+                        return
+                    if progress_gate is not None:
+                        lock, allowed, idx = progress_gate
+                        with lock:
+                            if idx > allowed[0]:
+                                return
+                    interval = (STREAM_PROGRESS_INTERVAL_SMALL
+                                if img.width() * img.height()
+                                <= STREAM_PROGRESS_SMALL_PIXELS
+                                else STREAM_PROGRESS_INTERVAL)
+                    now = time.perf_counter()
+                    if now - last_emit[0] < interval:
+                        return
+                    last_emit[0] = now
+                    cp = img.copy()
+                    cp.setDevicePixelRatio(dpr)
+                    self.layerProgress.emit(lj.lid, cp, job.epoch)
+
+                paint_stream_layer(p, lj.snap, job.world, job.scale, job.mpp,
+                                   cancelled=lambda: job.cancelled,
+                                   on_progress=_progress)
+            else:
+                _paint_layer(p, lj.snap, job.world, job.scale, job.mpp)
+        finally:
+            p.end()
+        return img
+
+    def _render_job(self, job: _RenderJob) -> None:
+        """按图层渲染；流式层发中间帧，每层画完发 final 图层图。
+
+        `GIS_AGENT_PARALLEL_LAYERS=0` 可退回严格串行，便于对照。
+        并行路径对应 `QgsMapRendererParallelJob::prepareJobs()`：每个图层
+        一个任务、各画各的 QImage，按原始图层顺序发 `layerReady` 后再合成。
+        """
+        if PARALLEL_LAYERS:
+            self._render_job_parallel(job)
+            return
         for lj in job.jobs:
             if job.cancelled:
                 return
-            if lj.snap is None:
+            img = self._paint_layer_job(job, lj)
+            if img is None:
                 continue
-            img = QImage(max(1, int(job.w * dpr)), max(1, int(job.h * dpr)),
-                         QImage.Format_ARGB32_Premultiplied)
-            img.setDevicePixelRatio(dpr)
-            img.fill(Qt.transparent)
-            p = QPainter(img)
-            p.setRenderHint(QPainter.Antialiasing, True)
-            p.setRenderHint(QPainter.SmoothPixmapTransform, False)
-            p.translate(job.tx, job.ty)
-            p.scale(job.scale, job.scale)
-            try:
-                _paint_layer(p, lj.snap, job.world, job.scale, job.mpp)
-            finally:
-                p.end()
             lj.image = img
             lj.completed = True
             if job.cancelled:
@@ -537,15 +925,94 @@ class _RenderWorker(QThread):
             # 这一层好了 → 主线程可以先合成出来看
             self.layerReady.emit(lj.lid, img, job.epoch)
 
+    def _render_job_parallel(self, job: _RenderJob) -> None:
+        """并行画层，但**按图层顺序**回传，保证合成顺序不变。
+
+        任务本身只写自己的 QImage；`layerReady` 由这里在底层完成后再发。
+        上层可以先画完等着，但不会先覆盖下层的中间帧。
+        """
+        jobs = [lj for lj in job.jobs if lj.snap is not None]
+        if len(jobs) < 2:
+            for lj in jobs:
+                if job.cancelled:
+                    return
+                img = self._paint_layer_job(job, lj)
+                if img is None:
+                    continue
+                lj.image = img
+                lj.completed = True
+                if job.cancelled:
+                    return
+                self.layerReady.emit(lj.lid, img, job.epoch)
+            return
+
+        from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+        n = min(PARALLEL_MAX_WORKERS, len(jobs))
+        gate_lock = threading.Lock()
+        allowed = [0]
+        finished: set[int] = set()
+        images: dict[int, QImage] = {}
+        emitted: set[int] = set()
+
+        def _work(i: int, lj: "_LayerJob"):
+            try:
+                img = self._paint_layer_job(job, lj, (gate_lock, allowed, i))
+                return i, img
+            except Exception:  # noqa: BLE001
+                return i, None
+
+        with ThreadPoolExecutor(max_workers=n, thread_name_prefix="layer") as ex:
+            futures = [ex.submit(_work, i, lj) for i, lj in enumerate(jobs)]
+            pending = set(futures)
+            while pending and not job.cancelled:
+                done, pending = wait(pending, timeout=0.05,
+                                     return_when=FIRST_COMPLETED)
+                for f in done:
+                    i, img = f.result()
+                    finished.add(i)
+                    if img is not None:
+                        images[i] = img
+                # 只按原始顺序释放已完成的层，避免上层先于下层上屏。
+                while True:
+                    nxt = len(emitted)
+                    if nxt >= len(jobs) or nxt not in finished:
+                        break
+                    lj = jobs[nxt]
+                    img = images.pop(nxt, None)
+                    if img is not None:
+                        lj.image = img
+                        lj.completed = True
+                        if not job.cancelled:
+                            self.layerReady.emit(lj.lid, img, job.epoch)
+                    emitted.add(nxt)
+                    with gate_lock:
+                        allowed[0] = nxt + 1
+            if job.cancelled:
+                for f in pending:
+                    f.cancel()
+                return
+            # 收尾：正常情况下上面已经全部释放；这里兜住异常任务。
+            for i, lj in enumerate(jobs):
+                if i in emitted:
+                    continue
+                img = images.pop(i, None)
+                if img is not None:
+                    lj.image = img
+                    lj.completed = True
+                    self.layerReady.emit(lj.lid, img, job.epoch)
+                emitted.add(i)
+
 
 class MapView(QWidget):
-    hoverChanged = Signal(object)
     picked = Signal(object)
     selectionChanged = Signal(int)      # 选区要素数
     mapMenu = Signal(QPoint)            # 右键菜单（全局坐标），由主窗口挂菜单项
     viewChanged = Signal()
     cursorMoved = Signal(float, float)
     progress = Signal(str)
+    #: 可见的大栅格没有 overview，提示上层可后台生成（只发路径，不阻塞渲染）
+    overviewNeeded = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -560,17 +1027,17 @@ class MapView(QWidget):
         self.tx = 0.0
         self.ty = 0.0
         self._fit_done = False
+        self._fit_pending: str | None = None     # 等范围算完再缩放到指定图层
+        self._fit_all_pending = False            # 等范围算完再重新 fit_all
         self.setFocusPolicy(Qt.StrongFocus)      # 方向键平移、+/- 缩放需要能拿到键盘焦点
         self._drag_from: QPoint | None = None
         self._drag_moved = 0
-        self._hover = None
         self._cache: dict[str, _LayerCache] = {}
-        self._hover_ts = 0.0
         # 选区：{图层 id: 要素下标数组}。只记一层（框选只作用于「当前图层」）。
         self._sel: dict[str, np.ndarray] = {}
         self._sel_layer: str | None = None      # 框选的目标图层，由主窗口同步过来
         self._band: tuple | None = None         # 正在拖的选框（屏幕坐标）
-        self._hl: tuple | None = None           # 持久高亮（属性表点行），和 hover 分开
+        self._hl: tuple | None = None           # 持久高亮（属性表点行），和点击拾取分开
         #: 算子高亮：{图层 id: (要素下标数组, 颜色)}。和 _hl 分开画，
         #: 因为 _hl 是「正在看的单个要素」，这个是「一批被高亮的要素」。
         self._hl_set: dict[str, tuple[np.ndarray, str]] = {}
@@ -597,7 +1064,7 @@ class MapView(QWidget):
         self._layer_views: dict[str, tuple] = {}
         self._img_cache: dict[str, tuple] = {}     # lid -> (cacheKey, QImage)
         self._img_keys: dict[str, tuple] = {}      # lid -> 本次请求算出的 cacheKey
-        # 合成缓冲：整帧画完才整体上屏（对应 QgsMapRendererParallelJob 结束换图）
+        # 同步合成缓冲（测试/兼容路径）；生产渲染走 `_ComposeWorker` 异步出图。
         self._pending: QPixmap | None = None
         self._pending_sig: tuple | None = None
         self._pending_view: tuple | None = None
@@ -611,6 +1078,7 @@ class MapView(QWidget):
         # 常驻渲染线程（最新任务优先）
         self._worker = _RenderWorker(self)
         self._worker.layerReady.connect(self._on_layer_ready)
+        self._worker.layerProgress.connect(self._on_layer_progress)
         self._worker.frameReady.connect(self._on_frame_ready)
         self._worker.start()
 
@@ -625,9 +1093,44 @@ class MapView(QWidget):
         self._vec_layers: list = []          # 参与矢量渲染链的图层
         self._raster_layers: list = []       # 栅格图层（不进 _cache / 渲染集）
         self._raster_imgs: dict[str, QImage] = {}
+        #: 当前 epoch 的栅格最终帧是否已经完成；防止迟到的瓦片中间帧把 final 降级
+        self._raster_final_epoch = -1
         self._raster = RasterPipeline(self)
         self._raster.on_layer = self._on_raster_layer
+        self._raster.on_partial = self._on_raster_progress
         self._raster.on_frame = self._on_raster_frame
+
+        # --- 要素标注（样式弹窗里配的字段）
+        #: 图层 id → {"field","sig","rect","xy","texts"}。按视口抽样缓存：
+        #: 平移/缩放离开缓存范围才重取；重取在独立线程里做，不卡界面。
+        self._labels: dict[str, dict] = {}
+        self._labels_pending: set[str] = set()
+        #: 图层 id → 世代号：旧任务的结果回来时按它丢弃
+        self._labels_gen: dict[str, int] = {}
+        #: 图层 id → 整层锚点表 {"field","xy","texts","angles","rect"}。
+        #: 源文件图层整层读一次后，视口切换只在内存里筛（村界面 614MB
+        #: 按视口取要 4.5s/次，拖动时就是「标注延后 10 秒」的根源）。
+        self._labels_anchors: dict[str, dict] = {}
+        #: 图层 id → 正在建的锚点表的世代号：建表期间不要重复提交，
+        #: 否则每次重绘都会把上一个表任务作废，永远建不完。
+        self._label_tables: dict[str, int] = {}
+        self._label_timer = QTimer(self)
+        self._label_timer.setSingleShot(True)
+        self._label_timer.setInterval(140)
+        self._label_timer.timeout.connect(self._rebuild_labels)
+        self._label_worker = _LabelWorker(self)
+        self._label_worker.ready.connect(self._on_labels_ready)
+        self._label_worker.start()
+
+        # 宽视野整层粗路径缓存：后台读一次源文件，之后不再碰磁盘
+        self._lod_worker = _LodWorker(self)
+        self._lod_worker.ready.connect(self._on_lod_ready)
+        self._lod_worker.start()
+
+        # 没有 bounds 旁车的旧 provider：先在后台补范围，本帧先跳过这层
+        self._bounds_worker = _BoundsWorker(self)
+        self._bounds_worker.ready.connect(self._on_bounds_ready)
+        self._bounds_worker.start()
 
         app = QApplication.instance()
         if app is not None:
@@ -662,6 +1165,30 @@ class MapView(QWidget):
                     compose.wait(2000)
             except Exception:
                 pass
+        label_worker = getattr(self, "_label_worker", None)
+        if label_worker is not None:
+            try:
+                if label_worker.isRunning():
+                    label_worker.stop()
+                    label_worker.wait(3000)
+            except Exception:
+                pass
+        lod_worker = getattr(self, "_lod_worker", None)
+        if lod_worker is not None:
+            try:
+                if lod_worker.isRunning():
+                    lod_worker.stop()
+                    lod_worker.wait(3000)
+            except Exception:
+                pass
+        bounds_worker = getattr(self, "_bounds_worker", None)
+        if bounds_worker is not None:
+            try:
+                if bounds_worker.isRunning():
+                    bounds_worker.stop()
+                    bounds_worker.wait(3000)
+            except Exception:
+                pass
 
     def __del__(self):  # noqa: D105
         # 兜底：非正常退出（没有走 closeEvent）时也尽量把线程停掉
@@ -685,12 +1212,243 @@ class MapView(QWidget):
                 compose.wait(1000)
         except Exception:
             pass
+        try:
+            lw = getattr(self, "_label_worker", None)
+            if lw is not None and lw.isRunning():
+                lw.stop()
+                lw.wait(1000)
+        except Exception:
+            pass
+        try:
+            lod = getattr(self, "_lod_worker", None)
+            if lod is not None and lod.isRunning():
+                lod.stop()
+                lod.wait(1000)
+        except Exception:
+            pass
 
     def closeEvent(self, e):  # noqa: N802
         self.shutdown()
         super().closeEvent(e)
 
     # ------------------------------------------------------------------ 数据
+    def _use_provider(self, c: _LayerCache, lay) -> bool:
+        """把源文件 provider 挂到图层缓存；返回模式是否变化。"""
+        prov = None
+        if c.stream:
+            try:
+                prov = getattr(lay, "provider", None)
+            except Exception:
+                prov = None
+        changed = prov is not c.provider
+        c.provider = prov
+        if prov is not None:
+            c.total = int(getattr(prov, "count", 0) or 0)
+            # Parquet provider 打开时只有文件头、没有 bbox；不要为了给隐藏
+            # 图层填 extent 去扫几十万顶点（那会把内存又推高）。真正 fit /
+            # zoom-to-layer 时再按需调用 wgs_bounds。GeoParquet 的 WGS84
+            # 范围由写入缓存时留下的旁车提供，打开时零扫描。
+            hint = getattr(prov, "wgs_bounds_hint", None)
+            if hint:
+                c.extent = tuple(hint)
+            elif getattr(prov, "bounds", None):
+                b = getattr(prov, "wgs_bounds", None)
+                if b is not None:
+                    c.extent = tuple(b)
+            if changed:
+                # 不缓存整层几何/路径：provider 每次按屏幕 bbox 读取
+                c.geoms = None
+                c.types = None
+                c.bounds = None
+                c.wgs_ready = False
+                c.sets.clear()
+                c.build = None
+                c.bounds_out = None
+                c.bounds_pos = 0
+                c.lod_state = ""
+                c.bounds_pending = False
+                c.bounds_failed = False
+                # 换了数据源：旧锚点表/旧标注缓存都不再对应当前数据
+                self._labels_anchors.pop(lay.id, None)
+                self._labels.pop(lay.id, None)
+                self._label_tables.pop(lay.id, None)
+                self._labels_pending.discard(lay.id)
+                self._labels_gen[lay.id] = self._labels_gen.get(lay.id, 0) + 1
+            self._ensure_bounds_async(lay, c)
+        return changed
+
+    def _ensure_bounds_async(self, lay, c: _LayerCache, force: bool = False) -> None:
+        """provider 没有范围时丢给后台算；本帧暂不画这一层。
+
+        旧 GeoParquet 缓存只有文件头，没有 bbox；如果为了“判断在不在视口里”
+        在 UI 线程扫 4480 万顶点，就会重现 13 秒卡顿。后台算完写旁车，
+        之后恢复零扫描。
+        """
+        if (c.provider is None or c.extent is not None or c.bounds_pending
+                or c.bounds_failed):
+            return
+        hint = getattr(c.provider, "wgs_bounds_hint", None)
+        if hint:
+            c.extent = tuple(hint)
+            return
+        if getattr(c.provider, "bounds", None):
+            b = getattr(c.provider, "wgs_bounds", None)
+            if b is not None:
+                c.extent = tuple(b)
+                return
+        # 隐藏图层先不扫；显式「缩放到图层」或显示后再排
+        if not force and not self.visible.get(lay.id, True):
+            return
+        c.bounds_pending = True
+        self._bounds_worker.submit(lay.id, c.provider)
+
+    def _on_bounds_ready(self, lid: str, provider, bounds) -> None:
+        c = self._cache.get(lid)
+        if c is None or c.provider is not provider:
+            return                  # 图层删了/换源了
+        c.bounds_pending = False
+        if bounds is not None and len(bounds) == 4:
+            c.extent = tuple(float(v) for v in bounds)
+            if self._fit_pending == lid:
+                self._fit_pending = None
+                self.fit_bounds(*c.extent, pad=0.15)
+                return
+            if self._fit_all_pending:
+                self._fit_all_pending = False
+                self.fit_all()
+                return
+            if self._view_need(c) is None:
+                return          # 范围外，范围回填不改变当前画面
+            if not self._vec_busy:
+                # 只重画矢量，不重新请求栅格：否则会把正在下载的在线瓦片
+                # 取消并从头下一遍。
+                self._start_render(request_raster=False)
+        else:
+            c.bounds_failed = True
+            if self._fit_pending == lid:
+                self._fit_pending = None
+            if self._fit_all_pending:
+                self._fit_all_pending = False
+                self.fit_all()
+
+    # ---------------------------------------------------- 宽视野整层粗路径缓存
+    def _maybe_start_lod(self, lay, c: _LayerCache) -> None:
+        """源文件图层够大就排一个后台任务，把整层读一次建成粗路径缓存。
+
+        只做「宽视野会用到」的那些层：线/面、要素数够多、范围已知。
+        点图层不建 —— 大点图层走 `point_dots` 的屏幕像素桶，本来就不建路径。
+        """
+        if not c.stream or c.provider is None or c.lod_state:
+            return
+        if not self.visible.get(lay.id, True):
+            return
+        try:
+            if int(c.total or 0) < LOD_MIN_FEATURES:
+                return
+        except Exception:  # noqa: BLE001
+            return
+        if c.extent is None or self._view_need(c) is None:
+            return
+        if self.mpp() < LOD_MIN_MPP:
+            return          # 城市级用不到整层粗路径；等缩到宽视野再建
+        try:
+            geom = str((lay.meta() or {}).get("geomType") or "")
+        except Exception:  # noqa: BLE001
+            geom = ""
+        if "Point" in geom and "Poly" not in geom and "Line" not in geom:
+            return
+        ext = c.extent
+        pad = LOD_TOL * 2.0
+        rect = (ext[0] - pad, ext[1] - pad, ext[2] + pad, ext[3] + pad)
+        c.lod_state = "building"
+        self._lod_worker.submit(_LodJob(lay.id, c.provider, rect, LOD_TOL))
+
+    def _maybe_prefetch_labels(self, lay, c: _LayerCache) -> None:
+        """配了标注字段的源文件图层：图层一进来就在后台建锚点表。
+
+        村界面这种 614MB 的 parquet，按视口取一次标注要 4.5s；等用户第一次
+        平移再开始建，看起来就是「标注一直不出来」。放在打开图层时建，用户
+        看完初始视图时表多半已经好了。
+        """
+        try:
+            st = self._layer_paint_style(lay)
+        except Exception:  # noqa: BLE001
+            return
+        field = st.get("label_field") or ""
+        if not field:
+            return
+        if not self.visible.get(lay.id, True):
+            return          # 隐藏的图层不预建；等用户打开时第一次重绘再建
+        c = self._cache.get(lay.id)
+        if c is not None and (c.bounds_pending or c.bounds_failed
+                              or self._view_need(c) is None):
+            return          # 视口外不建整层锚点表
+        if self._label_table_ok(lay, field):
+            return
+        if lay.id in self._label_tables:
+            return
+        if not self._label_table_eligible(lay):
+            return
+        gen = self._labels_gen.get(lay.id, 0) + 1
+        self._labels_gen[lay.id] = gen
+        self._label_tables[lay.id] = gen
+        self._label_worker.submit(_LabelJob(lay.id, lay, field, None, gen,
+                                            kind="table"))
+
+
+    def _lod_set(self, c: _LayerCache) -> _RenderSet | None:
+        """当前视野可用的整层粗路径集合（不覆盖或太粗时返回 None）。
+
+        「太粗」= 缓存的容差比当前视口需要的还大：这时候必须继续走流式
+        读窗口，否则放大后道路会变成折线。
+        """
+        if not c.stream or c.provider is None or not c.sets:
+            return None
+        need = self._view_need(c)
+        if need is None:
+            return None
+        cur = self._simplify_tol()
+        for s in c.sets:
+            if not s.built:
+                continue
+            if s.tol > cur * 1.02:
+                continue
+            if not _rect_contains(s.rect, need):
+                continue
+            s.used = time.perf_counter()
+            return s
+        return None
+
+    def _on_lod_ready(self, lid: str, payload, rect: tuple, tol: float,
+                      provider) -> None:
+        """整层粗路径建好了：收进图层缓存，之后宽视野直接用。"""
+        c = self._cache.get(lid)
+        if c is None or c.provider is not provider:
+            return                  # 图层删了，或者换了数据源
+        if payload is None:
+            c.lod_state = ""
+            return
+        poly_paths, poly_bounds, line_paths, line_bounds, points, point_bounds, nfeat = payload
+        s = _RenderSet(tol, rect)
+        s.poly_paths = poly_paths
+        s.poly_bounds = poly_bounds
+        s.line_paths = line_paths
+        s.line_bounds = line_bounds
+        s.points = points
+        s.point_bounds = point_bounds
+        s.nfeat = int(nfeat)
+        s.built = True
+        s.used = time.perf_counter()
+        c.sets = [s]
+        c.lod_state = "ready"
+        c.rev += 1
+        if not self._vec_busy:
+            # 没有渲染在飞：立刻按新缓存重画一次（宽视野下 ~0.3s）。
+            self._invalidate_frame(0)
+            self.update()
+        # 有渲染在飞就别打断它：这一帧是流式读出来的，细度不比缓存差；
+        # 现在取消它再重画只是白费一次整层读。下一次视图变化自然会用上缓存。
+
     def set_layers(self, layers: list) -> None:
         had = bool(self.layers)
         self.layers = layers
@@ -708,7 +1466,24 @@ class MapView(QWidget):
                 self._layer_views.pop(lid, None)
         for lay in self._vec_layers:
             if lay.id not in self._cache:
-                self._cache[lay.id] = _LayerCache()
+                c = _LayerCache()
+                c.stream = _stream_enabled(lay)
+                self._use_provider(c, lay)
+                self._cache[lay.id] = c
+            else:
+                # 图层对象可能被替换（同名重建），重新判断一次阈值
+                c = self._cache[lay.id]
+                was = c.stream
+                c.stream = _stream_enabled(lay)
+                changed = self._use_provider(c, lay)
+                if c.stream != was or changed:
+                    # 切换渲染模式：旧的图层图和路径都不能再复用
+                    self._img_cache.pop(lay.id, None)
+                    if c.stream:
+                        c.sets.clear()
+                        c.build = None
+            self._maybe_start_lod(lay, c)
+            self._maybe_prefetch_labels(lay, c)
         # 栅格管线自己维护缓存：换图层集合时同步过去
         self._raster.set_layers(self._raster_layers)
         self._raster.set_visible(self.visible)
@@ -716,6 +1491,14 @@ class MapView(QWidget):
         for lid in list(self._raster_imgs):
             if lid not in alive:
                 self._raster_imgs.pop(lid, None)
+        # 标注缓存跟着图层集合走：删掉的图层不能再留锚点
+        stale = set(self._labels) - {l.id for l in self._vec_layers}
+        for lid in stale:
+            self._labels.pop(lid, None)
+            self._labels_pending.discard(lid)
+            self._labels_anchors.pop(lid, None)
+            self._label_tables.pop(lid, None)
+            self._labels_gen[lid] = self._labels_gen.get(lid, 0) + 1
         self._invalidate_frame()
         if not had and layers:
             self.fit_all()
@@ -728,12 +1511,46 @@ class MapView(QWidget):
             self._img_cache.pop(layer_id, None)
             self._layer_imgs.pop(layer_id, None)
             self._layer_views.pop(layer_id, None)
+            self._labels.pop(layer_id, None)
+            self._labels_pending.discard(layer_id)
+            self._labels_anchors.pop(layer_id, None)
+            self._label_tables.pop(layer_id, None)
+            self._labels_gen[layer_id] = self._labels_gen.get(layer_id, 0) + 1
         else:
             self._cache.clear()
             self._img_cache.clear()
             self._layer_imgs.clear()
             self._layer_views.clear()
+            self._labels.clear()
+            self._labels_pending.clear()
+            self._labels_anchors.clear()
+            self._label_tables.clear()
+            self._labels_gen.clear()
         self._invalidate_frame()
+
+    def refresh_layer_style(self, layer_id: str) -> None:
+        """图层样式改了：作废这一层的图形缓存（几何路径可留），立刻重画。
+
+        矢量：几何路径和样式无关，不用重建；只要丢掉按旧样式合成的图层图。
+        栅格：透明度/拉伸在栅格管线里，交给它自己的 `bump_rev`。
+        """
+        self._img_cache.pop(layer_id, None)
+        self._layer_imgs.pop(layer_id, None)
+        self._layer_views.pop(layer_id, None)
+        self._labels.pop(layer_id, None)
+        self._labels_pending.discard(layer_id)
+        self._labels_anchors.pop(layer_id, None)
+        self._label_tables.pop(layer_id, None)
+        # 世代 +1：正在跑的任务结果回来时会被丢弃，不会把旧样式字段的标注画上来
+        self._labels_gen[layer_id] = self._labels_gen.get(layer_id, 0) + 1
+        c = self._cache.get(layer_id)
+        if c is not None:
+            c.rev += 1
+        try:
+            self._raster.bump_rev(layer_id)
+        except Exception:  # noqa: BLE001
+            pass
+        self._invalidate_frame(0)
 
     def invalidate(self) -> None:
         """外部改动（显隐、顺序）后调用，强制重画帧缓存。"""
@@ -766,12 +1583,34 @@ class MapView(QWidget):
     def screen_to_lonlat(self, px: float, py: float) -> tuple[float, float]:
         return unproject((px - self.tx) / self.scale, (py - self.ty) / self.scale)
 
-    @staticmethod
-    def _layer_bounds(lay):
-        """图层的经纬度范围。矢量取 gdf，栅格取元信息（两条管线共用的唯一入口）。"""
+    def _layer_bounds(self, lay):
+        """图层的经纬度范围。矢量取已缓存的 extent 或 gdf，栅格取元信息。
+
+        关键：provider 没有旁车/文件头范围时**返回 None**，绝不在 UI 线程
+        调 `lay.wgs_bounds`（旧 GeoParquet 会扫 4480 万顶点，13 秒）。
+        这种图层交给 `_BoundsWorker`，算完由 `_on_bounds_ready` 再 fit。
+        """
         if getattr(lay, "is_raster", False):
             return lay.info.bounds
-        gdf = lay.gdf
+        c = self._cache.get(lay.id)
+        if c is not None and c.extent is not None:
+            return c.extent
+        # provider 图层：只用文件头/旁车，不读全量几何
+        try:
+            if getattr(lay, "_gdf", None) is None:
+                prov = getattr(lay, "provider", None)
+                if prov is not None:
+                    hint = getattr(prov, "wgs_bounds_hint", None)
+                    if hint:
+                        return tuple(hint)
+                    if getattr(prov, "bounds", None):
+                        wb = getattr(prov, "wgs_bounds", None)
+                        if wb:
+                            return tuple(wb)
+                    return None
+            gdf = lay.gdf
+        except Exception:
+            return None
         b = gdf.total_bounds
         # GDB / Shapefile 常常是投影坐标（如 CGCS2000 3 度带，单位米）。
         # fit_all() 要的是经纬度；直接拿米制 bounds 会让视口飞到经度几千万度。
@@ -787,8 +1626,15 @@ class MapView(QWidget):
 
     def fit_all(self) -> None:
         b = None
+        need_bounds = False
         for lay in self.layers:
             if not self.visible.get(lay.id, True):
+                continue
+            c = self._cache.get(lay.id)
+            if c is not None and c.provider is not None and c.extent is None:
+                if not c.bounds_failed:
+                    self._ensure_bounds_async(lay, c)
+                    need_bounds = True
                 continue
             try:
                 lb = self._layer_bounds(lay)
@@ -799,13 +1645,26 @@ class MapView(QWidget):
             b = lb if b is None else [min(b[0], lb[0]), min(b[1], lb[1]),
                                       max(b[2], lb[2]), max(b[3], lb[3])]
         if b is None:
+            if need_bounds:
+                # 先不跳到默认中国范围；等后台范围回来后再 fit_all 一次
+                self._fit_all_pending = True
+                return
             self.fit_bounds(74, 18, 135.5, 53.5, pad=0.02)
         else:
             self.fit_bounds(b[0], b[1], b[2], b[3], pad=0.12)
+        if need_bounds:
+            self._fit_all_pending = True
 
     def fit_layer(self, layer_id: str) -> None:
         lay = next((l for l in self.layers if l.id == layer_id), None)
         if lay is None:
+            return
+        c = self._cache.get(lay.id)
+        if (c is not None and c.provider is not None and c.extent is None
+                and not c.bounds_failed):
+            # 旧缓存没有范围：后台算完再缩放到它，别让「缩放到图层」卡 13 秒
+            self._fit_pending = lay.id
+            self._ensure_bounds_async(lay, c, force=True)
             return
         try:
             b = self._layer_bounds(lay)
@@ -887,8 +1746,13 @@ class MapView(QWidget):
     def _scene_sig(self) -> tuple:
         return tuple((l.id, self.visible.get(l.id, True), l.color) for l in self.layers)
 
-    def _invalidate_frame(self, delay: int = RENDER_DEBOUNCE_MS) -> None:
+    def _invalidate_frame(self, delay: int | None = None) -> None:
         """标记当前帧需要重绘（不影响已缓存的几何路径）。"""
+        if delay is None:
+            # 有矢量时保留较长 debounce（避免边拖边重建路径）；纯栅格地图
+            # 主要成本是源块读取，60ms 已经足够合并滚轮事件，手感更直接。
+            delay = (RENDER_DEBOUNCE_MS if getattr(self, "_vec_layers", None)
+                     else RASTER_RENDER_DEBOUNCE_MS)
         self._frame_sig = None
         if self._render_timer.isActive():
             self._render_timer.stop()
@@ -936,24 +1800,40 @@ class MapView(QWidget):
         """渲染定时器回调：发起一次渲染（对应 QgsMapRendererJob::start()）。"""
         self._start_render()
 
-    def _start_render(self) -> None:
+    def _start_render(self, request_raster: bool = True) -> None:
         """发起一次渲染（对应 QgsMapRendererJob::start()）。
 
         · 每次视图变化都会给 job 分配新的世代号（epoch），旧世代的结果一律丢弃；
         · 每个图层一个 `_LayerJob`，命中图层缓存的直接复用上次的图，
           不再重绘（切显隐、调顺序几乎零成本）；
-        · 整帧画完才整体上屏（中途只有首次出图时会先显示半成品）。
+        · 流式图层在块边界发 `layerProgress`，主线程可先显示 provisional 帧；
+          整帧画完后 `frameReady` 再发 final 帧整体替换。
         """
         if self.width() < 10 or self.height() < 10:
             return
+        # 已经由当前视口发起渲染，就不要再让旧的 debounce 定时器补一枪：
+        # 在线瓦片会被第二次 request 取消并从头下载，看起来像“加载两遍”。
+        if self._render_timer.isActive():
+            self._render_timer.stop()
         # 从这里到函数结束，矢量图都可能被换掉：期间禁止栅格回调上屏
         self._vec_busy = True
         # 栅格管线先走一步：它是独立的线程和缓存，成败都不影响下面的矢量流程。
         # 这里必须兜住异常 —— 「栅格坏了」绝不能变成「矢量也不画了」。
-        try:
-            self._request_raster()
-        except Exception:  # noqa: BLE001
-            pass
+        # 矢量构建过程中的 partial 帧不重新请求栅格：视口没变，重发只会
+        # 取消正在下载的在线瓦片，看起来像瓦片反复重下。
+        if request_raster:
+            try:
+                self._request_raster()
+            except Exception:  # noqa: BLE001
+                pass
+        # 旧 provider 缓存没有范围旁车：先在后台补，别为了判断可见性扫全层。
+        for lay in self._vec_layers:
+            if not self.visible.get(lay.id, True):
+                continue
+            c = self._cache.get(lay.id)
+            if c is not None:
+                self._ensure_bounds_async(lay, c)
+                self._maybe_start_lod(lay, c)
         self._kick_build()
         snapshot = self._make_snapshot()
         if snapshot is None:
@@ -1013,8 +1893,15 @@ class MapView(QWidget):
                 epoch, "force")
             self._rendered_geo_rev = self._geo_rev
             return
-        # 没命中的图层用缓存里已有的旧图先顶着（避免合成时缺块闪白）
-        self._layer_imgs = dict(reuse)
+        # 没命中的图层先保留上一帧的图（按当前视口平移/缩放贴上去），
+        # 新图/中间图回来再逐层替换。不能直接清空：否则流式渲染刚起步时，
+        # 还没轮到的图层会整片消失，看起来就是「闪白」。
+        incoming = {j.lid for j in jobs}
+        kept = {lid: img for lid, img in self._layer_imgs.items() if lid in incoming}
+        kept.update(reuse)
+        self._layer_imgs = kept
+        for lid in reuse:
+            self._layer_views[lid] = view_now
         job = _RenderJob(epoch, jobs, self._scene_sig(),
                          (self.scale, self.tx, self.ty, self.width(), self.height()),
                          self._view_world_rect(),
@@ -1044,6 +1931,24 @@ class MapView(QWidget):
             world=self._view_world_rect(),
         )
         self._raster.set_visible(self.visible)
+        # 大栅格没有 overview：通知上层后台生成，避免每次缩放都重读全图。
+        # 只发一次判断，生成/去重由 MainWindow 负责；不阻塞当前渲染。
+        for lay in self._raster_layers:
+            if not self.visible.get(lay.id, True):
+                continue
+            try:
+                info = lay.info
+                b = getattr(info, "bounds", None)
+                e = vp.extent
+                if b is not None and len(b) == 4:
+                    if (float(b[2]) < float(e[0]) or float(b[0]) > float(e[2])
+                            or float(b[3]) < float(e[1]) or float(b[1]) > float(e[3])):
+                        continue    # 视口外的栅格不必为它生成 overview
+                if (not getattr(info, "overviews", ())
+                        and int(info.width) * int(info.height) >= 4_000_000):
+                    self.overviewNeeded.emit(str(info.path))
+            except Exception:  # noqa: BLE001
+                continue
         self._raster.request(vp)
 
     def _on_raster_layer(self, lid: str, img) -> None:
@@ -1053,29 +1958,63 @@ class MapView(QWidget):
         # 避免每个栅格图层都触发一次全屏合成、和矢量抢 UI 时间。
         if self._vec_busy and self._frame is not None:
             return
-        self._recompose_now()
+        # 单层 final 不等于整轮栅格 final（在线瓦片和本地栅格现在并行）；
+        # 在全部栅格 worker 收尾前仍按 provisional 合成，不登记整帧缓存。
+        self._recompose_now(provisional=self._raster_final_epoch != self._epoch)
+
+    def _on_raster_progress(self, lid: str, img) -> None:
+        """在线瓦片到一张就存一张：先合成半成品，不写完整帧缓存。
+
+        和矢量流式图的 `_on_layer_progress` 一样，用 provisional 模式上屏：
+        `_frame_sig` 不登记，避免平移/缩放时把“只到了几块瓦片”的图当成
+        完整帧复用。
+        """
+        if self._raster_final_epoch == self._epoch:
+            return                      # final 已出，迟到的中间帧不能再降级
+        self._raster_imgs[lid] = img
+        if self._vec_busy and self._frame is not None:
+            return
+        self._recompose_now(provisional=True)
 
     def _on_raster_frame(self) -> None:
+        # 先登记：即使矢量还在忙，这一轮栅格的 final 也已经到了；
+        # 后续排队的瓦片 progress 不能再把它降级成 provisional。
+        self._raster_final_epoch = self._epoch
         if self._vec_busy and self._frame is not None:
             return
         self._recompose_now()
 
-    def _recompose_now(self) -> None:
+    def _recompose_now(self, provisional: bool = False) -> None:
         """用当前视口参数重新合成一次（栅格管线的独立触发点）。
 
         不复用矢量 job 的 sig/view —— 栅格的完成时刻和矢量任务没有关系，
         可能矢量还在建几何、栅格已经画完了，这时也得让用户看到栅格。
 
-        但**能不能上屏**要分开判断：矢量 job 还在跑的时候，`_layer_imgs` 只是
-        「缓存命中的那几层」，拿它合成会把正在重画的矢量层整片抹掉，
-        屏幕上就是「矢量闪一下没了 → 又回来」。所以那种情况只更新 `_pending`
-        不上屏，等矢量的整帧回来时一起上（`_on_frame_ready`）。
+        矢量 job 还在跑时，栅格回调先不驱动上屏（见 `_on_raster_layer`）：
+        否则会和矢量中间帧抢合成线程；等矢量整帧的 provisional/final 一起出。
         """
         if self.width() < 10 or self.height() < 10:
             return
         view = (float(self.scale), float(self.tx), float(self.ty),
                 self.width(), self.height())
-        self._compose_async(self._scene_sig(), view, self._epoch, "auto")
+        mode = "raster_progress" if provisional else "auto"
+        self._compose_async(self._scene_sig(), view, self._epoch, mode)
+
+    def _on_layer_progress(self, lid: str, img, epoch: int) -> None:
+        """流式图层的中间结果：先把当前帧换成「画到这里」的 provisional 帧。
+
+        provisional 帧只用于显示，不写图层缓存，也不设置 `_frame_sig`：
+        `_frame_usable()` 会一直认为它不完整，直到 `_on_frame_ready()` 的
+        final 帧回来。这样拖拽/缩放不会把半成品当成可复用的整帧。
+        """
+        if epoch != self._epoch or img is None:
+            return
+        job = self._job
+        if job is None:
+            return
+        self._layer_imgs[lid] = img
+        self._layer_views[lid] = job.view
+        self._compose_async(job.sig, job.view, epoch, "progress")
 
     def _on_layer_ready(self, lid: str, img, epoch: int) -> None:
         """某个图层渲染好了：存图并合成到「待上屏」的缓冲里。"""
@@ -1090,9 +2029,9 @@ class MapView(QWidget):
         key = self._img_keys.get(lid)
         if key is not None:
             self._img_cache[lid] = (key, img)
-        # 首帧先显示已完成的图层；已有旧帧时等 _on_frame_ready 一次性上屏
-        if self._frame is None:
-            self._compose_async(job.sig, job.view, epoch, "first")
+        # 先显示已完成的图层；整帧最后一层完成时由 _on_frame_ready 再合成 final。
+        mode = "first" if self._frame is None else "progress"
+        self._compose_async(job.sig, job.view, epoch, mode)
 
     def _promote_pending(self, epoch: int, view, sig) -> None:
         """把「待上屏」的缓冲换成当前帧。
@@ -1150,7 +2089,14 @@ class MapView(QWidget):
         promote = (job.mode == "force" and not self._vec_busy
                    or (job.mode == "auto"
                        and (self._frame is None or not self._vec_busy))
-                   or (job.mode == "first" and self._frame is None))
+                   or (job.mode == "first" and self._frame is None)
+                   # 只在本轮矢量任务还没结束时贴中间帧；final 之后迟到的
+                   # progress 结果不能再把完整帧降级成半成品。
+                   or (job.mode == "progress" and self._vec_busy)
+                   # 在线瓦片先到一块就上屏；矢量同步完成时也允许贴 provisional。
+                   # final 之后迟到的中间帧直接丢弃，避免把完整图降级。
+                   or (job.mode == "raster_progress" and not self._vec_busy
+                       and self._raster_final_epoch != job.epoch))
         if not promote:
             return
         try:
@@ -1161,7 +2107,11 @@ class MapView(QWidget):
         self._frame = pix
         self._frame_epoch = job.epoch
         self._frame_view = job.view
-        self._frame_sig = job.sig
+        # provisional 帧故意不登记 sig：它只用于显示，不能被当成完整帧复用。
+        # first 也是「先显示已完成的图层」，同样要等 force 的 final 帧才算完整。
+        self._frame_sig = (None if job.mode in
+                           ("progress", "first", "raster_progress")
+                           else job.sig)
         if job.mode == "force":
             self._vec_busy = False
         self.update()
@@ -1172,8 +2122,8 @@ class MapView(QWidget):
         每次都在**一张干净的画布**上从零合成，绝不在上一帧上叠 ——
         否则同一个图层会被重复叠加（14% 的填充叠几次就变成实色），
         看起来就像「有些地方渲染错了 / 没渲染出来」。
-        合成结果先放在 `_pending`，等整帧画完再整体上屏
-        （对应 QgsMapRendererParallelJob 结束时一次性替换画布）。
+        这是兼容用的同步路径：结果先放 `_pending`，由调用方整体上屏；
+        生产路径是 `_compose_async` + `_on_compose_ready`。
         """
         dpr = self._device_pixel_ratio()
         w = max(1, int(self.width() * dpr))
@@ -1276,10 +2226,11 @@ class MapView(QWidget):
             p.restore()
 
     def _on_frame_ready(self, sig, view, epoch: int) -> None:
-        """整帧渲染完成：校验世代号后整体上屏。
+        """整帧渲染完成：校验世代号后合成 final 帧。
 
-        只在这里替换 `_frame` —— 对应 QGIS 渲染完成后一次性换图，
-        中途不往屏幕上贴半成品，也就不会出现「半帧旧图 + 半帧新图」叠加。
+        流式过程中 `_on_layer_progress` 已经贴过 provisional 帧（`_frame_sig=None`），
+        这里再把所有图层图合成一次完整帧；`_frame_sig` 直到这一步才登记，
+        所以缓存/拖拽不会把半成品当成完整帧。
         """
         if epoch != self._epoch:
             return                      # 过期世代，丢弃（否则旧帧会覆盖新帧）
@@ -1289,6 +2240,40 @@ class MapView(QWidget):
 
     def _device_pixel_ratio(self) -> float:
         return self.devicePixelRatioF() or 1.0
+
+    def _point_dots_for(self, c: _LayerCache, lay, need: tuple,
+                        visible_count: int | None = None) -> bool:
+        """当前视口是否该把点降成 1px 点。
+
+        不能用「图层总点数」一刀切：500 万点的图层放大到一条街时，
+        视口里可能只有几十个点，应该保留 3.4px 的圆点。这里用
+        「视口面积 / 图层范围面积」估算可见点数；内存流式图层已知
+        可见下标数量，直接用它。
+        """
+        if os.environ.get("GIS_AGENT_POINT_DOTS", "1").strip().lower() in (
+                "0", "false", "no", "off"):
+            return False
+        try:
+            gt = str(getattr(lay, "geom_type", "") or "")
+        except Exception:
+            return False
+        if "Point" not in gt:
+            return False
+        total = int(getattr(c, "total", 0) or 0)
+        if total <= 0:
+            return False
+        if visible_count is not None:
+            return int(visible_count) >= POINT_DOT_THRESHOLD
+        if total < POINT_DOT_THRESHOLD:
+            return False
+        b = getattr(lay, "wgs_bounds", None) or getattr(c, "extent", None)
+        if not b or len(b) != 4:
+            return True
+        area = max((float(b[2]) - float(b[0])) * (float(b[3]) - float(b[1])), 1e-12)
+        need_area = max((float(need[2]) - float(need[0]))
+                        * (float(need[3]) - float(need[1])), 0.0)
+        frac = min(1.0, need_area / area)
+        return total * frac >= POINT_DOT_THRESHOLD
 
     def _make_snapshot(self) -> dict | None:
         """拍下渲染所需的数据快照（每个图层一份）。
@@ -1302,7 +2287,55 @@ class MapView(QWidget):
             if not self.visible.get(lay.id, True):
                 continue
             c = self._cache.get(lay.id)
-            if c is None:
+            if c is None or c.bounds_pending or (c.bounds_failed and c.extent is None):
+                continue
+            style = getattr(lay, "style", None) or {}
+            try:
+                geom = str((lay.meta() or {}).get("geomType") or "")
+            except Exception:  # noqa: BLE001
+                geom = ""
+            if c.stream and c.provider is not None:
+                # 源文件图层：宽视野若已有「整层粗路径」缓存，就直接画缓存，
+                # 不再按 bbox 读文件（省域整层读取是 5~8s 卡顿的主要来源）。
+                lod = self._lod_set(c)
+                if lod is not None:
+                    layers.append(self._set_layer_entry(lay, lod, style, geom))
+                    continue
+                # 否则只传屏幕 bbox，渲染线程自己让 provider 读窗口。
+                # 内存里没有整层 geoms/bounds，这是「provider 模式」的关键。
+                need = self._view_need(c)
+                if need is None:
+                    continue
+                layers.append({
+                    "lid": lay.id,
+                    "color": lay.color, "op": lay.op,
+                    "style": style, "geom": geom,
+                    "stream": True,
+                    "provider": c.provider,
+                    "bbox": self._pad_region(need, 1.02),
+                    "tol": self._simplify_tol(),
+                    "point_dots": self._point_dots_for(c, lay, need),
+                })
+                continue
+            if c.stream:
+                # 内存大图层：不传整层路径，只传「屏幕范围内」的要素下标。
+                # 工作线程按块取几何、简化、建路径、立即画，路径不进缓存。
+                if c.geoms is None or c.bounds is None:
+                    continue
+                need = self._view_need(c)
+                if need is None:
+                    continue
+                idx = self._select_indices(c, self._pad_region(need, 1.02))
+                layers.append({
+                    "lid": lay.id,
+                    "color": lay.color, "op": lay.op,
+                    "style": style, "geom": geom,
+                    "stream": True,
+                    "geoms": c.geoms,
+                    "indices": idx,
+                    "tol": self._simplify_tol(),
+                    "point_dots": self._point_dots_for(c, lay, need, len(idx)),
+                })
                 continue
             s = self._active_set(c)
             if s is None:
@@ -1310,18 +2343,7 @@ class MapView(QWidget):
             if not (s.poly_paths or s.line_paths or s.points or s.dot_xy is not None
                     or s.dots is not None):
                 continue
-            layers.append({
-                "lid": lay.id,
-                "color": lay.color, "op": lay.op,
-                "poly_paths": s.poly_paths, "npoly": len(s.poly_paths),
-                "poly_bounds": s.poly_bounds, "npoly_b": len(s.poly_bounds),
-                "line_paths": s.line_paths, "nline": len(s.line_paths),
-                "line_bounds": s.line_bounds, "nline_b": len(s.line_bounds),
-                "points": s.points, "npt": len(s.points),
-                "point_bounds": s.point_bounds, "npt_b": len(s.point_bounds),
-                # 亚像素要素：传「取 QPolygonF 的方法」，由渲染线程首次用到时构建
-                "dots": s.dots_polygon if (s.dot_xy is not None or s.dots is not None) else None,
-            })
+            layers.append(self._set_layer_entry(lay, s, style, geom))
         if not layers:
             return None
         return {
@@ -1332,6 +2354,24 @@ class MapView(QWidget):
             "view": self._view_world_rect(),
             "mpp": self.mpp(),
         }
+
+    @staticmethod
+    def _set_layer_entry(lay, s: _RenderSet, style: dict, geom: str) -> dict:
+        """把一套渲染集（内存层的 / 源文件层的粗缓存）变成一个图层快照。"""
+        return {
+            "lid": lay.id,
+            "color": lay.color, "op": lay.op,
+            "style": style, "geom": geom,
+            "poly_paths": s.poly_paths, "npoly": len(s.poly_paths),
+            "poly_bounds": s.poly_bounds, "npoly_b": len(s.poly_bounds),
+            "line_paths": s.line_paths, "nline": len(s.line_paths),
+            "line_bounds": s.line_bounds, "nline_b": len(s.line_bounds),
+            "points": s.points, "npt": len(s.points),
+            "point_bounds": s.point_bounds, "npt_b": len(s.point_bounds),
+            # 亚像素要素：传「取 QPolygonF 的方法」，由渲染线程首次用到时构建
+            "dots": s.dots_polygon if (s.dot_xy is not None or s.dots is not None) else None,
+        }
+
 
     def _layer_cache_key(self, lay, snap: dict) -> tuple:
         """图层渲染缓存的键（对应 QGIS 的 QgsMapRendererCache::cacheKey）。
@@ -1345,7 +2385,8 @@ class MapView(QWidget):
         tier = 1 if snap.get("mpp", 0.0) >= LINE_THIN_MPP else 0
         return (snap["scale"], snap["tx"], snap["ty"],
                 snap["w"], snap["h"], snap["dpr"], rev,
-                lay.color, lay.op, tier)
+                lay.color, lay.op, tier,
+                style_signature(getattr(lay, "style", None)))
 
     # ------------------------------------------------------------------ 构建
     def _layers_render_order(self) -> list:
@@ -1379,7 +2420,11 @@ class MapView(QWidget):
             c = self._cache.get(lay.id)
             if c is None:
                 continue
-            if c.build is not None or c.bounds is None:
+            if c.build is not None:
+                return True
+            if c.provider is not None:
+                continue          # provider 图层不建全量包围盒，渲染时按 bbox 读
+            if c.bounds is None:
                 return True
             if self._needs_build(lay, c):
                 return True
@@ -1455,6 +2500,8 @@ class MapView(QWidget):
         """
         if c.total == 0:
             return False
+        if c.stream:
+            return False          # 流式图层不建渲染集，每次按视口现画
         if not self.visible.get(lay.id, True):
             # 隐藏的图层不建缓存：省下几十万个要素的构建，
             # 等重新显示时 `invalidate()` 会把它排进来
@@ -1610,6 +2657,8 @@ class MapView(QWidget):
             c = self._cache.get(lay.id)
             if c is None:
                 continue
+            if c.provider is not None:
+                continue          # 源文件图层：不预读全量几何，渲染时走 bbox
             if c.bounds is None:
                 self._ensure_geoms(lay, c)
                 return (lay, c, "bounds")
@@ -1631,7 +2680,7 @@ class MapView(QWidget):
             self._last_partial_frame = now
             if self._rendered_geo_rev != self._geo_rev:
                 # 几何有变化才重画，避免把在飞的任务白白取消掉
-                self._start_render()
+                self._start_render(request_raster=False)
         self.update()
 
     def _build_bounds_chunk(self, c: _LayerCache, t_end: float) -> None:
@@ -2215,16 +3264,6 @@ class MapView(QWidget):
             self.update()
             return
 
-        now = time.time()
-        if now - self._hover_ts > 0.1:
-            self._hover_ts = now
-            hit = self._hit_test(pos.x(), pos.y())
-            key = (hit[0].id, hit[1]) if hit else None
-            if key != self._hover:
-                self._hover = key
-                self.update()
-                self.hoverChanged.emit({"layer": hit[0], "props": hit[2]} if hit else None)
-
     def mouseReleaseEvent(self, e):  # noqa: N802
         if self._band is not None and e.button() == Qt.LeftButton:
             band, self._band = self._band, None
@@ -2288,12 +3327,6 @@ class MapView(QWidget):
         if dy:
             self.zoom_at(math.pow(1.0015, dy), e.position().x(), e.position().y())
         e.accept()
-
-    def leaveEvent(self, e):  # noqa: N802
-        if self._hover is not None:
-            self._hover = None
-            self.update()
-            self.hoverChanged.emit(None)
 
     # ------------------------------------------------------------------ 选区
     def set_select_target(self, layer_id: str | None) -> None:
@@ -2367,9 +3400,19 @@ class MapView(QWidget):
         if lay is None:
             return
         self._ensure_index(lay, c)
-        if c is None or c.bounds is None or pos_idx >= len(c.bounds):
+        b = None
+        if c is not None and c.bounds is not None and pos_idx < len(c.bounds):
+            b = c.bounds[pos_idx]
+        elif c is not None and c.provider is not None:
+            # provider 图层没有全量 bounds 索引：只读这一行的几何取范围。
+            try:
+                geom = c.provider.feature_geom(pos_idx)
+                if geom is not None and not geom.is_empty:
+                    b = geom.bounds
+            except Exception:
+                b = None
+        if b is None:
             return
-        b = c.bounds[pos_idx]
         w = max(b[2] - b[0], 1e-6)
         h = max(b[3] - b[1], 1e-6)
         # 单个点/极小要素：给一个固定的最小视野，否则会缩到极限
@@ -2411,9 +3454,21 @@ class MapView(QWidget):
 
     # ------------------------------------------------------------------ 拾取
     def _ensure_index(self, lay, c: _LayerCache) -> bool:
-        """按需生成全量几何索引（包围盒 + 几何数组），只在第一次点击时算一次。"""
+        """按需生成全量几何索引（包围盒 + 几何数组），只在第一次点击时算一次。
+
+        provider 图层**不能**走这里：`_ensure_geoms()` 会 `lay.gdf` 全量加载，
+        21k 块 / 4480 万顶点的图层会直接涨到数 GB（点击一次就触发）。
+        流式图层的命中由 `provider.hit_test()` 只读小 bbox / 属性完成。
+        """
+        if c is None:
+            return False
         if c.bounds is not None:
             return True
+        if c.provider is not None and c.geoms is None:
+            # 小图层（属性表/算子已经显式读过 gdf）可以照旧建索引；
+            # 只有 gdf 还没进内存的源文件大图层才必须挡住全量加载。
+            if getattr(lay, "_gdf", None) is None:
+                return False
         self._ensure_geoms(lay, c)
         try:
             import shapely
@@ -2434,6 +3489,21 @@ class MapView(QWidget):
             if not self.visible.get(lay.id, True):
                 continue
             c = self._cache.get(lay.id)
+            if c is not None and c.extent is not None:
+                e = c.extent
+                if lon < e[0] or lon > e[2] or lat < e[1] or lat > e[3]:
+                    continue        # 点在图层范围外，不必让 provider 扫文件
+            if (c is not None and c.provider is not None
+                    and c.geoms is None):
+                # 大图层不要为了点击拾取把整层读进内存；provider 用简化
+                # 缓存命中几何，再只读属性列。
+                try:
+                    hit = c.provider.hit_test(lon, lat, tol)
+                except Exception:
+                    hit = None
+                if hit is not None:
+                    return lay, int(hit[0]), hit[1]
+                continue
             if c is None or not self._ensure_index(lay, c):
                 continue
             b = c.bounds
@@ -2486,12 +3556,15 @@ class MapView(QWidget):
             p.setFont(QFont("Microsoft YaHei UI", 10))
             p.drawText(rect, Qt.AlignCenter, "正在准备渲染数据…")
 
-        # 经纬网画在帧缓存**之上**，这样缩放平移时网格始终对齐屏幕
+        # 经纬网画在帧缓存**之上**，这样缩放平移时网格始终对齐屏幕；
+        # 标注再压在网格之上，免得文字被网格线穿过。
         self._draw_grid(p)
+        # 要素标注跟着当前视口实时画（不烘焙进帧缓存）：
+        # 平移/缩放时文字位置立刻正确，不用等后台重渲染。
+        self._paint_labels(p)
         self._draw_selection(p)
         self._draw_highlight_set(p)
         self._draw_highlight(p)
-        self._draw_hover(p)
         self._draw_band(p)
         p.end()
 
@@ -2525,9 +3598,16 @@ class MapView(QWidget):
             return
         lid, idx = self._hl
         c = self._cache.get(lid)
-        if c is None or c.geoms is None or idx >= len(c.geoms):
-            return
-        geom = c.geoms[idx]
+        geom = None
+        if c is not None:
+            if c.geoms is not None and idx < len(c.geoms):
+                geom = c.geoms[idx]
+            elif c.provider is not None:
+                # provider 图层没有整层 geoms；只解码当前行，不能为了高亮建索引。
+                try:
+                    geom = c.provider.feature_geom(idx)
+                except Exception:
+                    geom = None
         if geom is None or geom.is_empty:
             return
         p.save()
@@ -2619,50 +3699,6 @@ class MapView(QWidget):
         p.setBrush(QBrush(QColor(217, 119, 87, 30)))
         p.drawRect(r)
 
-    def _draw_hover(self, p: QPainter) -> None:
-        if not self._hover:
-            return
-        lid, idx = self._hover
-        c = self._cache.get(lid)
-        lay = next((l for l in self.layers if l.id == lid), None)
-        if c is None or lay is None or c.geoms is None or idx >= len(c.geoms):
-            return
-        geom = c.geoms[idx]
-        if geom is None or geom.is_empty:
-            return
-        path = QPainterPath()
-        gt = geom.geom_type
-        if gt == "Polygon":
-            self._add_ring(path, geom.exterior.coords, True)
-            for r in geom.interiors:
-                self._add_ring(path, r.coords, True)
-        elif gt == "MultiPolygon":
-            for poly in geom.geoms:
-                self._add_ring(path, poly.exterior.coords, True)
-                for r in poly.interiors:
-                    self._add_ring(path, r.coords, True)
-        elif gt == "LineString":
-            self._add_ring(path, geom.coords, False)
-        elif gt == "MultiLineString":
-            for ln in geom.geoms:
-                self._add_ring(path, ln.coords, False)
-        else:
-            pt = self.lonlat_to_screen(geom.x, geom.y)
-            p.setPen(QPen(QColor("#0f1b2d"), 2))
-            p.setBrush(Qt.NoBrush)
-            p.drawEllipse(pt, 7, 7)
-            return
-        p.save()
-        p.translate(self.tx, self.ty)
-        p.scale(self.scale, self.scale)
-        pen = QPen(QColor("#0f1b2d"))
-        pen.setWidthF(2.2)
-        pen.setCosmetic(True)
-        p.setPen(pen)
-        p.setBrush(Qt.NoBrush)
-        p.drawPath(path)
-        p.restore()
-
     def _draw_grid(self, p: QPainter) -> None:
         steps = [0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 30]
         step = steps[-1]
@@ -2702,3 +3738,351 @@ class MapView(QWidget):
     def _view_world_rect(self) -> tuple[float, float, float, float]:
         return ((0 - self.tx) / self.scale, (0 - self.ty) / self.scale,
                 (self.width() - self.tx) / self.scale, (self.height() - self.ty) / self.scale)
+
+    # ------------------------------------------------------------- 要素标注
+    def _layer_paint_style(self, lay) -> dict:
+        """这个图层当前生效的矢量样式（含默认值）。"""
+        try:
+            geom = str((lay.meta() or {}).get("geomType") or "")
+        except Exception:  # noqa: BLE001
+            geom = ""
+        return resolve_vector_style(
+            getattr(lay, "op", "") or "", getattr(lay, "color", None) or "#2f6fed",
+            getattr(lay, "style", None), geom)
+
+    def _label_sig(self, lay) -> tuple:
+        c = self._cache.get(lay.id)
+        return (id(lay), getattr(c, "rev", 0) if c is not None else 0)
+
+    def _label_cache_stale(self, lay, field: str, view: tuple) -> bool:
+        if not field:
+            return False
+        cache = self._labels.get(lay.id)
+        if cache is None or cache.get("field") != field:
+            return True
+        if cache.get("sig") != self._label_sig(lay):
+            return True
+        rect = cache.get("rect") or view
+        if not _rect_contains(rect, view):
+            return True
+        # 缓存是「视野外扩 40%」取的。放大到缓存范围的 1/1.6 以下时，
+        # 之前按大范围均匀抽的锚点在新视野里只剩寥寥几个——必须按新视野重取，
+        # 否则就是「放大地图后标注几乎消失」。
+        cw, ch = rect[2] - rect[0], rect[3] - rect[1]
+        vw, vh = view[2] - view[0], view[3] - view[1]
+        if vw <= 0 or vh <= 0:
+            return True
+        return cw > vw * 1.6 or ch > vh * 1.6
+
+    def _label_table_ok(self, lay, field: str) -> bool:
+        """这层是否已经有可用的「整层锚点表」（且字段一致）。"""
+        a = self._labels_anchors.get(lay.id)
+        return bool(a and a.get("field") == field)
+
+    def _label_table_eligible(self, lay) -> bool:
+        """这层值不值得建整层锚点表：按视口取会顺扫整个文件的源文件图层。
+
+        · GeoParquet / GeoJSON、没有 `.qix` 的 Shapefile：按 bbox 取也要把
+          整个文件解一遍（村界面 614MB 实测 4.5s/次），整层读一次更划算；
+        · GPKG / FileGDB / FlatGeobuf / 有 `.qix` 的 Shapefile：按视口读本来
+          就是毫秒级，别为标注把整层物化出来。
+        """
+        c = self._cache.get(lay.id)
+        if c is None or c.provider is None or not c.stream:
+            return False
+        if getattr(lay, "_gdf", None) is not None:
+            return False
+        try:
+            if int(c.total or 0) > LABEL_TABLE_MAX:
+                return False
+        except Exception:  # noqa: BLE001
+            return False
+        try:
+            path = str(getattr(c.provider, "path", "") or "").lower()
+        except Exception:  # noqa: BLE001
+            return False
+        if path.endswith((".parquet", ".geojson", ".json")):
+            return True
+        if path.endswith(".shp"):
+            import os
+            return not os.path.exists(path[:-4] + ".qix")
+        return False
+
+    def _derive_labels(self, lay, field: str, view: tuple):
+        """用整层锚点表生成当前视口的标注缓存：纯 numpy 筛选，不读磁盘。
+
+        锚点在 Web Mercator 世界坐标里，所以视口只要换算成世界矩形就能做掩码；
+        拖动/缩放时每帧现算（2 万个锚点约 0.2ms），标注不会再落后于地图。
+        """
+        a = self._labels_anchors.get(lay.id)
+        if not a or a.get("field") != field:
+            return None
+        pad = self._pad_region(view, 1.4)
+        xy = a.get("xy")
+        texts_all = a.get("texts") or []
+        angles_all = a.get("angles")
+        if xy is None or len(xy) == 0 or not texts_all:
+            cache = {"field": field, "rect": pad, "sig": self._label_sig(lay),
+                     "xy": None, "texts": [], "angles": None}
+            self._labels[lay.id] = cache
+            return None
+        try:
+            wx0, wy0 = project(float(view[0]), float(view[3]))
+            wx1, wy1 = project(float(view[2]), float(view[1]))
+            if wx0 > wx1:
+                wx0, wx1 = wx1, wx0
+            if wy0 > wy1:
+                wy0, wy1 = wy1, wy0
+            mask = ((xy[:, 0] >= wx0) & (xy[:, 0] <= wx1)
+                    & (xy[:, 1] >= wy0) & (xy[:, 1] <= wy1))
+        except Exception:  # noqa: BLE001
+            mask = np.ones(len(xy), dtype=bool)
+        sel = np.nonzero(mask)[0]
+        if len(sel) == 0:
+            cache = {"field": field, "rect": pad, "sig": self._label_sig(lay),
+                     "xy": None, "texts": [], "angles": None}
+            self._labels[lay.id] = cache
+            return None
+        if len(sel) > LABEL_CAP:
+            sel = sel[_grid_pick(xy[sel, 0], xy[sel, 1], pad, LABEL_CAP)]
+        cache = {
+            "field": field, "rect": pad, "sig": self._label_sig(lay),
+            "xy": np.asarray(xy[sel], dtype=float),
+            "texts": [texts_all[int(i)] for i in sel],
+            "angles": (np.asarray(angles_all, dtype=float)[sel]
+                       if angles_all is not None
+                       and len(angles_all) == len(xy) else None),
+        }
+        self._labels[lay.id] = cache
+        return cache
+
+    def _ensure_labels(self, lay, st: dict, view: tuple):
+        """返回可画的标注缓存；过期就登记重建（防抖，不在 paint 里读数据）。"""
+        field = st.get("label_field") or ""
+        if not field:
+            return None
+        c = self._cache.get(lay.id)
+        if c is not None and (c.bounds_pending or c.bounds_failed
+                              or self._view_need(c) is None):
+            return None          # 视口外/范围未知时不派发标注任务
+        if self._label_table_ok(lay, field):
+            # 整层锚点表已就绪：每帧现筛，拖动时标注跟着地图走，不读盘也不排队。
+            return self._derive_labels(lay, field, view)
+        cache = self._labels.get(lay.id)
+        if lay.id in self._label_tables:
+            # 整层表正在后台建（村界面约 4.5s，只付一次）；先画旧标注。
+            return cache if cache is not None and cache.get("field") == field else None
+        if self._vec_busy:
+            # 渲染线程正在读同一个源文件（宽视野下那是一次 3s 级别的整层读）。
+            # 标注也去读一遍只会让两边都变慢，先显示旧标注，等这一帧画完再重建。
+            if cache is not None and cache.get("field") == field:
+                return cache
+            return None
+        if self._label_cache_stale(lay, field, view):
+            self._labels_pending.add(lay.id)
+            if not self._label_timer.isActive():
+                self._label_timer.start()
+        if cache is not None and cache.get("field") == field:
+            return cache
+        return None
+
+    def _rebuild_labels(self) -> None:
+        """把过期图层的标注任务交给标注线程（防抖定时器回调，UI 线程只做派发）。"""
+        pending, self._labels_pending = self._labels_pending, set()
+        if not pending:
+            return
+        view = self._view_lonlat_rect()
+        # 缓存范围比视口大一圈：小幅平移不用重新取数
+        rect = self._pad_region(view, 1.4)
+        by_id = {l.id: l for l in self._layers_render_order()}
+        for lid in pending:
+            lay = by_id.get(lid)
+            if lay is None:
+                continue
+            c = self._cache.get(lid)
+            if c is not None and (c.bounds_pending or c.bounds_failed
+                                  or self._view_need(c) is None):
+                continue
+            st = self._layer_paint_style(lay)
+            field = st.get("label_field") or ""
+            if not field:
+                continue
+            if self._label_table_ok(lay, field):
+                self._derive_labels(lay, field, view)
+                continue
+            if self._label_table_eligible(lay):
+                if lid in self._label_tables:
+                    continue        # 整层表正在建，别拿视口任务把它顶掉
+                gen = self._labels_gen.get(lid, 0) + 1
+                self._labels_gen[lid] = gen
+                self._label_tables[lid] = gen
+                self._label_worker.submit(
+                    _LabelJob(lid, lay, field, None, gen, kind="table"))
+                continue
+            # 内存图层若被换出：先把几何读回主线程，别让标注线程去和渲染争同一个懒加载
+            if getattr(lay, "_gdf", None) is None and getattr(lay, "provider", None) is None:
+                try:
+                    lay.gdf
+                except Exception:  # noqa: BLE001
+                    pass
+            gen = self._labels_gen.get(lid, 0) + 1
+            self._labels_gen[lid] = gen
+            self._label_worker.submit(_LabelJob(lid, lay, field, rect, gen))
+
+    def _on_labels_ready(self, lid: str, gen: int, kind: str, payload) -> None:
+        """标注线程交回结果：世代/字段对不上就丢弃，否则缓存并重绘。"""
+        if self._label_tables.get(lid) == gen:
+            self._label_tables.pop(lid, None)
+        if gen != self._labels_gen.get(lid, 0):
+            return
+        field, rect, xy, texts, angles = payload
+        by_id = {l.id: l for l in self._layers_render_order()}
+        lay = by_id.get(lid)
+        if lay is None:
+            return
+        if (self._layer_paint_style(lay).get("label_field") or "") != field:
+            return
+        if kind == "table" and xy is not None:
+            # 整层锚点表：之后所有视口都从它派生，不再触发磁盘读
+            self._labels_anchors[lid] = {"field": field, "xy": xy,
+                                         "texts": texts, "angles": angles,
+                                         "rect": rect}
+            self._labels.pop(lid, None)
+            self._derive_labels(lay, field, self._view_lonlat_rect())
+            self.update()
+            return
+        if kind == "table":
+            # 表建失败（字段读不到/要素太多/被取消）：退回按视口取
+            self._labels_anchors.pop(lid, None)
+            self._labels_pending.add(lid)
+            if not self._label_timer.isActive():
+                self._label_timer.start()
+            return
+        self._labels[lid] = {"field": field, "rect": rect,
+                             "sig": self._label_sig(lay),
+                             "xy": xy, "texts": texts, "angles": angles}
+        self.update()
+
+
+    def _paint_labels(self, p: QPainter) -> None:
+        """在帧缓存之上画要素标注（屏幕坐标，带简单避让 + 白色描边）。"""
+        if self._frame is None or not self._vec_layers:
+            return
+        view = self._view_lonlat_rect()
+        for lay in self._layers_render_order():
+            if not self.visible.get(lay.id, True):
+                continue
+            st = self._layer_paint_style(lay)
+            cache = self._ensure_labels(lay, st, view)
+            if not cache:
+                continue
+            self._draw_label_set(p, cache, st)
+
+    def _draw_label_set(self, p: QPainter, cache: dict, st: dict) -> None:
+        xy = cache.get("xy")
+        texts = cache.get("texts") or []
+        if xy is None or len(texts) == 0:
+            return
+        try:
+            pts = xy.tolist()
+        except Exception:  # noqa: BLE001
+            pts = list(xy)
+        if not pts:
+            return
+        angles = cache.get("angles")
+        if angles is None or len(angles) != len(pts):
+            angles = [0.0] * len(pts)
+        size = max(8, int(st.get("label_size") or 11))
+        # 不用 "Microsoft YaHei UI"：某些精简字体环境/离屏渲染下该族名取不到字形，
+        # 标注会整片消失。"Microsoft YaHei" 在 Windows 上一定有。
+        font = QFont("Microsoft YaHei")
+        font.setPixelSize(size)
+        fm = QFontMetricsF(font)
+        # 文本宽度只跟字号有关：建缓存时算一次，平移/缩放每帧不用再量一遍
+        widths = cache.get("widths")
+        if widths is None or cache.get("width_size") != size or len(widths) != len(texts):
+            widths = [fm.horizontalAdvance(t) if t else 0.0 for t in texts]
+            cache["widths"] = widths
+            cache["width_size"] = size
+        th = fm.height()
+        ascent = fm.ascent()
+        color = QColor(st.get("label_color") or "#2b2a26")
+        halo = bool(st.get("label_halo", True))
+        p.save()
+        p.setRenderHint(QPainter.TextAntialiasing, True)
+        p.setFont(font)
+        # 简单避让：按 120×26 像素的格子分桶，只和相邻 9 格里的框比较
+        cell_w, cell_h = 120, 26
+        placed: dict[tuple[int, int], list[QRectF]] = {}
+        # 同名道路由很多短线段组成，不去重会把「机场路」在同一个路口标四遍。
+        # QGIS 用「合并相连线」解决，这里退一步：同名文本在屏幕上相距太近就不再画。
+        same_text_gap = 180.0
+        text_spots: dict[str, list[tuple[float, float]]] = {}
+        drawn = 0
+        w, h = float(self.width()), float(self.height())
+        for pos, text, tw, ang in zip(pts, texts, widths, angles):
+            if not text:
+                continue
+            sx = float(pos[0]) * self.scale + self.tx
+            sy = float(pos[1]) * self.scale + self.ty
+            if sx < -40 or sy < -40 or sx > w + 40 or sy > h + 40:
+                continue
+            spots = text_spots.get(text)
+            if spots is not None:
+                too_close = False
+                for px, py in spots:
+                    if abs(px - sx) < same_text_gap and abs(py - sy) < same_text_gap:
+                        too_close = True
+                        break
+                if too_close:
+                    continue
+            ang = float(ang)
+            if not math.isfinite(ang):
+                ang = 0.0
+            # 碰撞用旋转后文字的外接矩形（轴对齐）：斜路上的字实际占的是斜条，
+            # 用未旋转的宽度会和相邻标注误碰，用外接矩形则偏保守一点，和 QGIS
+            # 的「旋转几何求交」是同量级的近似。
+            if ang:
+                rad = math.radians(ang)
+                ca, sa = abs(math.cos(rad)), abs(math.sin(rad))
+                bw = tw * ca + th * sa
+                bh = tw * sa + th * ca
+            else:
+                bw, bh = tw, th
+            box = QRectF(sx - bw / 2, sy - bh / 2, bw, bh)
+            # 标注不能画到视口外：QGIS 也是整块放不下就不放，避免边上出现半截字
+            if (box.left() < -2 or box.top() < -2
+                    or box.right() > w + 2 or box.bottom() > h + 2):
+                continue
+            gi, gj = int(sx // cell_w), int(sy // cell_h)
+            near: list[QRectF] = []
+            for i in (gi - 1, gi, gi + 1):
+                for j in (gj - 1, gj, gj + 1):
+                    near.extend(placed.get((i, j), ()))
+            if any(box.intersects(r) for r in near):
+                continue
+            placed.setdefault((gi, gj), []).append(box)
+            if spots is None:
+                text_spots[text] = [(sx, sy)]
+            else:
+                spots.append((sx, sy))
+            p.save()
+            p.translate(sx, sy)
+            if ang:
+                p.rotate(ang)      # 正角 = 顺时针，和屏幕 atan2 的方向一致
+            bx = -tw / 2.0
+            by = -th / 2.0 + ascent
+            if halo:
+                # 描边用「四个方向偏移画一遍」：比 QPainterPath 轮廓更快，
+                # 也不依赖字体轮廓（offscreen/精简字体环境下轮廓可能取不到）。
+                off = max(1.0, size / 12.0)
+                p.setPen(QColor(255, 255, 255, 235))
+                for dx, dy in ((-off, 0.0), (off, 0.0), (0.0, -off), (0.0, off)):
+                    p.drawText(QPointF(bx + dx, by + dy), text)
+            p.setPen(color)
+            p.drawText(QPointF(bx, by), text)
+            p.restore()
+            drawn += 1
+            if drawn >= LABEL_CAP:
+                break
+        p.restore()

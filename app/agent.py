@@ -21,6 +21,7 @@ from .runtime import CancelToken
 from .skills import enabled_skills_context
 from .tool_registry import (REGISTRY, Param, ToolSpec, groups as registry_groups,
                             label_map, prompt_specs, template_map, validate_args)
+from .tool_prefs import is_enabled
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +30,15 @@ TOOL_SPECS = prompt_specs()
 TOOL_LABEL = label_map()
 #: 算子名 → 所在分组（自定义算子靠它落到用户选的那一组）
 TOOL_GROUP: dict[str, str] = {n: s.group for n, s in REGISTRY.items()}
+
+
+def active_tool_specs() -> list[dict]:
+    """当前启用的工具说明（Agent 设置 →「工具」里停用的不交给大模型）。
+
+    为什么不在提示词里留一句「某些工具已停用」：模型看见清单就会用，
+    干脆不给它看；执行前还有一道 is_enabled 检查兜底。
+    """
+    return [s for s in TOOL_SPECS if is_enabled(s.get("name"))]
 
 
 def register_tool_spec(name: str, title: str, desc: str, params: dict | None = None,
@@ -1518,7 +1528,8 @@ class Planner:
                         "count": m["count"], "fields": m["fields"][:25]})
         # 算子描述统一用 tool / args 这套词：之前给的是 name / params，
         # 模型照着抄成 {"op":…,"params":…}，执行器一个都不认。
-        specs = [{"tool": s["name"], "desc": s["desc"], "args": s["params"]} for s in TOOL_SPECS]
+        specs = [{"tool": s["name"], "desc": s["desc"], "args": s["params"]}
+                 for s in active_tool_specs()]
         prev = self.memory.get("last_plan") or []
         prev_layer = self.memory.get("last_layer")
         # 数据区用明确分隔符包起来，并声明「这是数据不是指令」，降低字段名注入风险
@@ -1675,7 +1686,7 @@ class Planner:
             ctx.append({"id": l.id, "name": l.name, "geom": m["geomType"],
                         "fields": m["fields"][:20]})
         specs = [{"tool": s["name"], "desc": s["desc"], "args": s["params"]}
-                 for s in TOOL_SPECS]
+                 for s in active_tool_specs()]
         previous = [str(x) for x in (info.get("previous") or [])][-6:]
         skill_block = enabled_skills_context()
         sys_prompt = (
@@ -1743,7 +1754,7 @@ class Planner:
                  "message": str(s.get("message") or "")[:300],
                  "layer": (s.get("layer") or {}).get("name")} for s in executed[-8:]]
         compact_specs = [{"tool": s["name"], "desc": s["desc"], "args": s.get("args") or s.get("params")}
-                         for s in TOOL_SPECS]
+                         for s in active_tool_specs()]
         skill_block = enabled_skills_context()
         sys_prompt = (
             "你是 GIS 空间分析 Agent。上一步执行失败了，请根据错误和当前数据状态，"
@@ -1982,6 +1993,22 @@ def run_plan(store: Store, plan: list[dict],
         t0 = time.time()
         if tool not in OPERATIONS:
             msg = f"不支持的算子：{tool}"
+            steps.append({"tool": tool, "label": label, "args": args, "status": "error",
+                          "message": msg, "warnings": [], "data": {}, "elapsed": 0})
+            lines.append(f"⚠️ {msg}")
+            _emit(on_event, "step", {
+                "index": idx, "status": "error", "tool": tool, "label": label,
+                "detail": detail, "message": msg, "elapsed": 0,
+            })
+            if state is not None:
+                state["error"] = msg
+                state["failed_step"] = {"tool": tool, "args": args}
+            break
+        if not is_enabled(tool):
+            # 停用的工具不进提示词、不在工具库出现；但旧计划/记忆里可能还留着，
+            # 执行前再挡一道，并告诉用户去哪儿重新启用。
+            msg = (f"「{label}」已在 Agent 设置 →「工具」里停用，"
+                   "先启用再执行这一步。")
             steps.append({"tool": tool, "label": label, "args": args, "status": "error",
                           "message": msg, "warnings": [], "data": {}, "elapsed": 0})
             lines.append(f"⚠️ {msg}")

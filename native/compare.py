@@ -9,7 +9,7 @@
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QPointF, Qt, QTimer
+from PySide6.QtCore import QEvent, QPointF, QRect, Qt, QTimer
 from PySide6.QtGui import QRegion
 from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QFormLayout,
                                QGraphicsOpacityEffect, QLabel, QMessageBox,
@@ -148,7 +148,11 @@ class MapCompareWidget(QWidget):
         self._guide = QWidget(self)
         self._guide.setObjectName("compareGuide")
         self._guide.setAttribute(Qt.WA_StyledBackground, True)
+        # 引导线只是视觉提示，别挡住手柄/地图的鼠标事件
+        self._guide.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self._guide.hide()
+        #: 卷帘模式上一次生效的蒙版左边界；用来算出需要重绘的竖条
+        self._swipe_x: int | None = None
 
         self._opacity = QGraphicsOpacityEffect(self.right)
         self._opacity.setOpacity(0.5)
@@ -266,6 +270,7 @@ class MapCompareWidget(QWidget):
         if self._flicker.isActive():
             self._flicker.stop()
         self._flicker_on = True
+        self._swipe_x = None
         try:
             self.left.show()
             self.right.show()
@@ -317,9 +322,7 @@ class MapCompareWidget(QWidget):
         elif self.mode == "swipe":
             self.left.setGeometry(r)
             self.right.setGeometry(r)
-            mw = r.width() - x
-            self.right.setMask(QRegion(x, 0, max(0, mw), r.height()) if mw > 0
-                               else QRegion())
+            self._apply_swipe_mask(x)
             self.handle.setCursor(Qt.SplitHCursor)
             self.handle.setGeometry(x - gap // 2, 0, gap, r.height())
             self.handle.show()
@@ -330,6 +333,43 @@ class MapCompareWidget(QWidget):
             self.handle.hide()
             self.right.raise_()
 
+    def _apply_swipe_mask(self, x: int) -> None:
+        """卷帘：把副图裁成 `x` 右侧的区域，并把变化的竖条重绘一遍。
+
+        为什么不能只 `setMask()`：蒙版变小（分隔条右移）时，露出来的是**下面**
+        主地图的区域，Qt/Windows 不会自动重绘那块旧像素，看到的就是「拖了
+        地图没反应」；而分隔条左移时副图自己变大，它会被重绘，所以只有往左
+        拖是「好」的。这里每次蒙版变化都把变化的那条竖带在主/副图上各
+        `update()` 一次（只是重贴缓存帧，代价很小）。
+        """
+        r = self.rect()
+        if r.width() < 2 or r.height() < 2:
+            return
+        x = max(0, min(r.width(), int(x)))
+        mw = r.width() - x
+        old = self._swipe_x
+        try:
+            if mw <= 0:
+                self.right.clearMask()
+                self.right.hide()
+            else:
+                if self.right.isHidden():
+                    self.right.show()
+                    self.right.raise_()
+                region = QRegion(x, 0, mw, r.height())
+                if region != self.right.mask():
+                    self.right.setMask(region)
+            if old is None:
+                self.left.update()
+                self.right.update()
+            elif old != x:
+                strip = QRect(min(old, x), 0, abs(x - old) + 2, r.height())
+                self.left.update(strip)
+                self.right.update(strip)
+        except Exception:  # noqa: BLE001
+            pass
+        self._swipe_x = x
+
     # ------------------------------------------------------------- 拖拽
     def _preview_handle(self) -> None:
         """拖动时只移动手柄和橙色引导线，不重排地图。"""
@@ -338,6 +378,10 @@ class MapCompareWidget(QWidget):
         if self.mode in ("horizontal", "swipe"):
             x = int(r.width() * self.split)
             x = max(40, min(r.width() - 40, x))
+            if self.mode == "swipe":
+                # 卷帘不改变两块地图的几何，只改蒙版：可以实时跟手，
+                # 而且不会有分屏模式那种「拖动时两套渲染线程打架」的问题。
+                self._apply_swipe_mask(x)
             self.handle.setGeometry(x - gap // 2, 0, gap, r.height())
             self._guide.setGeometry(x - 1, 0, 2, r.height())
         elif self.mode == "vertical":

@@ -3,12 +3,12 @@ from __future__ import annotations
 
 from typing import Callable
 
-from PySide6.QtCore import QSize, QThread, Qt, Signal
+from PySide6.QtCore import QPoint, QRect, QSize, QThread, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QMenu, QPlainTextEdit,
-                               QPushButton, QScrollArea, QSizePolicy, QStackedWidget,
-                               QTabBar, QTableWidget, QTableWidgetItem, QTextEdit,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLayout, QMenu,
+                               QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
+                               QStackedWidget, QTabBar, QTableWidget, QTableWidgetItem,
+                               QTextEdit, QVBoxLayout, QWidget)
 
 from .format import kv_text
 from .icons import panel_icon
@@ -79,6 +79,9 @@ class Worker(QThread):
 
 
 _ZWSP = "\u200b"
+# 输入框的两套占位文案：Agent 反问你的时候，提示要跟着变成「回答问题」
+_INPUT_HINT = "描述你要做的空间分析…（用 @ 指定图层）"
+_ASK_HINT = "直接回答上面的问题，或点一个选项…"
 # QLabel 的 wordWrap 只在「词边界」断行，连续的 ASCII 串（图层名、路径、数字）没有词边界，
 # 会整行溢出后被硬裁掉。这些字符后面补一个零宽空格，给排版器一个断点。
 _SOFT_AFTER = "_/()（）-·"
@@ -104,10 +107,104 @@ def _label(text: str, obj: str | None = None, wrap: bool = True,
     return lb
 
 
+class FlowLayout(QLayout):
+    """自动换行的流式布局。
+
+    给长短不一的按钮/标签用：横着排一长串必然超出容器宽度（右边被裁掉一半），
+    流式布局按容器宽度自动折行。
+
+    实现参考 Qt 官方 Flow Layout 示例。
+    """
+
+    def __init__(self, parent=None, margin: int = 0, h_spacing: int = -1,
+                 v_spacing: int = -1):
+        super().__init__(parent)
+        self._items: list = []
+        self._h_space = h_spacing
+        self._v_space = v_spacing
+        self.setContentsMargins(margin, margin, margin, margin)
+
+    def __del__(self):  # pragma: no cover - Qt 析构顺序
+        while self.count():
+            self.takeAt(0)
+
+    # -------------------------------------------------------- QLayout 接口
+    def addItem(self, item) -> None:  # noqa: N802
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int):  # noqa: N802
+        if 0 <= index < len(self._items):
+            return self._items[index]
+        return None
+
+    def takeAt(self, index: int):  # noqa: N802
+        if 0 <= index < len(self._items):
+            return self._items.pop(index)
+        return None
+
+    def expandingDirections(self):  # noqa: N802
+        return Qt.Orientation(Qt.Orientation(0))
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802
+        return True
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802
+        return self._layout(QRect(0, 0, width, 0), True)
+
+    def setGeometry(self, rect: QRect) -> None:  # noqa: N802
+        super().setGeometry(rect)
+        self._layout(rect, False)
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:  # noqa: N802
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        m = self.contentsMargins()
+        return size + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    # ---------------------------------------------------------------- 排版
+    def _layout(self, rect: QRect, test_only: bool) -> int:
+        m = self.contentsMargins()
+        area = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        x, y = area.x(), area.y()
+        line_h = 0
+        for item in self._items:
+            widget = item.widget()
+            hint = item.sizeHint()
+            space_x = self._h_space
+            space_y = self._v_space
+            if widget is not None:
+                style = widget.style()
+                if space_x < 0:
+                    space_x = style.layoutSpacing(QSizePolicy.PushButton,
+                                                 QSizePolicy.PushButton, Qt.Horizontal)
+                if space_y < 0:
+                    space_y = style.layoutSpacing(QSizePolicy.PushButton,
+                                                 QSizePolicy.PushButton, Qt.Vertical)
+            next_x = x + hint.width() + space_x
+            # 放不下就换行（第一行除外）
+            if next_x - space_x > area.right() and line_h > 0:
+                x = area.x()
+                y = y + line_h + space_y
+                next_x = x + hint.width() + space_x
+                line_h = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x = next_x
+            line_h = max(line_h, hint.height())
+        return y + line_h - rect.y() + m.bottom()
+
+
 class StepCard(QFrame):
     """一步算子的执行卡片：标题 / 说明 / 指标 / 告警 / 小表格 / 操作按钮。"""
 
-    def __init__(self, index: int, step: dict, win):
+    def __init__(self, index: int, step: dict, win, avail: int = 330):
         super().__init__()
         self.setObjectName("stepCard")
         self._win = win
@@ -144,11 +241,11 @@ class StepCard(QFrame):
         bl.setContentsMargins(17, 2, 2, 8)
         bl.setSpacing(5)
 
-        bl.addWidget(_label(step.get("message") or "", "stepBody", True, 330))
+        bl.addWidget(_label(step.get("message") or "", "stepBody", True, avail))
 
         kv = kv_text(step.get("data") or {})
         if kv:
-            bl.addWidget(_label(kv, "muted", True, 330))
+            bl.addWidget(_label(kv, "muted", True, avail))
 
         for w in step.get("warnings") or []:
             bl.addWidget(_label("⚠ " + w, "warnBox"))
@@ -210,15 +307,32 @@ class StepCard(QFrame):
         tw.verticalHeader().setVisible(False)
         tw.setEditTriggers(QTableWidget.NoEditTriggers)
         tw.setSelectionMode(QTableWidget.NoSelection)
+        tw.setFocusPolicy(Qt.NoFocus)
         tw.setShowGrid(False)
-        tw.setFixedHeight(26 + 22 * max(len(rows), 1))
-        tw.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        # 固定高度必须按「表头 + 每一行」实际高度算，不能按 26px 表头拍脑袋：
+        # QSS 的 QHeaderView padding + 字体实际会让表头到 34px，固定 48px 的
+        # 小表只给数据区留下 14px，行文字会被裁得几乎看不见（只剩表头）。
+        tw.verticalHeader().setDefaultSectionSize(22)
+        header_h = 26
+        tw.horizontalHeader().setFixedHeight(header_h)
+        # 横向策略用 Ignored：表格列宽是内容决定的，最小宽度往往超过面板，
+        # 一旦让它参与撑宽，整列消息（尤其右对齐的用户气泡）就会被顶出可视区。
+        # 列宽交给表格自己的横向滚动条，窄面板下也能看全。
+        tw.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         for r, row in enumerate(rows):
             for c, val in enumerate(row[:len(cols)]):
                 item = QTableWidgetItem("—" if val is None else str(val))
                 item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
                 tw.setItem(r, c, item)
         tw.resizeColumnsToContents()
+        # 行高由字体决定（setDefaultSectionSize 只是下限），所以最后按真实
+        # 行高加总，保证最后一行不会被表格底边裁掉。
+        if tw.rowCount():
+            tw.resizeRowsToContents()
+            rows_h = sum(tw.rowHeight(r) for r in range(tw.rowCount()))
+        else:
+            rows_h = 22
+        tw.setFixedHeight(header_h + rows_h + 2)
         return tw
 
 
@@ -251,11 +365,16 @@ class PlanCard(QFrame):
         "cancelled": "#b04a3f",
     }
 
-    def __init__(self, plan: list[dict], source: str = "", win=None):
+    def __init__(self, plan: list[dict], source: str = "", win=None, avail: int = 300):
         super().__init__()
         self.setObjectName("planCard")
         self._win = win
         self._rows: list[dict] = []
+        self._avail = max(160, int(avail))
+        # 横向不参与撑宽：计划卡里的文字再长，也不该把整列消息顶出可视区
+        pol = self.sizePolicy()
+        pol.setHorizontalPolicy(QSizePolicy.Ignored)
+        self.setSizePolicy(pol)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10, 8, 10, 8)
@@ -269,6 +388,7 @@ class PlanCard(QFrame):
         src = "大模型规划" if source in ("llm", "chat") else "规则规划"
         self._source = QLabel(src)
         self._source.setObjectName("planSource")
+        self._source_text = str(source or "")
         head.addWidget(self._source)
         head.addStretch(1)
         self._count = QLabel(f"0/{max(0, len(plan))} 完成")
@@ -322,8 +442,8 @@ class PlanCard(QFrame):
 
         info = QVBoxLayout()
         info.setSpacing(1)
-        name = _label(step.get("label") or step.get("tool") or "算子", "planName", True, 260)
-        detail = _label(self._detail_text(step), "planDetail", True, 300)
+        name = _label(step.get("label") or step.get("tool") or "算子", "planName", True, self._avail)
+        detail = _label(self._detail_text(step), "planDetail", True, self._avail)
         detail.setVisible(bool(detail.text()))
         info.addWidget(name)
         info.addWidget(detail)
@@ -413,6 +533,250 @@ class PlanCard(QFrame):
                    ("ok", "warn", "error", "skipped", "cancelled"))
         self._count.setText(f"{done}/{len(self._rows)} 完成")
 
+    @staticmethod
+    def _public_step(step: dict) -> dict:
+        """只留下能 JSON 序列化、回放计划卡需要的字段。
+
+        步进事件里可能带 ``gate``（StepConfirmGate）或 Qt 对象；直接
+        ``json.dumps(default=str)`` 虽然不会炸，但会把对象 repr 写进库，
+        下次恢复显示一堆 ``<... object at 0x...>``。
+        """
+        out = {}
+        for key in ("label", "tool", "detail", "args", "status", "elapsed",
+                    "message", "index", "warnings", "data", "layer"):
+            if key in step and step[key] is not None:
+                out[key] = step[key]
+        return out
+
+    def to_state(self) -> dict:
+        """保存给会话回放用：计划来源 + 每一行的最终状态。"""
+        return {"source": self._source_text,
+                "plan": [self._public_step(row["step"]) for row in self._rows]}
+
+
+def _restyle(*widgets) -> None:
+    """改完动态属性（state）后重新套样式；Qt 不会自动感知属性变化。"""
+    for w in widgets:
+        w.style().unpolish(w)
+        w.style().polish(w)
+        w.update()
+
+
+class _ClarifyOption(QFrame):
+    """问题卡里的一个可点选项：序号 + 会换行的正文。
+
+    选项文字经常是一整句中文（「加载北京市/区县行政区划图层，我再按范围裁剪或定位」），
+    做成小 chip 只能压成一行 11px 小字，换行之后还读不全。所以这里做成整行可点：
+    序号是「这是个可选项」的强提示，正文按面板宽度换行，多长的选项都读得完；
+    整行可点、可 Tab 聚焦、回车/空格确认。
+    """
+
+    def __init__(self, num: int, text: str, card: "ClarifyCard"):
+        super().__init__(card)
+        self.setObjectName("clarifyOption")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setProperty("state", "idle")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.text = str(text)
+        self._card = card
+        self._done = False
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(9, 7, 10, 7)
+        row.setSpacing(9)
+        self.num_lb = QLabel(str(num))
+        self.num_lb.setObjectName("clarifyNum")
+        self.num_lb.setAttribute(Qt.WA_StyledBackground, True)
+        self.num_lb.setProperty("state", "idle")
+        # 数字和正文都不吃鼠标：点哪儿都算点这一行，不会变成拖选文字
+        self.num_lb.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.num_lb.setAlignment(Qt.AlignCenter)
+        self.num_lb.setFixedSize(17, 17)
+        row.addWidget(self.num_lb, 0, Qt.AlignTop)
+        self.lb = _label(self.text, "clarifyOptText", True)
+        self.lb.setTextInteractionFlags(Qt.NoTextInteraction)
+        self.lb.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        row.addWidget(self.lb, 1)
+        self.setAccessibleName(f"选项 {num}：{self.text}")
+        self.setToolTip("点击选择这个答案（Tab 聚焦后按回车也可以）")
+
+    # 尺寸统一由 ClarifyCard.fit_width() 算：QLabel 的换行高度不会穿过布局传上去
+    def fit_width(self, text_w: int) -> None:
+        w = max(60, int(text_w))
+        self.lb.setFixedWidth(w)
+        h = max(16, self.lb.heightForWidth(w))
+        self.lb.setFixedHeight(h)
+        self.setFixedHeight(max(32, h + 14))
+
+    def set_state(self, state: str) -> None:
+        """idle / picked / muted（没被选中的那几项）。"""
+        for w in (self, self.num_lb, self.lb):
+            w.setProperty("state", state)
+        if state == "picked":
+            self.num_lb.setText("✓")
+        if state != "idle":
+            self._done = True
+            self.setCursor(Qt.ArrowCursor)
+            self.setFocusPolicy(Qt.NoFocus)
+            self.setToolTip("")
+        _restyle(self, self.num_lb, self.lb)
+
+    def _fire(self) -> None:
+        if self._done:
+            return
+        self._card._picked(self)
+
+    def mouseReleaseEvent(self, e) -> None:  # noqa: N802
+        if (e.button() == Qt.LeftButton and not self._done
+                and self.rect().contains(e.position().toPoint())):
+            self._fire()
+            e.accept()
+            return
+        super().mouseReleaseEvent(e)
+
+    def keyPressEvent(self, e) -> None:  # noqa: N802
+        if e.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+            self._fire()
+            e.accept()
+            return
+        super().keyPressEvent(e)
+
+
+class ClarifyCard(QFrame):
+    """Agent 反问你时的那张卡：一句问题 + 几个可点的备选答案。
+
+    以前问题是普通 agent 气泡，底下挂一排小 chip：看起来和普通回复没区别
+    （用户不知道在等自己）、长选项读不全、点完也没状态（手滑再点会重复发送）。
+    现在收成一张卡：状态标题、带序号的可点整行、点完立刻锁住并标记「已选」。
+
+    ``picked`` 在用户点选后发出；如果用户改用在输入框里回答，
+    由 ChatPanel 调 resolve() 把卡收掉，避免旧选项还留在那儿能点。
+    """
+
+    picked = Signal(str)
+    MAX_W = 560
+
+    def __init__(self, question: str, options: list[str],
+                 avail: int = 360):
+        super().__init__()
+        self.setObjectName("clarifyCard")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setProperty("state", "open")
+        self.awaiting = True
+        self.chosen: str | None = None
+        self._rows: list[_ClarifyOption] = []
+        self._box: QWidget | None = None
+
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(13, 11, 13, 11)
+        vl.setSpacing(8)
+
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(5)
+        self._dot = QLabel("●")
+        self._dot.setObjectName("clarifyDot")
+        self._dot.setProperty("state", "open")
+        head.addWidget(self._dot, 0, Qt.AlignVCenter)
+        self._kicker = QLabel("需要你确认")
+        self._kicker.setObjectName("clarifyKicker")
+        self._kicker.setProperty("state", "open")
+        head.addWidget(self._kicker)
+        head.addStretch(1)
+        vl.addLayout(head)
+
+        self.question_lb = _label(str(question), "clarifyQuestion", True)
+        vl.addWidget(self.question_lb)
+
+        if options:
+            box = QWidget()
+            bl = QVBoxLayout(box)
+            bl.setContentsMargins(0, 2, 0, 0)
+            bl.setSpacing(5)
+            for i, opt in enumerate(options[:6]):
+                row = _ClarifyOption(i + 1, opt, self)
+                self._rows.append(row)
+                bl.addWidget(row)
+            vl.addWidget(box)
+            self._box = box
+            hint = "点一个选项直接继续；也可以直接在下方输入框回答。"
+        else:
+            self._box = None
+            hint = "在下方输入框里回答即可。"
+
+        self.hint = _label(hint, "clarifyHint", True)
+        vl.addWidget(self.hint)
+        self.fit_width(avail)
+
+    # ------------------------------------------------------------------ 尺寸
+    def fit_width(self, avail: int) -> None:
+        """面板变宽变窄时重排：卡宽跟着走，正文按剩余宽度换行。"""
+        w = max(220, min(self.MAX_W, int(avail)))
+        self.setFixedWidth(w)
+        inner = w - 26                       # 左右内边距
+        self.question_lb.setFixedWidth(inner)
+        self.question_lb.setFixedHeight(max(16, self.question_lb.heightForWidth(inner)))
+        self.hint.setFixedWidth(inner)
+        self.hint.setFixedHeight(max(14, self.hint.heightForWidth(inner)))
+        text_w = inner - 9 - 10 - 17 - 9     # 行内边距 + 序号 + 间距
+        for row in self._rows:
+            row.fit_width(text_w)
+
+    # ------------------------------------------------------------------ 状态
+    def _picked(self, row: _ClarifyOption) -> None:
+        if not self.awaiting:
+            return
+        self.awaiting = False
+        self.chosen = row.text
+        for r in self._rows:
+            r.set_state("picked" if r is row else "muted")
+        self._finish("已确认", "已选好，正在按这个答案继续…")
+        self.picked.emit(row.text)
+
+    def resolve(self, option: str | None = None, note: str = "") -> None:
+        """不通过点选结束这一问（用户在输入框里回答了 / 被新问题取代）。"""
+        if not self.awaiting:
+            return
+        self.awaiting = False
+        self.chosen = option
+        for r in self._rows:
+            r.set_state("muted")
+        if self._box is not None and option is None:
+            # 用输入框答的：选项已经没意义了，收起来，别让一列灰按钮占着对话高度
+            self._box.hide()
+        self._finish("已回答", note or "这个问题已经处理过了。")
+
+    def _finish(self, kicker: str, hint: str) -> None:
+        self._kicker.setText(kicker)
+        self.hint.setText(hint)
+        for w in (self, self._dot, self._kicker):
+            w.setProperty("state", "done")
+        _restyle(self, self._dot, self._kicker)
+
+    def restore(self, chosen: str | None = None, state: str = "open",
+                note: str = "") -> None:
+        """从会话记录恢复一张历史问题卡，不再可点。
+
+        重启后没有 ``_pending_clarify``，所以不能把旧卡恢复成“等待回答”：
+        否则用户点一下会带着空上下文重新规划。已选过的答案按原样标绿，
+        没选过的统一收成“已回答 / 未回答”的只读状态。
+        """
+        self.awaiting = False
+        self.chosen = chosen or None
+        if chosen:
+            for row in self._rows:
+                row.set_state("picked" if row.text == chosen else "muted")
+            self._finish("已确认" if state == "picked" else "已回答",
+                         note or "这一问上次已经回答过了。")
+            return
+        for row in self._rows:
+            row.set_state("muted")
+        if self._box is not None and state in ("answered", "superseded"):
+            self._box.hide()
+        self._finish("已回答" if state == "answered" else "未回答",
+                     note or "上次会话没有完成这一问，可以重新描述需求。")
+
 
 class ChatPanel(QWidget):
     sent = Signal(str)
@@ -427,6 +791,8 @@ class ChatPanel(QWidget):
         self._mention_popup = None
         #: 当前 @ 的位置（-1 表示没有）
         self._mention_at = -1
+        #: 当前正等用户回答的问题卡（同一时间只允许一张可点）
+        self._clarify_card: ClarifyCard | None = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -517,6 +883,13 @@ class ChatPanel(QWidget):
         self.msg_layout.setContentsMargins(16, 14, 16, 10)
         self.msg_layout.setSpacing(14)
         self.msg_layout.addStretch(1)
+        # 消息容器**永远**只跟视口一样宽。
+        # QScrollArea 在 setWidgetResizable(True) 时是把容器撑到它自己的 sizeHint，
+        # 而不是视口宽度；只要有一条消息（澄清选项、步骤卡里的小表格…）报了个
+        # 很大的宽度，容器就会比视口宽，右半截被裁掉 —— 而用户气泡是右对齐的，
+        # 于是正好被裁出可视区，看上去就是「用户消息不显示」。
+        # 这里显式钉住最小宽度 0，剩下的交给下面每条消息的 Ignored 策略兜底。
+        self.msgs.setMinimumWidth(0)
         self.scroll.setWidget(self.msgs)
         cp.addWidget(self.scroll, 1)
         self.chat_stack.addWidget(chat_page)
@@ -557,20 +930,6 @@ class ChatPanel(QWidget):
         self.tool_activity.hide()
         fl.addWidget(self.tool_activity)
 
-        chip_scroll = QScrollArea()
-        chip_scroll.setFixedHeight(30)
-        chip_scroll.setWidgetResizable(True)
-        chip_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        chip_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        chip_host = QWidget()
-        self.chip_layout = QHBoxLayout(chip_host)
-        self.chip_layout.setContentsMargins(0, 0, 0, 0)
-        self.chip_layout.setSpacing(5)
-        self.chip_layout.addStretch(1)
-        chip_scroll.setWidget(chip_host)
-        fl.addWidget(chip_scroll)
-        self.chip_scroll = chip_scroll
-
         composer = QFrame()
         composer.setObjectName("composer")
         box = QVBoxLayout(composer)
@@ -578,7 +937,7 @@ class ChatPanel(QWidget):
         box.setSpacing(4)
         self.input = QTextEdit()
         self.input.setObjectName("chatInput")
-        self.input.setPlaceholderText("描述你要做的空间分析…（用 @ 指定图层）")
+        self.input.setPlaceholderText(_INPUT_HINT)
         self.input.setFixedHeight(38)
         self.input.installEventFilter(self)
         self.input.textChanged.connect(self._on_input_changed)
@@ -769,19 +1128,6 @@ class ChatPanel(QWidget):
         self.input.clear()
         self.sent.emit(text)
 
-    # ------------------------------------------------------------------ 内容
-    def set_suggestions(self, items: list[str]) -> None:
-        while self.chip_layout.count() > 1:
-            it = self.chip_layout.takeAt(0)
-            if it.widget():
-                it.widget().deleteLater()
-        for s in items[:8]:
-            b = QPushButton(s)
-            b.setObjectName("chip")
-            b.setCursor(Qt.PointingHandCursor)
-            b.clicked.connect(lambda _=False, t=s: (self.input.setPlainText(t), self.input.setFocus()))
-            self.chip_layout.insertWidget(self.chip_layout.count() - 1, b)
-
     def set_planner(self, text: str, ready: bool = False) -> None:
         self.planner_label.setText(text)
         self.planner_label.setObjectName("plannerOn" if ready else "muted")
@@ -869,6 +1215,8 @@ class ChatPanel(QWidget):
             self.tabs.setCurrentIndex(0)
 
     def clear(self) -> None:
+        self._clarify_card = None
+        self._set_awaiting(False)
         while self.msg_layout.count() > 1:
             it = self.msg_layout.takeAt(0)
             w = it.widget()
@@ -937,11 +1285,13 @@ class ChatPanel(QWidget):
         return max(150, w - 72)
 
     def _fit(self, frame) -> None:
-        base = 300 if frame._kind == "user" else 400
+        # 气泡宽度上限跟着面板走：面板拉宽后长消息应该更宽，而不是卡在 300/400。
+        avail = self._avail()
+        base = min(avail, 360) if frame._kind == "user" else min(avail, 520)
         lb = frame._label
         # 用「插过零宽空格」的文本量宽，才是真正要显示的宽度；字体取 label 自己的
         # （主题样式 polish 之前 self.fontMetrics() 还是默认字体，量出来偏小）
-        w = _bubble_size(lb.text(), lb.fontMetrics(), min(base, self._avail()))
+        w = _bubble_size(lb.text(), lb.fontMetrics(), max(120, base))
         frame.setFixedWidth(w + 26)
         lb.setFixedWidth(w)
         # 高度必须自己定：QLabel 的 heightForWidth 不会穿过中间那层布局传上去，
@@ -954,14 +1304,35 @@ class ChatPanel(QWidget):
         for f in self.msgs.findChildren(QFrame):
             if getattr(f, "_kind", None) in ("user", "agent"):
                 self._fit(f)
+        avail = max(200, self._avail() - 6)
+        for c in self.msgs.findChildren(ClarifyCard):
+            c.fit_width(avail)
 
     def resizeEvent(self, e) -> None:
         super().resizeEvent(e)
         self._reflow()
 
-    def add_user(self, text: str) -> None:
-        self.show_chat_tab()
+    @staticmethod
+    def _msg_row() -> QWidget:
+        """一条消息的外壳。
+
+        横向尺寸策略必须设成 Ignored：QScrollArea 会把消息容器撑到它自己的
+        sizeHint，只要有一条消息报了个很大的宽度（澄清选项、步骤卡里的小表格、
+        很长的引用），容器就会比视口宽，右半截被裁掉 —— 用户气泡是右对齐的，
+        于是正好被裁出可视区，看上去就是「用户消息不显示」。
+        """
         row = QWidget()
+        pol = row.sizePolicy()
+        pol.setHorizontalPolicy(QSizePolicy.Ignored)
+        row.setSizePolicy(pol)
+        return row
+
+    def add_user(self, text: str) -> None:
+        # 用户已经用输入框回答了（或者干脆换了话题）：把还挂着的问题卡收掉，
+        # 免得旧选项留在上面，过一会儿手滑又点出一个过期的回答。
+        self.resolve_clarify(None, "你已经在下方输入框里回答了这个问题。")
+        self.show_chat_tab()
+        row = self._msg_row()
         hl = QHBoxLayout(row)
         hl.setContentsMargins(0, 0, 0, 0)
         hl.addStretch(1)
@@ -970,7 +1341,7 @@ class ChatPanel(QWidget):
 
     def add_agent(self, text: str, steps: list[dict] | None = None) -> None:
         self.show_chat_tab()
-        wrap = QWidget()
+        wrap = self._msg_row()
         vl = QVBoxLayout(wrap)
         vl.setContentsMargins(0, 0, 0, 0)
         vl.setSpacing(7)
@@ -978,7 +1349,20 @@ class ChatPanel(QWidget):
         vl.addWidget(self._make_bubble(text, "agent"), 0, Qt.AlignLeft)
 
         for i, st in enumerate(steps or []):
-            vl.addWidget(StepCard(i, st, self._win))
+            vl.addWidget(StepCard(i, st, self._win, max(200, self._avail() - 26)))
+        self._append(wrap)
+
+    def add_steps(self, steps: list[dict]) -> None:
+        """只追加步骤结果卡（重启回放时文本和步骤可能分在不同 part）。"""
+        if not steps:
+            return
+        self.show_chat_tab()
+        wrap = self._msg_row()
+        vl = QVBoxLayout(wrap)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(7)
+        for i, st in enumerate(steps):
+            vl.addWidget(StepCard(i, st, self._win, max(200, self._avail() - 26)))
         self._append(wrap)
 
     def add_plan(self, card: PlanCard) -> None:
@@ -987,38 +1371,64 @@ class ChatPanel(QWidget):
         self._append(card)
 
     def add_clarify(self, question: str, options: list[str],
-                   on_pick: Callable[[str], None]) -> None:
-        """渲染澄清问题 + 可点选项。
+                   on_pick: Callable[[str], None]) -> ClarifyCard:
+        """渲染一张「需要你回答」的问题卡，点选项就等于回答了问题。
 
-        点一个选项就等于用户回答了这个问题——直接把选中的文本回填给 Agent，
-        让它带着答案重新规划（而不是让用户再打一遍）。
+        点选的文本会原样回填给 Agent，让它带着答案重新规划（而不是让用户再打一遍）；
+        也可以忽略选项、直接在输入框里回答 —— 那会通过 resolve_clarify() 把卡收掉。
+
+        同一时间只留一张可点的卡：后一个问题来了，前一张先标成「已被取代」。
         """
-        wrap = QWidget()
-        vl = QVBoxLayout(wrap)
-        vl.setContentsMargins(0, 0, 0, 0)
-        vl.setSpacing(6)
+        self.resolve_clarify(None, "这个问题已经被新的问题取代。")
+        self.show_chat_tab()
 
-        vl.addWidget(self._make_bubble(question, "agent"), 0, Qt.AlignLeft)
+        card = ClarifyCard(question, options, max(200, self._avail() - 6))
 
-        if options:
-            row = QWidget()
-            hl = QHBoxLayout(row)
-            hl.setContentsMargins(2, 0, 0, 0)
-            hl.setSpacing(5)
-            for opt in options[:6]:
-                b = QPushButton(str(opt))
-                b.setObjectName("chip")
-                b.setCursor(Qt.PointingHandCursor)
-                b.setToolTip(f"选择「{opt}」")
-                b.clicked.connect(lambda _=False, t=str(opt): on_pick(t))
-                hl.addWidget(b)
-            hl.addStretch(1)
-            vl.addWidget(row)
-        self._append(wrap)
+        def _relay(text: str) -> None:
+            if self._clarify_card is card:
+                self._clarify_card = None
+            self._set_awaiting(False)
+            on_pick(text)
+
+        card.picked.connect(_relay)
+        self._clarify_card = card
+        self._append(card)
+        self._set_awaiting(True)
+        # 这是等着用户动手的问题：就算他正翻着上面的历史，也把他带到问题这里，
+        # 否则消息沉在下面，状态栏提示一句「需要你确认」人却看不见问题。
+        self._stick = True
+        self._pin_bottom()
+        return card
+
+    def restore_clarify(self, card: ClarifyCard, chosen: str | None = None,
+                        state: str = "open", note: str = "") -> None:
+        """恢复历史问题卡并把它从“等待回答”状态里摘掉。"""
+        card.restore(chosen, state, note)
+        if self._clarify_card is card:
+            self._clarify_card = None
+        self._set_awaiting(False)
+
+    def resolve_clarify(self, option: str | None = None, note: str = "") -> None:
+        """把当前问题卡收成只读（用户用输入框回答 / 问题被新问题取代）。"""
+        card = self._clarify_card
+        if card is None:
+            return
+        self._clarify_card = None
+        card.resolve(option, note)
+        self._set_awaiting(False)
+
+    def _set_awaiting(self, on: bool) -> None:
+        """问题等着回答时，输入框的占位文案跟着变 —— 不然用户不知道该在哪儿答。"""
+        if not hasattr(self, "input"):
+            return
+        self.input.setPlaceholderText(_ASK_HINT if on else _INPUT_HINT)
 
     def add_typing(self) -> None:
         frame = QFrame()
         frame.setObjectName("agentBubble")
+        pol = frame.sizePolicy()
+        pol.setHorizontalPolicy(QSizePolicy.Ignored)
+        frame.setSizePolicy(pol)
         fl = QHBoxLayout(frame)
         fl.setContentsMargins(12, 8, 12, 8)
         self._typing_label = QLabel("正在规划并执行…")

@@ -79,6 +79,42 @@ def main() -> int:
     check("比例已变化", abs(m.split - old_split) > 0.05, True)
     check("左/右几何跟随", m.left.width() + m.right.width() <= m.width(), True)
 
+    print("[3b] 卷帘：拖动时蒙版实时跟手、露出的主图要重绘")
+    m._set_mode("swipe")
+    pump(app, 0.2)
+
+    def _want_x(ratio):
+        return max(40, min(m.width() - 40, int(m.width() * ratio)))
+
+    check("卷帘模式", m.mode, "swipe")
+    check("初始蒙版跟着当前比例",
+          abs(m.right.mask().boundingRect().left() - _want_x(m.split)) <= 2, True)
+    m.split = 0.8
+    m._preview_handle()
+    check("拖动中蒙版跟手（不是只在松手时更新）",
+          abs(m.right.mask().boundingRect().left() - _want_x(0.8)) <= 2, True)
+    # 蒙版变小（分隔条右移）时露出来的是下面主地图的旧像素：Qt/Windows 不会
+    # 自动重绘，肉眼就是「往右拖没反应」。必须显式 update 变化的那条竖带。
+    repaints = []
+    orig_update = m.left.update
+    m.left.update = lambda *a: (repaints.append(a), orig_update(*a))
+    try:
+        m.split = 0.85
+        m._preview_handle()
+    finally:
+        m.left.update = orig_update
+    check("蒙版右移后主图被要求重绘", len(repaints), 1)
+    check("重绘的是变化的竖条",
+          bool(repaints and repaints[0] and repaints[0][0].width() < m.width()), True)
+    m.split = 0.5
+    m._apply()
+    pump(app, 0.1)
+    check("回到 50% 蒙版复位",
+          abs(m.right.mask().boundingRect().left() - m.width() / 2) <= 2, True)
+    m._set_mode("horizontal")
+    pump(app, 0.15)
+    check("切回分屏清掉蒙版", m.right.mask().isEmpty(), True)
+
     print("[4] 视图同步")
     old = m.right.scale
     m.left.zoom_at(1.5, m.left.width() / 2, m.left.height() / 2)
