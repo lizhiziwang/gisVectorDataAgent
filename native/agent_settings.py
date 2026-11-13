@@ -1,28 +1,32 @@
-"""Agent 设置窗口：技能管理 + 工具库管理 + 每步确认开关。
+"""Agent 设置窗口：一个入口管全部配置。
 
-头部的「Agent 设置」打开这里；模型接口仍由原来的「模型设置」管理，
-本窗口只放 Agent 自己的行为配置，避免把两类配置混在一起。
+页签：模型（接口地址 / Key / 格式 / 测试连接）· 记忆（偏好 / 事实 / 工作流）·
+技能 · 工具库 · 通用（逐步确认、技能开关）。
+
+以前顶部标题栏还有「模型设置」「记忆」「大模型规划」三个独立按钮，现在都收进
+这个窗口 —— 标题栏只留一个「Agent 设置」，界面更安静，配置也只有一处可找。
 """
 from __future__ import annotations
 
 from PySide6.QtCore import QSize, Qt, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices
-from PySide6.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox, QFormLayout,
-                               QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-                               QListWidget, QListWidgetItem, QMessageBox,
-                               QPlainTextEdit, QPushButton, QTabWidget,
-                               QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QFrame,
+                               QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
+                               QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton,
+                               QScrollArea, QTabWidget, QTreeWidget, QTreeWidgetItem,
+                               QVBoxLayout, QWidget)
 
 from app import custom_ops
+from app import tool_prefs
 from app.agent import TOOL_LABEL, TOOL_SPECS
 from app.config import is_ready, load_cfg, save_cfg
 from app.skills import (SKILLS_DIR, Skill, delete_skill, ensure_dir, list_skills,
                         save_skill, set_skill_enabled)
 from app.tool_catalog import is_custom, tool_tree
 from app.tool_prefs import is_enabled
-from app.tool_registry import GROUP_CHOICES
 
-from .dialogs import OperatorDialog
+from .dialogs import ModelSettingsPage, OperatorDialog
+from .memory_panel import MemoryPage
 
 
 class SkillEditDialog(QDialog):
@@ -105,15 +109,15 @@ class SkillRow(QWidget):
 
 
 class AgentSettingsDialog(QDialog):
-    """Agent 自己的设置（和模型接口设置分开）。"""
+    """Agent 自己的设置：模型 / 记忆 / 技能 / 工具 / 通用，一个窗口全管。"""
 
     #: 工具被新增/删除/停用后通知主窗口：同步运行时状态并刷新左栏工具库。
     tools_changed = Signal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, memory=None, tab: str | None = None):
         super().__init__(parent)
         self.setWindowTitle("Agent 设置")
-        self.resize(680, 620)
+        self.resize(760, 700)
         self._pending: dict[str, bool] = {}
         #: 每个工具当前是否启用（值是「保存后」的状态，不是磁盘上的旧状态）
         self._tool_enabled: dict[str, bool] = {}
@@ -122,16 +126,26 @@ class AgentSettingsDialog(QDialog):
         self._painting_tool = False
         #: 点「新建工具」并且设置保存成功后置为 True，由主窗口接去走生成流程
         self.new_tool_requested = False
+        self._memory = memory
         cfg = load_cfg()
         vl = QVBoxLayout(self)
         vl.setContentsMargins(14, 12, 14, 12)
         vl.setSpacing(8)
-        tabs = QTabWidget()
-        tabs.setObjectName("agentSettingsTabs")
-        tabs.addTab(self._build_skills_tab(), "技能")
-        tabs.addTab(self._build_tools_tab(), "工具")
-        tabs.addTab(self._build_general_tab(cfg), "通用")
-        vl.addWidget(tabs, 1)
+        self.tabs = QTabWidget()
+        self.tabs.setObjectName("agentSettingsTabs")
+        self.model_page = None
+        self.memory_page = None
+        self._tab_index: dict[str, int] = {}
+        for key, title, widget in (
+                ("模型", "模型", self._build_model_tab(cfg)),
+                ("记忆", "记忆", self._build_memory_tab()),
+                ("技能", "技能", self._build_skills_tab()),
+                ("工具", "工具", self._build_tools_tab()),
+                ("通用", "通用", self._build_general_tab(cfg))):
+            self._tab_index[key] = self.tabs.addTab(widget, title)
+        if tab in self._tab_index:
+            self.tabs.setCurrentIndex(self._tab_index[tab])
+        vl.addWidget(self.tabs, 1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Ok).setText("保存")
@@ -139,6 +153,55 @@ class AgentSettingsDialog(QDialog):
         buttons.accepted.connect(self._save)
         buttons.rejected.connect(self.reject)
         vl.addWidget(buttons)
+
+    def closeEvent(self, e):  # noqa: N802
+        """关窗时收掉模型页的测试线程（不然退出阶段可能崩）。"""
+        if self.model_page is not None:
+            self.model_page.stop_test()
+        super().closeEvent(e)
+
+    @staticmethod
+    def _planner_status_text(cfg: dict) -> str:
+        if is_ready(cfg):
+            return f"● 大模型规划 · {cfg.get('model') or '已配置'}"
+        return "● 规则引擎 · 离线可用（接上模型后可以用更自由的说法）"
+
+    # ------------------------------------------------------------- 模型
+    def _build_model_tab(self, cfg: dict) -> QWidget:
+        w = QWidget()
+        vl = QVBoxLayout(w)
+        vl.setContentsMargins(2, 8, 2, 4)
+        vl.setSpacing(6)
+        self.model_status = QLabel(self._planner_status_text(cfg))
+        self.model_status.setObjectName("plannerOn" if is_ready(cfg) else "muted")
+        self.model_status.setToolTip("「● 大模型规划」表示下面的接口已启用且配置完整；"
+                                     "否则走离线的规则引擎")
+        vl.addWidget(self.model_status)
+        scroll = QScrollArea()
+        scroll.setObjectName("modelScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        self.model_page = ModelSettingsPage(cfg)
+        scroll.setWidget(self.model_page)
+        vl.addWidget(scroll, 1)
+        return w
+
+    # ------------------------------------------------------------- 记忆
+    def _build_memory_tab(self) -> QWidget:
+        if self._memory is None:
+            w = QWidget()
+            vl = QVBoxLayout(w)
+            vl.setContentsMargins(8, 12, 8, 8)
+            lab = QLabel("当前没有记忆库。\n\n"
+                         "记忆跟着本地会话库 data/agent.db 走；以正常桌面方式启动、"
+                         "有过对话之后，这里会列出 Agent 记住的偏好、项目事实和工作流。")
+            lab.setObjectName("muted")
+            lab.setWordWrap(True)
+            vl.addWidget(lab)
+            vl.addStretch(1)
+            return w
+        self.memory_page = MemoryPage(self._memory)
+        return self.memory_page
 
     # ------------------------------------------------------------- 技能
     def _build_skills_tab(self) -> QWidget:
@@ -518,7 +581,8 @@ class AgentSettingsDialog(QDialog):
             QMessageBox.warning(self, "工具", f"找不到「{name}」的源码文件，可能已被删除。")
             self._refresh_tools()
             return
-        dlg = OperatorDialog(spec, self, group_choices=GROUP_CHOICES, editing=True)
+        dlg = OperatorDialog(spec, self, group_choices=tool_prefs.group_choices(),
+                              editing=True)
         if dlg.exec() != QDialog.Accepted:
             return
         try:
@@ -527,6 +591,15 @@ class AgentSettingsDialog(QDialog):
         except Exception as e:  # noqa: BLE001
             QMessageBox.warning(self, "保存失败", str(e))
             return
+        # 编辑弹窗里可能刚「＋ 新建分组…」：立刻落盘，别等用户点这个窗口的「保存」
+        try:
+            cfg = load_cfg()
+            groups = tool_prefs.custom_groups()
+            if cfg.get("tool_groups") != groups:
+                cfg["tool_groups"] = groups
+                save_cfg(cfg)
+        except Exception:
+            pass
         # 改完重装后工具表里的中文名/说明/分组都变了，整棵树要重建；
         # 勾选状态仍按 name 保留（用户刚取消勾选、还没保存的情况不能被重置）。
         self._refresh_tools()
@@ -591,27 +664,20 @@ class AgentSettingsDialog(QDialog):
 
         vl.addStretch(1)
         model_row = QHBoxLayout()
-        model = QLabel(f"当前模型：{cfg.get('model') or '未配置'}")
+        model = QLabel("模型接口在「模型」页配置，记忆在「记忆」页管理。")
         model.setObjectName("muted")
+        model.setWordWrap(True)
         model_row.addWidget(model)
         model_row.addStretch(1)
-        b_model = QPushButton("打开模型设置…")
-        b_model.setObjectName("ghost")
-        b_model.clicked.connect(self._open_model_settings)
-        model_row.addWidget(b_model)
         vl.addLayout(model_row)
         return w
-
-    def _open_model_settings(self) -> None:
-        try:
-            from .dialogs import SettingsDialog
-            SettingsDialog(load_cfg(), self).exec()
-        except Exception as e:  # noqa: BLE001
-            QMessageBox.warning(self, "模型设置", str(e))
 
     # ------------------------------------------------------------- 保存
     def _save(self) -> bool:
         cfg = load_cfg()
+        # 模型页：接口地址 / Key / 格式 / 是否启用，一起写回 settings.json
+        if self.model_page is not None:
+            cfg.update(self.model_page.value())
         cfg["confirm_steps"] = bool(self.chk_confirm.isChecked())
         cfg["skills_enabled"] = bool(self.chk_skills.isChecked())
         disabled = set(str(x) for x in (cfg.get("skills_disabled") or []))
@@ -625,6 +691,8 @@ class AgentSettingsDialog(QDialog):
         # 工具停用：以树上的勾选状态为准整表重写，顺带把已删除工具的名字清掉
         cfg["tools_disabled"] = sorted(
             n for n, on in self._tool_enabled.items() if not on)
+        # 用户新建的工具分组：编辑工具时也可能刚建了一个，一并存下来
+        cfg["tool_groups"] = tool_prefs.custom_groups()
         try:
             save_cfg(cfg)
         except Exception as e:  # noqa: BLE001

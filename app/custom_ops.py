@@ -170,7 +170,8 @@ def _safe_name(name: str) -> str:
 
 def save(spec: dict) -> dict:
     """保存到 data/operators/<name>.json，返回补全后的 spec。"""
-    from .tool_registry import CUSTOM_GROUP, GROUP_CHOICES
+    from . import tool_prefs
+    from .tool_registry import CUSTOM_GROUP
     spec = dict(spec or {})
     spec["name"] = _safe_name(spec.get("name") or spec.get("title"))
     spec["title"] = (spec.get("title") or spec["name"]).strip()[:24]
@@ -178,9 +179,10 @@ def save(spec: dict) -> dict:
     spec["params"] = spec.get("params") or {}
     spec["code"] = spec.get("code") or ""
     spec["created"] = spec.get("created") or time.strftime("%Y-%m-%d %H:%M:%S")
-    # 分组：只认白名单里的组，没选或写错了就落「我的工具」
-    group = str(spec.get("group") or "").strip()
-    spec["group"] = group if group in GROUP_CHOICES else CUSTOM_GROUP
+    # 分组：内置分组 + 用户新建的分组（tool_prefs 里那份）都认，
+    # 没选或写错了就落「我的工具」，免得工具掉进没人看得见的地方
+    group = " ".join(str(spec.get("group") or "").split())
+    spec["group"] = group if group in tool_prefs.group_choices() else CUSTOM_GROUP
     check_code(spec["code"])
     OPS_DIR.mkdir(parents=True, exist_ok=True)
     (OPS_DIR / f"{spec['name']}.json").write_text(

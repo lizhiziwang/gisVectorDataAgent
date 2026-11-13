@@ -35,6 +35,12 @@ PALETTE = [
     "#3f7d8c", "#b04a5a", "#6b7a4f", "#8a6a4f", "#5a6b7d",
 ]
 
+#: 「背景类」算子：结果是给原图层做背景/参照的（缓冲区、融合、网格、合并、
+#: 凸包、泰森多边形），默认垫在图层栈最底下，免得一大块面把原图层盖住。
+#: 注意这只决定**新建时插在哪**；之后用户在图层面板里拖拽可以随意调整，
+#: 渲染顺序始终等于面板顺序（见 `Store.reorder`）。
+BACK_OPS = {"buffer", "dissolve", "grid", "merge", "convex_hull", "voronoi"}
+
 UNIT_TO_M = {"m": 1.0, "米": 1.0, "km": 1000.0, "公里": 1000.0, "千米": 1000.0,
              "cm": 0.01, "厘米": 0.01, "mm": 0.001, "毫米": 0.001,
              "ha": 10000.0, "公顷": 10000.0, "ft": 0.3048, "英尺": 0.3048}
@@ -61,6 +67,9 @@ class Layer:
     #: 元信息不读全量，渲染时按 bbox 从源文件取窗口。
     source_path: str | None = field(default=None, repr=False)
     source_layer: str | None = field(default=None, repr=False)
+    #: 数据库图层（PostGIS 表）：{conn, schema, table, geom_column, srid, ...}。
+    #: 有它就说明这一层的数据不在本地文件里，而是渲染时按视野向库里查。
+    db_spec: dict | None = field(default=None, repr=False)
     _provider: Any = field(default=None, repr=False, compare=False)
     _invalid: int | None = field(default=None, repr=False)
     _meta: dict | None = field(default=None, repr=False, compare=False)
@@ -71,7 +80,8 @@ class Layer:
                  source: str = "", parent: str = "", op: str = "",
                  created_at: float | None = None, _gdf=None, cache_path: str | None = None,
                  source_path: str | None = None, source_layer: str | None = None,
-                 _provider=None, style: dict | None = None):
+                 _provider=None, style: dict | None = None,
+                 db_spec: dict | None = None):
         self.id = id
         self.name = name
         self._gdf = _gdf if _gdf is not None else gdf
@@ -86,6 +96,7 @@ class Layer:
         self.cache_path = cache_path
         self.source_path = source_path
         self.source_layer = source_layer
+        self.db_spec = dict(db_spec) if db_spec else None
         self._provider = _provider
         self._invalid = None
         self._meta = None
@@ -94,20 +105,30 @@ class Layer:
 
     @property
     def provider(self):
-        """源文件 / 磁盘缓存 provider；打不开时返回 None。
+        """数据源 provider（本地文件 / 数据库）；打不开时返回 None。
 
         `_gdf is None` 很关键：用户已经显式把数据读进内存（算子结果、
         编辑中的图层）时仍用内存数据，不能被旧缓存覆盖。
+
+        `db_spec` 存在时造的是 `PostGISProvider`：不读本地文件，渲染时按
+        视野向库里查（库连不上就返回 None，图层凉但不崩）。
         """
         if self._provider is None and self._gdf is None:
-            path = self.source_path or self.cache_path
-            if path:
+            if self.db_spec:
                 try:
-                    from .vector_provider import VectorProvider
-                    layer = self.source_layer if self.source_path else None
-                    self._provider = VectorProvider(path, layer=layer)
+                    from .db_provider import provider_for
+                    self._provider = provider_for(self.db_spec)
                 except Exception:
                     self._provider = None
+            else:
+                path = self.source_path or self.cache_path
+                if path:
+                    try:
+                        from .vector_provider import VectorProvider
+                        layer = self.source_layer if self.source_path else None
+                        self._provider = VectorProvider(path, layer=layer)
+                    except Exception:
+                        self._provider = None
         return self._provider
 
     @property
@@ -281,6 +302,10 @@ class Store:
             name = f"{base}_{k}"
         lay = Layer(id=lid, name=name, gdf=gdf, color=kw.pop("color", color), **kw)
         self.layers[lid] = lay
+        if lay.op in BACK_OPS:
+            # 背景类算子垫底：字典顺序 = 渲染顺序（第一个最先画、压在最下面）。
+            # 之后用户在图层面板里拖到哪一层就以哪一层为准。
+            self.reorder([lid] + [k for k in self.layers if k != lid])
         # 先把 meta 算好：换出后 UI 仍然只读缓存，不会重新读盘
         try:
             lay.meta()
@@ -328,6 +353,37 @@ class Store:
             pass
         return lay
 
+    def add_db_source(self, spec: dict, name: str, **kw) -> Layer:
+        """登记一个数据库图层：只记「连接 + schema.表」，数据按视野现查。
+
+        和 `add_source()` 的区别只有数据来源：那边是本地文件（元信息读文件头），
+        这边连元信息都是加图层前探测好的（范围/字段/行数估计），
+        所以双击一张 500 万行的表也是「立刻就出现在图层面板里」，
+        真正的数据要等地图画到它、并且按当前视野去查时才动。
+        """
+        from .db_provider import PostGISProvider
+
+        lid = "D" + uuid.uuid4().hex[:8]
+        color = PALETTE[self._n % len(PALETTE)]
+        self._n += 1
+        existing = {l.name for l in self.layers.values()}
+        if name in existing:
+            base, k = name, 2
+            while f"{base}_{k}" in existing:
+                k += 1
+            name = f"{base}_{k}"
+        spec = dict(spec or {})
+        spec["layer_name"] = name
+        lay = Layer(id=lid, name=name, gdf=None,
+                    color=kw.pop("color", color), db_spec=spec,
+                    _provider=PostGISProvider(spec), **kw)
+        self.layers[lid] = lay
+        try:
+            lay.meta()
+        except Exception:
+            pass
+        return lay
+
     def add_raster(self, info, name: str, **kw):
         """加入一个栅格图层。
 
@@ -347,6 +403,24 @@ class Store:
         lay = RasterLayer(id=lid, name=name, info=info, color=kw.pop("color", color), **kw)
         self.layers[lid] = lay
         return lay
+
+    def reorder(self, layer_ids: list[str]) -> None:
+        """按给定顺序重排图层：**自下而上**，最后一项压在最上面。
+
+        图层面板从上到下就是「压在上面的 → 压在下面的」，面板把列表反过来
+        显示，所以面板拖拽只要把顺序倒过来交给这里即可。没提到的图层按原
+        相对顺序排到最后，未知 id 直接忽略 —— 宁可顺序不完美，也不丢图层。
+        """
+        known = [lid for lid in layer_ids if lid in self.layers]
+        seen = set(known)
+        rest = [lid for lid in self.layers if lid not in seen]
+        order = known + rest
+        if order == list(self.layers):
+            return
+        ordered = {lid: self.layers[lid] for lid in order}
+        # 原地改字典：别的地方可能还持有 `store.layers` 的引用
+        self.layers.clear()
+        self.layers.update(ordered)
 
     # ------------------------------------------------------------------ 高亮
     def set_highlight(self, layer_id: str, indices: list[int],

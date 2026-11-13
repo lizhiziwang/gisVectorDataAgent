@@ -9,12 +9,13 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout,
-                               QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
-                               QScrollArea, QSizePolicy, QTableWidget, QTableWidgetItem,
-                               QVBoxLayout, QWidget)
+                               QInputDialog, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
+                               QPushButton, QScrollArea, QSizePolicy, QTableWidget,
+                               QTableWidgetItem, QVBoxLayout, QWidget)
 
 from app import api_formats
 from app import conn_test
+from app import tool_prefs
 from app.gdb import gdb_layer_infos
 from app.io_utils import VECTOR_EXTS, extract_zip, file_info
 from app.online_map import METHOD_LABELS, TOKEN_KEY_PRESETS, validate_config
@@ -178,8 +179,8 @@ class TableDialog(QDialog):
         self.next.setEnabled(self._page < pages - 1)
 
 
-class SettingsDialog(QDialog):
-    """大模型设置：接口地址 / 密钥 / 模型 / **API 格式**。
+class ModelSettingsPage(QWidget):
+    """大模型设置表单：接口地址 / 密钥 / 模型 / **API 格式**。
 
     API 格式决定请求怎么拼、响应怎么取（见 `app/api_formats.py`）：
     OpenAI Chat Completions、OpenAI Responses、Anthropic Messages、
@@ -188,6 +189,9 @@ class SettingsDialog(QDialog):
 
     「测试连接」在后台线程里发一个最小请求，验证地址 / Key / 模型 / 格式对不对；
     失败时按状态码给出**具体是什么问题、怎么改**，而不是甩一段原始 JSON。
+
+    这一页是普通 QWidget：既当 Agent 设置里的「模型」页，也当独立窗口的主体
+    （见下面的 `SettingsDialog`），两种用法共用同一份表单项和校验逻辑。
     """
 
     #: 后台线程的结果回到主线程
@@ -206,7 +210,7 @@ class SettingsDialog(QDialog):
 
     def __init__(self, cfg: dict, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("模型设置")
+        self.setObjectName("modelSettingsPage")
         self.setMinimumWidth(520)
         #: 正在跑测试的线程 / 取消标志
         self._test_thread: threading.Thread | None = None
@@ -342,13 +346,6 @@ class SettingsDialog(QDialog):
         note.setObjectName("tiny")
         root.addWidget(note)
 
-        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        btns.button(QDialogButtonBox.Ok).setText("保存")
-        btns.button(QDialogButtonBox.Cancel).setText("取消")
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-        root.addWidget(btns)
-
         self.fmt.currentIndexChanged.connect(self._refresh_preview)
         self.adv.toggled.connect(self._on_adv_toggled)
         self.base.textChanged.connect(self._refresh_preview)
@@ -463,15 +460,18 @@ class SettingsDialog(QDialog):
             self.test_result.setText(f"✗ {res.message}")
         self.test_detail = res.detail
 
-    def closeEvent(self, e):  # noqa: N802
-        """关窗口时把后台测试收尾，避免线程在解释器退出阶段改界面。"""
+    def stop_test(self) -> None:
+        """停掉后台测试（窗口关闭 / 设置窗被销毁时调用）。
+
+        线程在解释器退出阶段还会活着的话，Qt 清理 adopted thread 时可能崩；
+        这里主动取消并等它一小会儿。
+        """
         self._test_timer.stop()
         if self._test_cancel is not None:
             self._test_cancel.set()
         t = self._test_thread
         if t is not None and t.is_alive():
             t.join(timeout=1.0)
-        super().closeEvent(e)
 
     def value(self) -> dict:
         overrides: dict = {}
@@ -497,6 +497,56 @@ class SettingsDialog(QDialog):
             "api_format": self.fmt.currentData() or api_formats.DEFAULT_FORMAT,
             "api_overrides": overrides,
         }
+
+
+class SettingsDialog(QDialog):
+    """独立的「模型设置」窗口：Agent 设置里的「模型」页是同一份表单。
+
+    保留这个窗口是因为有脚本 / 测试直接用 `SettingsDialog(cfg)`；主界面已经不再
+    单独挂按钮，入口在 Agent 设置里。`__getattr__` 把属性转发给页面，旧代码
+    （`dlg.btn_test`、`dlg.adv_open` 之类）不用改。
+    """
+
+    def __init__(self, cfg: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("模型设置")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 10)
+        outer.setSpacing(6)
+        self.page = ModelSettingsPage(cfg, self)
+        outer.addWidget(self.page, 1)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.button(QDialogButtonBox.Ok).setText("保存")
+        btns.button(QDialogButtonBox.Cancel).setText("取消")
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        row = QHBoxLayout()
+        row.setContentsMargins(16, 0, 16, 0)
+        row.addWidget(btns)
+        outer.addLayout(row)
+
+    def value(self) -> dict:
+        return self.page.value()
+
+    def __getattr__(self, name: str):
+        # 只在正常属性查找失败时才走到这里；初始化期间 page 可能还没建好。
+        page = self.__dict__.get("page")
+        if page is not None and hasattr(page, name):
+            return getattr(page, name)
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+
+    def __setattr__(self, name: str, value) -> None:
+        # 同 MemoryPanel：测试会直接改页面内部状态，转发过去才真的生效。
+        page = self.__dict__.get("page")
+        if (page is not None and not hasattr(type(self), name)
+                and hasattr(page, name)):
+            setattr(page, name, value)
+            return
+        super().__setattr__(name, value)
+
+    def closeEvent(self, e):  # noqa: N802
+        self.page.stop_test()
+        super().closeEvent(e)
 
 
 def _cand_detail(c: dict) -> str:
@@ -857,6 +907,80 @@ class ImportDataDialog(QDialog):
         super().done(result)
 
 
+class GroupCombo(QComboBox):
+    """「放进工具库哪一组」的下拉：内置分组 + 用户新建的，最后一项是「＋ 新建分组…」。
+
+    新建分组就地完成（弹一个输入框），名字登记到 `app.tool_prefs`；主窗口写完
+    工具后把它一起存进 settings.json。因此下一步的预览弹窗、左栏工具库、
+    Agent 设置 →「工具」页都能立刻看到这个新分组 —— 不必先建好工具才有分组。
+
+    下拉本身不可编辑：分组名是要长期显示的标题，随手打错字会留下一个再也
+    用不上的分组。想新建就点最后那项，名字会先过一遍校验。
+    """
+
+    NEW_ITEM = tool_prefs.NEW_GROUP_LABEL
+
+    def __init__(self, choices=None, initial: str = "", parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("toolGroupCombo")
+        for g in (choices if choices is not None else tool_prefs.group_choices()):
+            self.add_group_item(str(g))
+        self.addItem(self.NEW_ITEM)
+        pick = str(initial or "").strip()
+        if pick and self.findText(pick) >= 0:
+            self.setCurrentText(pick)
+        else:
+            self.setCurrentText(CUSTOM_GROUP)
+        self._last = self.currentText()
+        # activated 只在用户点选时触发，setCurrentText 不会误触「新建分组」；
+        # currentIndexChanged 负责记住「上一次真正选中的分组」，取消新建时回退到它。
+        self.activated.connect(self._on_activated)
+        self.currentIndexChanged.connect(self._on_index_changed)
+
+    # ------------------------------------------------------------------ 选项
+    def add_group_item(self, name: str) -> bool:
+        """插入一个分组（「＋ 新建分组…」始终留在最后）。重复 / 空名字返回 False。"""
+        name = str(name or "").strip()
+        if not name or name == self.NEW_ITEM or self.findText(name) >= 0:
+            return False
+        pos = self.count() - 1 if self.findText(self.NEW_ITEM) >= 0 else self.count()
+        self.insertItem(pos, name)
+        return True
+
+    def current_group(self) -> str:
+        """当前选中的分组名；停在「＋ 新建分组…」上时算没选（由调用方回落默认组）。"""
+        text = str(self.currentText() or "").strip()
+        return "" if text == self.NEW_ITEM else text
+
+    # ------------------------------------------------------------------ 新建
+    def _on_index_changed(self, _index: int) -> None:
+        text = str(self.currentText() or "").strip()
+        if text and text != self.NEW_ITEM:
+            self._last = text
+
+    def _on_activated(self, index: int) -> None:
+        text = self.itemText(index)
+        if text != self.NEW_ITEM:
+            self._last = text
+            return
+        name, ok = QInputDialog.getText(
+            self, "新建分组",
+            "分组名（会出现在左栏工具库和 Agent 设置的「工具」页）：\n"
+            f"最多 {tool_prefs.MAX_GROUP_NAME} 个字。")
+        if not ok:
+            self.setCurrentText(self._last or CUSTOM_GROUP)
+            return
+        try:
+            name = tool_prefs.add_group(name)
+        except ValueError as e:
+            QMessageBox.warning(self, "新建分组", str(e))
+            self.setCurrentText(self._last or CUSTOM_GROUP)
+            return
+        self.add_group_item(name)
+        self.setCurrentText(name)
+        self._last = name
+
+
 class NewToolDialog(QDialog):
     """「＋ 新建工具」的第一步：描述算法 + 选一个分组。
 
@@ -886,19 +1010,8 @@ class NewToolDialog(QDialog):
         self.editor.setMinimumHeight(150)
         root.addWidget(self.editor, 1)
 
-        # ---- 分组：放进工具库的哪一组
-        self.group_combo = QComboBox()
-        self.group_combo.setObjectName("toolGroupCombo")
-        choices = [str(g) for g in (group_choices or []) if str(g).strip()]
-        if CUSTOM_GROUP not in choices:
-            choices.append(CUSTOM_GROUP)
-        for g in choices:
-            self.group_combo.addItem(g)
-        cur = str(initial_group or "").strip()
-        if cur and self.group_combo.findText(cur) >= 0:
-            self.group_combo.setCurrentText(cur)
-        else:
-            self.group_combo.setCurrentText(CUSTOM_GROUP)
+        # ---- 分组：放进工具库的哪一组（最后一项可以就地新建分组）
+        self.group_combo = GroupCombo(group_choices, initial_group)
 
         grow = QHBoxLayout()
         grow.setContentsMargins(0, 0, 0, 0)
@@ -918,7 +1031,7 @@ class NewToolDialog(QDialog):
     def value(self) -> tuple[str, str]:
         """返回 (算法描述, 选中的分组)。"""
         return (self.editor.toPlainText().strip(),
-                str(self.group_combo.currentText() or "").strip() or CUSTOM_GROUP)
+                self.group_combo.current_group() or CUSTOM_GROUP)
 
 
 class OperatorDialog(QDialog):
@@ -971,20 +1084,8 @@ class OperatorDialog(QDialog):
             desc.setObjectName("muted")
             root.addWidget(desc)
 
-        # ---- 分组：放进工具库的哪一组
-        self.group_combo = QComboBox()
-        self.group_combo.setObjectName("toolGroupCombo")
-        # 候选 = 传入的分组 + 恒定的「我的工具」（没选时的默认落点）
-        choices = [str(g) for g in (group_choices or []) if str(g).strip()]
-        if CUSTOM_GROUP not in choices:
-            choices.append(CUSTOM_GROUP)
-        for g in choices:
-            self.group_combo.addItem(g)
-        cur_group = str(self.spec.get("group") or "").strip()
-        if cur_group and self.group_combo.findText(cur_group) >= 0:
-            self.group_combo.setCurrentText(cur_group)
-        else:
-            self.group_combo.setCurrentText(CUSTOM_GROUP)
+        # ---- 分组：放进工具库的哪一组（最后一项可以就地新建分组）
+        self.group_combo = GroupCombo(group_choices, str(self.spec.get("group") or ""))
         grow = QHBoxLayout()
         grow.setContentsMargins(0, 0, 0, 0)
         glab = QLabel("分组")
@@ -1048,7 +1149,7 @@ class OperatorDialog(QDialog):
         spec = dict(self.spec)
         spec["code"] = self.editor.toPlainText()
         # 分组：用户选了就用选的；下拉框为空（理论上不会）则回落到默认组
-        picked = str(self.group_combo.currentText() or "").strip()
+        picked = self.group_combo.current_group()
         spec["group"] = picked or CUSTOM_GROUP
         if self.editing:
             # 名称/说明可改，算子名不动：已有计划、记忆和调用链都按算子名找工具

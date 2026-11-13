@@ -113,6 +113,56 @@ def search_icon(size: int = 14) -> QIcon:
     return _icon(size, draw)
 
 
+def db_icon(size: int = 16, color: str = _INK) -> QIcon:
+    """数据库：圆柱（顶面 + 柱身 + 前面两道弧）。"""
+    def draw(p: QPainter) -> None:
+        pen = QPen(QColor(color), 1.15, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        body = QRectF(3.2, 1.9, 9.6, 3.2)
+        p.setPen(pen)
+        p.setBrush(QColor(_WARM))
+        p.drawEllipse(body)                       # 顶面
+        # 柱身：先填一块矩形，再补左右两条垂线和底部鼓出的半弧
+        p.setPen(Qt.NoPen)
+        p.drawRect(QRectF(3.2, 3.4, 9.6, 7.6))
+        p.setPen(pen)
+        p.drawLine(QPointF(3.2, 3.5), QPointF(3.2, 11.0))
+        p.drawLine(QPointF(12.8, 3.5), QPointF(12.8, 11.0))
+        p.drawArc(QRectF(3.2, 9.4, 9.6, 3.2), 180 * 16, 180 * 16)
+        p.drawArc(QRectF(3.2, 6.1, 9.6, 3.0), 180 * 16, 180 * 16)
+
+    return _icon(size, draw)
+
+
+def grid_icon(size: int = 14, color: str = _INK) -> QIcon:
+    """普通表（没有几何列）：外框 + 一横一竖两条格线。"""
+    def draw(p: QPainter) -> None:
+        p.setPen(QPen(QColor(color), 1.15, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(QRectF(2.4, 3.0, 11.2, 10.0), 1.4, 1.4)
+        p.drawLine(QPointF(2.6, 6.2), QPointF(13.4, 6.2))
+        p.drawLine(QPointF(6.6, 6.2), QPointF(6.6, 12.8))
+
+    return _icon(size, draw)
+
+
+def schema_icon(size: int = 14, color: str = _INK) -> QIcon:
+    """schema：一个方括号包着两行小横线（区别于文件式的 folder_icon）。"""
+    def draw(p: QPainter) -> None:
+        pen = QPen(QColor(color), 1.15, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawLine(QPointF(4.2, 2.6), QPointF(2.8, 2.6))
+        p.drawLine(QPointF(2.8, 2.6), QPointF(2.8, 13.4))
+        p.drawLine(QPointF(2.8, 13.4), QPointF(4.2, 13.4))
+        p.drawLine(QPointF(11.8, 2.6), QPointF(13.2, 2.6))
+        p.drawLine(QPointF(13.2, 2.6), QPointF(13.2, 13.4))
+        p.drawLine(QPointF(13.2, 13.4), QPointF(11.8, 13.4))
+        p.drawLine(QPointF(5.8, 6.0), QPointF(10.2, 6.0))
+        p.drawLine(QPointF(5.8, 10.0), QPointF(10.2, 10.0))
+
+    return _icon(size, draw)
+
+
 def plus_icon(size: int = 14, color: str = _INK) -> QIcon:
     def draw(p: QPainter) -> None:
         p.setPen(QPen(QColor(color), 1.35, Qt.SolidLine, Qt.RoundCap))

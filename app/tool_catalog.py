@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+from . import tool_prefs
 from .tool_prefs import is_enabled
 
 #: 一级「矢量」下的功能分组。自定义矢量工具按 TOOL_GROUP 归位。
@@ -67,17 +68,26 @@ def tool_tree(include_disabled: bool = False) -> list[tuple[str, list[tuple[str,
     custom = [n for n in OPERATIONS
               if n not in grouped and is_custom(n) and keep(n)]
     names_of_group = dict(TOOL_GROUPS)
+    # 用户「＋ 新建分组…」建的分组：id 就是组名，和内置分组共用一套归位逻辑
+    user_groups = tool_prefs.custom_groups()
     by_group: dict[str, list[str]] = {}
     mine: list[str] = []
     for n in custom:
         g = (TOOL_GROUP.get(n) or "").strip()
-        if g and g in names_of_group and n not in names_of_group[g]:
+        if g and (g in names_of_group or g in user_groups) and n not in names_of_group.get(g, ()):
             by_group.setdefault(g, []).append(n)
         else:
             mine.append(n)
     if by_group:
-        vector = [(title, names + by_group.get(title, []))
-                  for title, names in vector]
+        merged = {title: list(names) for title, names in vector}
+        for title, names in by_group.items():
+            if title in names_of_group or title in user_groups:
+                merged.setdefault(title, []).extend(names)
+        vector = [(title, names) for title, names in merged.items() if names]
+    # 用户分组按创建顺序排在「我的工具」前面
+    for g in user_groups:
+        if by_group.get(g):
+            vector.append((g, by_group[g]))
     if mine:
         vector.append((CUSTOM_GROUP, mine))
 

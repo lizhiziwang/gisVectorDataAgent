@@ -463,7 +463,7 @@ class Planner:
             if not has_data:
                 return ("你好！我是空间分析助手。\n"
                         "先把数据拖进来（shp 压缩包 / GeoJSON / GPKG / KML / CSV，"
-                        "或 GeoTIFF 栅格），或者点右上角「示例数据」先试一遍。")
+                        "或 GeoTIFF 栅格）。")
             n, brief, total = _layer_brief(self.store)
             return (f"你好！当前有 {n} 个图层（{brief}，共 {total:,} 要素）。\n"
                     "直接说需求就行，比如：\n"
@@ -493,7 +493,7 @@ class Planner:
                     "原始图层只读不改，每一步的结果都是新图层。")
             if has_data:
                 return body + f"\n\n当前可用图层：{brief}（共 {total:,} 要素）。"
-            return body + "\n\n现在还没有数据，先把文件拖进来或点右上角「示例数据」。"
+            return body + "\n\n现在还没有数据，先把文件拖进来。"
 
         return None
 
@@ -2125,8 +2125,7 @@ def run_agent(store: Store, planner: Planner, text: str, current: str | None,
                 return {"reply": reply, "steps": [], "lines": [], "planner": "llm",
                         "note": "", "clarify": None, "layers": []}
         return {"reply": small or ("还没有数据。先把数据拖进来（支持 shp 压缩包 / "
-                                   "GeoJSON / GPKG / KML / CSV / GeoTIFF 栅格），"
-                                   "或者点「载入示例数据」先试一遍。"),
+                                   "GeoJSON / GPKG / KML / CSV / GeoTIFF 栅格）。"),
                 "steps": [], "lines": [], "planner": "chat", "note": "", "clarify": None,
                 "layers": []}
 

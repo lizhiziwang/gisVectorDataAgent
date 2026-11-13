@@ -32,9 +32,11 @@ from __future__ import annotations
 
 import math
 import os
+import queue
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from concurrent.futures import Future
 
 import numpy as np
 
@@ -589,13 +591,133 @@ def _online_zoom(scale: float, cfg: dict) -> int:
     return max(lo, min(hi, z))
 
 
+#: 瓦片并发下载的线程数。渲染线程只负责解码和贴图，网络等待摊到这几条线程。
+#: 8 是天地图 / OSM 这类公共瓦片服务能稳定接受的同时连接数；再多容易被限速。
+TILE_FETCH_WORKERS = 8
+
+
+class _TileTask:
+    """一张待下载的瓦片：URL 与结果 Future。"""
+
+    __slots__ = ("url", "headers", "future")
+
+    def __init__(self, url: str, headers: dict | None) -> None:
+        self.url = url
+        self.headers = headers or {}
+        self.future = Future()
+
+
+class _TileFetcher:
+    """并发取瓦片字节的小线程池。
+
+    为什么不用 `ThreadPoolExecutor`：它的工作线程不是 daemon，解释器退出时会
+    join；某张瓦片卡在 6 s 超时里，关窗口就得陪着等。这里用 daemon 线程 +
+    队列，进程退出不被拖住，和 `_online_worker` 的 cancel 语义也对得上。
+
+    `submit()` 只入队，结果从 `future` 回来；贴图仍由渲染线程单线程完成
+    （QPainter 不能跨线程）。
+    """
+
+    def __init__(self, workers: int = TILE_FETCH_WORKERS) -> None:
+        self._workers = max(1, int(workers))
+        self._queue: queue.Queue = queue.Queue()
+        self._threads: list[threading.Thread] = []
+        self._lock = threading.Lock()
+
+    @property
+    def workers(self) -> int:
+        """线程数；调用方据此决定同时提交多少张。"""
+        return self._workers
+
+    def submit(self, url: str, headers: dict | None) -> _TileTask:
+        task = _TileTask(url, headers)
+        self._ensure_threads()
+        self._queue.put(task)
+        return task
+
+    def _ensure_threads(self) -> None:
+        with self._lock:
+            while len(self._threads) < self._workers:
+                name = "tile-fetch-%d" % (len(self._threads) + 1)
+                t = threading.Thread(target=self._run, name=name, daemon=True)
+                self._threads.append(t)
+                t.start()
+
+    def _run(self) -> None:
+        while True:
+            task = self._queue.get()
+            if task is None:
+                return
+            fut = task.future
+            # 视图已经切走：这张不发，队列里剩下的同理（cancel 后再判断）。
+            if not fut.set_running_or_notify_cancel():
+                continue
+            try:
+                data = fetch_bytes(task.url, headers=task.headers)
+            except BaseException:  # noqa: BLE001  后台线程不能把异常抛给解释器
+                data = None
+            try:
+                fut.set_result(data)
+            except Exception:  # noqa: BLE001  调用方已经 cancel 了这张
+                pass
+
+
+def _tile_workers() -> int:
+    """并发数：默认 `TILE_FETCH_WORKERS`，`GIS_AGENT_TILE_THREADS` 可覆盖。
+
+    服务端限流时把它调小（比如 2），网络很好时可以调到 16；上限夹 32，
+    免得一条 `export` 把浏览器同源并发策略之外的压力全砸给瓦片服务器。
+    """
+    env = os.environ.get("GIS_AGENT_TILE_THREADS", "").strip()
+    if env:
+        try:
+            return max(1, min(32, int(env)))
+        except ValueError:
+            pass
+    return TILE_FETCH_WORKERS
+
+
+_TILE_FETCHER: "_TileFetcher | None" = None
+_TILE_FETCHER_LOCK = threading.Lock()
+
+
+def tile_fetcher() -> _TileFetcher:
+    """进程级单例：所有在线图层共用这几条下载线程。"""
+    global _TILE_FETCHER
+    with _TILE_FETCHER_LOCK:
+        if _TILE_FETCHER is None:
+            _TILE_FETCHER = _TileFetcher(_tile_workers())
+        return _TILE_FETCHER
+
+
+def _wait_tile(task: _TileTask, cancel=None) -> bytes | None:
+    """等一张瓦片的结果，期间保持可取消（每 50 ms 看一次取消标志）。
+
+    不能用无超时的 `future.result()`：视图切走后渲染线程必须马上让路，
+    否则旧视图的慢瓦片会把新视图挡在后面。
+    """
+    fut = task.future
+    while True:
+        if _cancel_requested(cancel):
+            fut.cancel()
+            raise RasterCancelled()
+        try:
+            return fut.result(timeout=0.05)
+        except TimeoutError:
+            continue
+
+
 def _render_online_tiles(layer, cfg: dict, vp: RasterViewPort,
                          cancel=None, progress=None) -> QImage | None:
-    """XYZ / WMTS 瓦片：逐张取、逐张贴，每贴一张就回传当前快照。
+    """XYZ / WMTS 瓦片：并发下载、按扫描顺序贴图，每贴一张就回传当前快照。
 
     网络瓦片是一张一张到的；如果等全部到齐才返回整图，图层会长时间空白，
     还会让整条栅格管线以为这一层没画完。`progress` 回调让调用方每拿到一张
     就合成一次，先出半成品，最后一张到齐后再用完整图替换。
+
+    下载在 `_TileFetcher` 的几条线程上同时进行（一屏 12 张、每张 150 ms，
+    串行要 1.8 s，8 路并发只要约 300 ms），贴图仍在本线程按顺序做 ——
+    QPainter 不能跨线程，而瓦片之间不重叠，顺序贴出来的结果和串行一致。
     """
     template = str(cfg.get("url") or "")
     if not template:
@@ -627,37 +749,73 @@ def _render_online_tiles(layer, cfg: dict, vp: RasterViewPort,
     p = QPainter(out)
     p.setRenderHint(QPainter.SmoothPixmapTransform, True)
     drawn = 0
+    # 先把视口覆盖到的瓦片列成有序清单（扫描顺序 = 左上到右下），缓存命中的
+    # 直接拿图；没命中的入队并发下载。同时在飞的不超过 TILE_FETCH_WORKERS 张，
+    # 免得一屏几十张同时打到服务器被限速。
+    items: list[list] = []
+    for ty in range(y0, y1 + 1):
+        for tx in range(x0, x1 + 1):
+            url = append_query_params(
+                build_tile_url(template, z, tx, ty, subdomains=subdomains),
+                params)
+            key = _online_cache_key(url, headers)
+            items.append([tx, ty, key, url, ONLINE_CACHE.get(key)])
+
+    fetcher = tile_fetcher()
+    #: 在飞窗口 = 线程数：排队超过线程数只是把结果压在自己的队列里，没意义。
+    window = max(1, min(TILE_FETCH_WORKERS, fetcher.workers))
+    inflight: deque = deque()          # (清单下标, _TileTask)，按提交顺序
+    pos = 0
+    failed = False
+
+    def pump() -> None:
+        """把下载窗口补满（只提交未缓存、且线路还没出错的瓦片）。"""
+        nonlocal pos
+        while not failed and pos < len(items) and len(inflight) < window:
+            it = items[pos]
+            if it[4] is None:
+                inflight.append((pos, fetcher.submit(it[3], headers)))
+            pos += 1
+
+    def drop_inflight() -> None:
+        """放弃还没开始的下载（已经发出去的会自己结束，结果丢掉即可）。"""
+        while inflight:
+            _j, task = inflight.popleft()
+            task.future.cancel()
+
     try:
-        for ty in range(y0, y1 + 1):
-            for tx in range(x0, x1 + 1):
-                if _cancel_requested(cancel):
-                    raise RasterCancelled()
-                url = append_query_params(
-                    build_tile_url(template, z, tx, ty, subdomains=subdomains),
-                    params)
-                key = _online_cache_key(url, headers)
-                tile = ONLINE_CACHE.get(key)
-                if tile is None:
-                    data = fetch_bytes(url, headers=headers)
-                    if _cancel_requested(cancel):
-                        raise RasterCancelled()
-                    if not data:
-                        # 一个瓦片失败通常意味着整条线路不可用；不要为了
-                        # 几十个超时把一帧拖到几分钟。整张都没画出来时返回
-                        # None，不缓存空图，下次视图变化还能重试。
-                        return out if drawn else None
-                    tile = QImage()
-                    if not tile.loadFromData(data):
-                        return out if drawn else None
-                    ONLINE_CACHE.put(key, tile)
-                p.drawImage(QRectF(tx / n * vp.scale + vp.tx,
-                                   ty / n * vp.scale + vp.ty,
-                                   span, span), tile)
-                drawn += 1
-                if progress is not None:
-                    # 必须 copy：调用方要把这张图交给主线程显示，后台 painter
-                    # 还会继续往 out 上贴下一张瓦片。
-                    progress(out.copy())
+        for tx, ty, key, _url, tile in items:
+            if _cancel_requested(cancel):
+                raise RasterCancelled()
+            pump()
+            if tile is None:
+                # 清单按顺序提交，所以队头正好是当前这张。
+                _j, task = inflight.popleft()
+                data = _wait_tile(task, cancel)
+                if not data:
+                    # 一张瓦片失败通常意味着整条线路不可用：不再提交新的，
+                    # 已经贴上的先留着。整张都没画出来时返回 None，不缓存空图，
+                    # 下次视图变化还能重试。
+                    failed = True
+                    drop_inflight()
+                    return out if drawn else None
+                tile = QImage()
+                if not tile.loadFromData(data):
+                    failed = True
+                    drop_inflight()
+                    return out if drawn else None
+                ONLINE_CACHE.put(key, tile)
+            p.drawImage(QRectF(tx / n * vp.scale + vp.tx,
+                               ty / n * vp.scale + vp.ty,
+                               span, span), tile)
+            drawn += 1
+            if progress is not None:
+                # 必须 copy：调用方要把这张图交给主线程显示，后台 painter
+                # 还会继续往 out 上贴下一张瓦片。
+                progress(out.copy())
+    except RasterCancelled:
+        drop_inflight()
+        raise
     finally:
         p.end()
     return out if drawn else None

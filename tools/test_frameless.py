@@ -60,6 +60,64 @@ def main() -> int:
     print("[4] 尺寸手柄")
     check("右下角尺寸手柄", win.size_grip.isVisible(), True)
 
+    print("[5] 边框拖拽缩放（无边框窗口要自己回答 WM_NCHITTEST）")
+    from PySide6.QtCore import QPoint, QRect
+
+    from native.app import (EDGE_BOTTOM, EDGE_LEFT, EDGE_RIGHT, EDGE_TOP, RESIZE_MARGIN,
+                            edge_at, hit_test_code, msg_screen_point)
+
+    rect = QRect(360, 120, 1200, 800)
+
+    def at(x, y):
+        return hit_test_code(edge_at(QPoint(x, y), rect))
+
+    check("左边框", at(361, 500), 10)      # HTLEFT
+    check("右边框", at(1558, 500), 11)     # HTRIGHT
+    check("上边框", at(800, 121), 12)      # HTTOP
+    check("下边框", at(800, 918), 15)      # HTBOTTOM
+    check("左上角", at(361, 121), 13)      # HTTOPLEFT
+    check("右上角", at(1558, 121), 14)     # HTTOPRIGHT
+    check("左下角", at(361, 918), 16)      # HTBOTTOMLEFT
+    check("右下角", at(1558, 918), 17)     # HTBOTTOMRIGHT
+    check("窗口内部不是边框", at(800, 500), 0)
+    check("边框内侧 %dpx 仍是内部" % (RESIZE_MARGIN + 4),
+          at(360 + RESIZE_MARGIN + 4, 500), 0)
+    check("窗口外不算边框", at(100, 100), 0)
+    check("边掩码完整", (EDGE_LEFT, EDGE_RIGHT, EDGE_TOP, EDGE_BOTTOM), (1, 2, 4, 8))
+
+    # MSG.lParam 是物理像素、按 16 位有符号拆，负坐标（副屏在左边）不能错
+    class _Msg:
+        pass
+
+    m = _Msg()
+    m.lParam = ((500 & 0xFFFF) << 16) | (361 & 0xFFFF)
+    check("lParam 正坐标", (msg_screen_point(m).x(), msg_screen_point(m).y()), (361, 500))
+    m.lParam = ((500 & 0xFFFF) << 16) | (-1920 & 0xFFFF)
+    check("lParam 负坐标", msg_screen_point(m).x(), -1920)
+
+    # 窗口自己的命中计算：offsscreen 下没有真实 HWND，只验证几何判断
+    win.resize(1200, 800)
+    app.processEvents()
+    g = win.frameGeometry()
+    check("窗口左边命中", win._resize_edge(QPoint(g.left() + 1, g.top() + 300)),
+          EDGE_LEFT)
+    check("窗口中间不命中", win._resize_edge(QPoint(g.left() + 300, g.top() + 300)), 0)
+
+    if QApplication.platformName() == "windows":
+        import ctypes
+
+        user32 = ctypes.WinDLL("user32")
+        hwnd = int(win.winId())
+        lparam = lambda x, y: ((y & 0xFFFF) << 16) | (x & 0xFFFF)  # noqa: E731
+        got = user32.SendMessageW(hwnd, 0x0084, 0, lparam(g.left() + 1, g.top() + 300))
+        check("系统查询左边框", got, 10)
+        got = user32.SendMessageW(hwnd, 0x0084, 0, lparam(g.left() + 300, g.top() + 300))
+        check("系统查询窗口内部", got, 1)
+        style = user32.GetWindowLongPtrW(hwnd, -16)
+        check("补了 WS_THICKFRAME", bool(style & 0x00040000), True)
+    else:
+        print("  跳过  真实 HWND 命中（当前平台不是 windows，回归默认 offscreen）")
+
     win.close()
     win.deleteLater()
     app.processEvents()

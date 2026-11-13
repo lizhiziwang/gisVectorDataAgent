@@ -49,6 +49,15 @@ QFrame#resizeHandle {
     border-left: 1px solid #e7e3d8;
 }
 QFrame#resizeHandle:hover { background: #f0ece1; border-left: 1px solid #d97757; }
+/* 左栏「图层 / 工具库」之间的分隔条：平时就是那条 1px 细线，悬停才显形 */
+QSplitter#sideSplit::handle:vertical {
+    background: transparent;
+    border-top: 1px solid #e7e3d8;
+}
+QSplitter#sideSplit::handle:vertical:hover {
+    background: #f0ece1;
+    border-top: 1px solid #d97757;
+}
 QFrame#topbar { background: #faf9f5; border-bottom: 1px solid #e7e3d8; }
 QLabel#brandTitle { font-size: 14px; font-weight: 600; color: #1f1e1d; }
 QLabel#brandSub { font-size: 11px; color: #8d897e; }
@@ -137,6 +146,47 @@ QTabWidget#sideTabs QTabBar::tab:selected {
     border-bottom: 2px solid #b0522f;
 }
 QTabWidget#sideTabs QTabBar::tab:hover { color: #43413c; }
+
+/* ---- 左栏下半块：工具库 / 数据库页签（和上面一块同一套下划线样式） ---- */
+QTabWidget#dataTabs::pane { border: none; background: transparent; }
+QTabWidget#dataTabs QTabBar::tab {
+    background: transparent; color: #8a8578; border: none;
+    padding: 5px 10px 4px 10px; font-size: 11px;
+}
+QTabWidget#dataTabs QTabBar::tab:selected {
+    color: #1f1e1d; font-weight: 600;
+    border-bottom: 2px solid #b0522f;
+}
+QTabWidget#dataTabs QTabBar::tab:hover { color: #43413c; }
+
+/* ---- 左栏：数据库连接 ---- */
+QFrame#dbPanel { background: transparent; }
+QLabel#dbEmpty { color: #8a8578; font-size: 11px; }
+QToolButton#rowMenu {
+    border: none; background: transparent; color: #8a8578;
+    font-size: 14px; padding: 0px 3px; border-radius: 5px;
+}
+QToolButton#rowMenu:hover { background: #f2efe6; color: #43413c; }
+QLineEdit#dbFilter {
+    background: #f7f5ee; border: 1px solid #e7e3d8; border-radius: 6px;
+    padding: 4px 7px; font-size: 11px; color: #43413c;
+    min-height: 16px;
+}
+QLineEdit#dbFilter:focus { border-color: #c9bda8; }
+/* 树背景透明：左栏窄，浅色底上一块纯白会像「挖了个洞」，空的时候尤其明显 */
+QTreeWidget#dbTree {
+    background: transparent; border: none; font-size: 11px; outline: none;
+}
+QTreeWidget#dbTree::item { padding: 3px 2px; border: none; }
+QTreeWidget#dbTree::item:selected { background: #f1e7df; color: #1f1e1d; }
+QTreeWidget#dbTree::item:hover { background: #f4efe6; }
+QTreeWidget#dbTree QHeaderView { background: transparent; }
+QTreeWidget#dbTree QHeaderView::section {
+    background: transparent; border: none; border-bottom: 1px solid #e7e3d8;
+    color: #a8a395; font-size: 10px; padding: 2px 4px 3px 4px;
+}
+/* 底栏（读表上限 + 提示）用一条细线和树分开 */
+QFrame#dbFooter { background: transparent; border-top: 1px solid #e7e3d8; }
 QFrame#workspace { background: transparent; }
 QLineEdit#workspaceSearch {
     background: #f7f5ee; border: 1px solid #e7e3d8; border-radius: 6px;

@@ -158,6 +158,12 @@ def _register_output(store, path: Path, name: str, source: str, op: str):
     lay = store.add_raster(info, name, source=source, op=op)
     # 让 Store.remove/clear 能清掉这些派生文件；原始文件不会被设置这个字段
     lay.cache_path = str(path)
+    # 处理结果紧贴在源图层的上面：渲染顺序 = 图层面板顺序，否则结果会
+    # 藏在源栅格底下（以前栅格有固定的「结果最后画」顺序，现在没有了）。
+    if source in store.layers:
+        ids = [lid for lid in store.layers if lid != lay.id]
+        at = ids.index(source) + 1
+        store.reorder(ids[:at] + [lay.id] + ids[at:])
     return lay
 
 

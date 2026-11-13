@@ -150,8 +150,10 @@ def _stream_enabled(lay) -> bool:
     if env in ("0", "false", "no", "off"):
         return False
     try:
-        if (getattr(lay, "source_path", None) or getattr(lay, "cache_path", None)) \
-                and lay.provider is not None:
+        p = lay.provider
+        if p is not None and (getattr(lay, "source_path", None)
+                              or getattr(lay, "cache_path", None)
+                              or getattr(p, "live", False)):
             return True
     except Exception:
         pass
@@ -426,9 +428,9 @@ class _ComposeJob:
     """一次离屏合成请求（图层图 + 视口 + 显隐 + 顺序）。"""
 
     __slots__ = ("epoch", "sig", "view", "dpr", "w", "h",
-                 "raster_items", "vec_items", "mode")
+                 "items", "mode")
 
-    def __init__(self, epoch, sig, view, dpr, w, h, raster_items, vec_items,
+    def __init__(self, epoch, sig, view, dpr, w, h, items,
                  mode: str):
         self.epoch = epoch
         self.sig = sig
@@ -436,8 +438,9 @@ class _ComposeJob:
         self.dpr = dpr
         self.w = w
         self.h = h
-        self.raster_items = raster_items   # [(QImage, own_view)]
-        self.vec_items = vec_items         # [(QImage, own_view)]
+        #: 自下而上的图层图：[(是否栅格, QImage, own_view)]
+        #: 栅格和矢量在同一个列表里，顺序完全由图层列表决定（栅格不再强制垫底）
+        self.items = items
         self.mode = mode                   # force / auto / first
 
 
@@ -448,20 +451,12 @@ def _compose_job_image(job: _ComposeJob) -> QImage | None:
     img.fill(Qt.transparent)
     p = QPainter(img)
     try:
-        for rimg, own in job.raster_items:
-            if rimg is None:
+        for is_raster, limg, own in job.items:
+            if limg is None:
                 continue
             try:
-                MapView._blit_view_image(p, rimg, own, job.view, job.dpr,
-                                         device_size=True)
-            except Exception:  # noqa: BLE001
-                pass
-        for vimg, own in job.vec_items:
-            if vimg is None:
-                continue
-            try:
-                MapView._blit_view_image(p, vimg, own, job.view, job.dpr,
-                                         device_size=False)
+                MapView._blit_view_image(p, limg, own, job.view, job.dpr,
+                                         device_size=bool(is_raster))
             except Exception:  # noqa: BLE001
                 pass
     finally:
@@ -1340,6 +1335,10 @@ class MapView(QWidget):
         """
         if not c.stream or c.provider is None or c.lod_state:
             return
+        if getattr(c.provider, "live", False):
+            # 数据库图层：整层 LOD 缓存 = 按「全世界」bbox 把整表读一遍，
+            # 正是这次要消灭的动作。宽视野下数据库照样按视野过滤，不预读。
+            return
         if not self.visible.get(lay.id, True):
             return
         try:
@@ -2055,22 +2054,21 @@ class MapView(QWidget):
         dpr = self._device_pixel_ratio()
         w = max(1, int(self.width() * dpr))
         h = max(1, int(self.height() * dpr))
-        raster_items = []
-        if self._raster_imgs:
-            for lay in self._raster_layers:
-                if not self.visible.get(lay.id, True):
-                    continue
-                rimg = self._raster_imgs.get(lay.id)
-                if rimg is not None:
-                    raster_items.append((rimg, self._raster.view_of(lay.id)))
-        vec_items = []
-        for lay in self._layers_render_order():
+        # 自下而上叠：`self.layers` 的顺序就是面板顺序（最后一个压在最上面）。
+        # 栅格和矢量混在同一个列表里，这样把一张栅格拖到矢量上面才真的有效果。
+        items = []
+        for lay in self.layers:
             if not self.visible.get(lay.id, True):
                 continue
-            vimg = self._layer_imgs.get(lay.id)
-            if vimg is not None:
-                vec_items.append((vimg, self._layer_views.get(lay.id)))
-        job = _ComposeJob(epoch, sig, view, dpr, w, h, raster_items, vec_items, mode)
+            if getattr(lay, "is_raster", False):
+                rimg = self._raster_imgs.get(lay.id)
+                if rimg is not None:
+                    items.append((True, rimg, self._raster.view_of(lay.id)))
+            else:
+                vimg = self._layer_imgs.get(lay.id)
+                if vimg is not None:
+                    items.append((False, vimg, self._layer_views.get(lay.id)))
+        job = _ComposeJob(epoch, sig, view, dpr, w, h, items, mode)
         try:
             self._compose_worker.submit(job)
         except Exception:
@@ -2139,21 +2137,20 @@ class MapView(QWidget):
         # 于是矢量整片消失），并且 `p` 带着未配对的 save()/活跃画笔退出。
         # 现在逐层兜底 + finally 收笔，异常最多丢那一层，帧照常完整。
         try:
-            # ① 栅格先铺底（和 QGIS 一致：栅格通常在下，矢量叠上去）
-            if self._raster_imgs:
-                for lay in self._raster_layers:
-                    if not self.visible.get(lay.id, True):
-                        continue
-                    rimg = self._raster_imgs.get(lay.id)
-                    if rimg is not None:
-                        try:
-                            self._blit_view_image(p, rimg, self._raster.view_of(lay.id),
-                                                  view, dpr, device_size=True)
-                        except Exception:  # noqa: BLE001
-                            pass
-            # ② 矢量层按渲染顺序叠上去
-            for lay in self._layers_render_order():
+            # 自下而上逐层叠：栅格和矢量共用同一份图层顺序（面板顺序），
+            # 所以把栅格拖到矢量上面、或者把矢量拖到栅格下面都能立刻生效。
+            for lay in self.layers:
                 if not self.visible.get(lay.id, True):
+                    continue
+                if getattr(lay, "is_raster", False):
+                    rimg = self._raster_imgs.get(lay.id)
+                    if rimg is None:
+                        continue
+                    try:
+                        self._blit_view_image(p, rimg, self._raster.view_of(lay.id),
+                                              view, dpr, device_size=True)
+                    except Exception:  # noqa: BLE001
+                        pass
                     continue
                 img = self._layer_imgs.get(lay.id)
                 if img is not None:
@@ -2390,11 +2387,14 @@ class MapView(QWidget):
 
     # ------------------------------------------------------------------ 构建
     def _layers_render_order(self) -> list:
-        back = {"buffer", "dissolve", "grid", "merge", "convex_hull", "voronoi"}
-        # 只排矢量层：栅格由 RasterPipeline 自己管顺序，不参与这里的「背景算子置底」规则
-        idx = {id(l): i for i, l in enumerate(self._vec_layers)}
-        return sorted(self._vec_layers,
-                      key=lambda l: (0 if l.op in back else 1, idx[id(l)]))
+        """矢量图层的渲染顺序（自下而上）= 图层列表顺序。
+
+        以前这里把 buffer / dissolve / grid 这类「背景算子」强制置底，以免
+        一大块缓冲面盖住原图层；现在顺序由用户在图层面板里拖拽决定，
+        背景算子改在 `Store.add()` 时插到最底下（默认效果不变），
+        所以这里只需要照抄图层顺序，拖拽才不会有「拖了不生效」的层。
+        """
+        return list(self._vec_layers)
 
     def _build_pending(self) -> bool:
         """还有几何构建没做完吗（数据在解析、或者分片构建定时器还活着）。
@@ -3549,7 +3549,7 @@ class MapView(QWidget):
             p.setFont(QFont("Microsoft YaHei UI", 9))
             p.setPen(QColor("#a9a396"))
             p.drawText(rect.adjusted(0, 18, 0, 18), Qt.AlignCenter,
-                       "拖入 Shapefile / GeoJSON / GeoTIFF，或点右上角「示例数据」")
+                       "拖入 Shapefile / GeoJSON / GeoTIFF，或点左栏的导入区")
         else:
             # 图层已载入但几何还在构建：给出明确提示，而不是一片空白
             p.setPen(QColor("#8d897e"))

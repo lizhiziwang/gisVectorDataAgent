@@ -20,3 +20,11 @@ Thumbs.db
 *.tmp
 *.bak
 ~$*
+
+# ---- 文档配图 / 本地调试产物（docs/*.md 仍然入库）----
+docs/perf/
+.workbuddy/
+tools/_probe_*.py
+tools/probe_*.py
+tools/_tmp_*
+samples/raster/

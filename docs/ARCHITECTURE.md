@@ -3,7 +3,8 @@
 这份文档讲三件事：**代码放在哪**、**一帧地图是怎么画出来的**、**一句话需求是怎么变成图层的**。
 细节都在代码注释里，这里只写「为什么这么设计」和「改动时必须守住什么」。
 
-- 主程序入口：`native_app.py` → `native/app.py::MainWindow`
+- 主程序入口：`native_app.py`（QApplication → 启动画面 → `native/app.py::MainWindow`）
+- 启动画面：`native/splash.py`；图标几何在 `native/branding.py`（窗口图标 / 任务栏 / 启动画面共用）
 - 渲染核心：`native/mapview.py`（2000+ 行，全项目最重的文件）
 - 规划与执行：`app/agent.py` → `app/engine.py`
 
@@ -13,7 +14,7 @@
 
 ```
 gis-agent/
-├── native_app.py            桌面版入口（创建 QApplication + MainWindow）
+├── native_app.py            桌面版入口（创建 QApplication + 启动画面 + MainWindow）
 ├── 启动.bat / 调试启动.bat    Windows 双击启动（后者带控制台，便于看报错）
 ├── requirements.txt         依赖清单（核心 / 桌面界面 / 栅格 / 可选补充）
 ├── preview.png              README 首图
@@ -27,8 +28,9 @@ gis-agent/
 │   ├── agent.py             两级规划器（规则 / 大模型）+ Agent 闭环 + 计划预检 + 算子签名表
 │   ├── tool_registry.py     算子契约单一事实源：参数 schema / 模板 / 分组 / 校验
 │   ├── tool_catalog.py      工具库分类清单（矢量/栅格 → 功能分组），左栏与设置页共用
-│   ├── tool_prefs.py        工具启用/停用运行时状态（左栏、模型候选、执行前检查共用）
+│   ├── tool_prefs.py        工具启用/停用运行时状态 + 用户自建分组（左栏、模型候选、执行前检查共用）
 │   ├── online_map.py        在线地图：校验 + Token/参数/请求头 + XYZ/WMTS/WMS URL（不依赖 Qt/GDAL）
+│   ├── db_conn.py           数据库连接（PostgreSQL/PostGIS）：连接描述 + 测试 + 表清单 + 取数（不依赖 Qt/GDAL）
 │   ├── custom_ops.py        自定义算子：AST 白名单校验、受限执行、落盘与装载
 │   ├── io_utils.py          读写矢量数据：编码择优、zip 解压、导出 4 种格式
 │   ├── vector_provider.py   矢量 provider：文件头元信息 + 按 bbox 从源文件取要素（属性按 Arrow 批）
@@ -40,17 +42,21 @@ gis-agent/
 │
 ├── native/                  纯 Qt 桌面界面（QWidget + QPainter，无 WebView）
 │   ├── app.py               主窗口：三栏布局、图层面板、算子面板、状态栏、撤销栈、载入队列
+│   ├── splash.py            启动画面：自绘卡片 + 真实阶段进度 + 淡出（在 app.exec() 之前自旋推帧）
+│   ├── branding.py          应用图标几何与绘制（窗口图标 / 任务栏 / 启动画面共用一份顶点）
 │   ├── mapview.py           自绘地图 + 矢量渲染管线（渲染集、渲染线程、缓存、拾取、选区）
 │   ├── vectorstream.py      大图层屏幕范围流式渲染（分块建路径，不缓存整层路径）
 │   ├── compare.py           地图对比容器（左右/上下分屏、卷帘、透明度、闪烁、视图同步）
-│   ├── agent_settings.py    Agent 设置窗口（技能管理 / 工具库管理 / 每步确认开关 / 模型设置入口）
+│   ├── agent_settings.py    Agent 设置窗口（模型 / 记忆 / 技能 / 工具库 / 逐步确认五个页签）
 │   ├── rasterview.py        独立栅格渲染管线（RasterViewPort / 线程 / 缓存 / 拉伸）
 │   ├── proj.py              两条管线共用的 Web Mercator 投影函数
 │   ├── chat.py              对话面板：对话/轨迹、任务胶囊、工具状态、模型选择器、统计、计划卡、步骤卡片
 │   ├── workspace.py         左栏工作区：gis-agent → 未分组 → 会话 / 会话图层引用
+│   ├── dbpanel.py           左栏「数据库」页签：连接列表 + 新建/编辑/测试 + 选表（读表写 GeoParquet）
 │   ├── pyramid.py           栅格 overview 检测 + GDAL C API 生成 .ovr（QThread 进度）
 │   ├── taskcenter.py        地图顶部任务通知（TaskNotice）+ 旧面板测试用 TaskCenter
-│   ├── dialogs.py           属性表（分页/排序/筛选）、模型设置、多图层导入、算子确认、在线地图配置
+│   ├── dialogs.py           属性表（分页/排序/筛选）、模型设置页、多图层导入、算子确认、在线地图配置
+│   ├── memory_panel.py      记忆管理页：分组树、置顶 / 编辑 / 删除 / 清空、JSON 导入导出
 │   ├── style_dialog.py      图层样式弹窗：矢量符号 + 要素标注 + 栅格显示参数，带实时预览
 │   ├── labels.py            要素标注取数：视口锚点 + 文本；无索引源文件走整层锚点表
 │   ├── theme.py             全局 QSS（暖白底 + 陶土橙，参照 Claude Code 桌面端）
@@ -68,10 +74,11 @@ gis-agent/
 │   ├── test_gdb.py          FileGDB 多要素类导入 / ZIP / 桌面端接线
 │   ├── shot_window.py       整窗截图（真字体路径，用于 README 配图）
 │   ├── shot_tools.py        左栏截图 + 分组几何打印
+│   ├── shot_splash.py       启动画面各阶段截图（开场 / 会话 / 工作台 / 就绪）
 │   ├── make_icon_assets.py  由绘制代码生成 icon.png / icon.ico
 │   └── test_*.py            回归：渲染/显隐/对话/步骤卡/自定义算子/交互/滚动/不阻塞
 │
-├── samples/                 内置示例（GeoJSON，首次打开由「示例数据」按钮载入）
+├── samples/                 内置示例（GeoJSON，直接拖进窗口就能演示）
 └── docs/
     ├── perf/                验证截图与性能对照图（README 里引用）
     └── qgis-ref/            对照用的 QGIS 头文件（QgsSimplifyMethod 等）
@@ -89,6 +96,19 @@ gis-agent/
 `app/` 里**不出现任何 Qt 的 import**——这是刻意的：引擎层保持无界面依赖，可以独立测试，
 界面只负责展示与交互。反过来 `native/` 也不直接调 geopandas 做运算，只调 `app.engine`。
 
+**启动链路**（`native_app.py`）：`QApplication` → 启动画面开场 → 导入 `native.app`
+（约 1 秒的 geopandas / shapely）→ `MainWindow(on_stage=…)` → 窗口显示 → 启动画面淡出。
+两个要守住的点：
+
+- **QApplication 必须排在 `native.app` 导入前面**：启动画面只有拿到 QApplication 才立得起来，
+  否则那 1 秒的导入期间屏幕上什么都没有；顺带让 rasterio/GDAL 排在 Qt 之后
+  （Windows 上反过来会 access violation，见 `tools/test_raster.py` 顶注）。
+- **启动画面只在入口接，不进 `MainWindow.__init__`**：`tools/` 下几十个回归脚本都直接
+  `MainWindow()`，动画属于「进程入口」的事。`native/splash.py` 的开场与收尾是自旋帧循环
+  （`repaint()` + `processEvents()`），因为这段代码跑在 `app.exec()` 之前，没有事件循环
+  可依赖；而 `on_stage` 回调在构建期间**只 `repaint()`、不跑事件队列** —— 构建中的窗口
+  不能处理后台线程发来的信号。
+
 ---
 
 ## 2. 数据模型
@@ -97,9 +117,16 @@ gis-agent/
 Layer(id, name, gdf, color, op, source, parent)   # 一个矢量图层 = GeoDataFrame + 元信息
                                                    # 源文件图层可带 source_path，gdf 保持懒加载
 RasterLayer(id, name, info, color, op, source, online=None)  # 本地栅格只存文件头；在线地图存 URL/方式/Token/参数
-Store.layers: dict[str, Layer | RasterLayer]      # 有序字典，顺序即渲染顺序
+Store.layers: dict[str, Layer | RasterLayer]      # 有序字典，自下而上，顺序即渲染顺序
 Result(ok, message, layer=None, warnings=[], data={})   # 每个算子的返回
 ```
+
+图层面板从上到下显示的是 `reversed(Store.layers)`：**面板第一行 = 压在最上面**，
+拖拽行 / 右键「顺序」改的都是这一份顺序（`Store.reorder`）。栅格和矢量混在
+同一份顺序里，所以把影像拖到矢量上面就真的盖住矢量；新建时 `BACK_OPS`
+（缓冲区/融合/网格…）插到最底下，导入的栅格插在所有栅格之上、矢量之下，
+保持以前的默认观感。旧会话（没有 `layer_order: 2` 标记）恢复时按旧渲染
+顺序迁移一次（栅格 → 背景算子 → 其它矢量），画面不变。
 
 `RasterLayer` 是**鸭子类型**：字段形状对齐 `Layer`，但访问 `.gdf` 会抛中文
 `RasterError`——这样图层面板/缩放/显隐/导出不用分叉，而误用矢量算子时
@@ -475,6 +502,11 @@ GPKG / FileGDB / FlatGeobuf / 有 `.qix` 的 Shapefile 按视口读本来就是�
   → `MapView._on_raster_progress` 立即合成 provisional 帧；`RasterPipeline`
   不把中间图写进完整帧缓存，最后一张到齐后才走 `layerReady`/`frameDone`。
   在线瓦片还走**独立线程** `_online_worker`，本地栅格不会被下载中的底图堵住；
+  一屏内的瓦片字节由 `_TileFetcher`（`TILE_FETCH_WORKERS`=8 条常驻 daemon 线程，
+  进程退出不 join）**并发下载**：渲染线程按扫描顺序从 `Future` 里取结果、解码、
+  QPainter 贴图，同时在飞的不超过 8 张；实测一屏 12 张、单张往返 40 ms 时
+  480 ms → 120 ms。取字节失败即停止提交后续瓦片（保留已画部分），视图切走时
+  未开始的 `Future` 直接 cancel，新视图不会被旧瓦片排队挡住。
   `_pending_jobs` 等本地/在线两边都结束才发 `on_frame`。单帧最多
   `MAX_ONLINE_TILES`(1024) 张，异常视口（例如整世界误算到 z15）直接放弃，不会
   进入几十分钟的下载循环。矢量构建中的 partial 帧用 `_start_render(request_raster=False)`，
@@ -484,8 +516,8 @@ GPKG / FileGDB / FlatGeobuf / 有 `.qix` 的 Shapefile 按视口读本来就是�
   补 `BBOX/WIDTH/HEIGHT/SRS`（1.3.0 用 `CRS`），请求一张图后铺满视口。
 - **缓存**：`ONLINE_CACHE` 是解码后 `QImage` 的 LRU（默认 64 MB / 256 张），
   键是最终请求 URL + 自定义请求头；缩放/平移回来直接复用，不重复下载、不重复解码。
-  网络请求在栅格渲染线程里同步做，主线程不阻塞；`fetch_bytes()` 会合并同名的
-  UA/Referer 默认值。
+  网络请求在 `_TileFetcher` 的下载线程里同步做（不在主线程，也不在渲染线程），
+  主线程不阻塞；`fetch_bytes()` 会合并同名的 UA/Referer 默认值。
 - **持久化**：`_layer_descriptors()` 保存 `online` 配置（包括 Token/参数/请求头），
   恢复时用 `RasterInfo(**info)` 造元信息并跳过 `read_info()`（URL 不是本地文件）；
   图片本身不落盘，Token 不写入日志/聊天消息。
@@ -494,6 +526,100 @@ GPKG / FileGDB / FlatGeobuf / 有 `.qix` 的 Shapefile 按视口读本来就是�
   `steps`（结果步骤卡的 message/data/warnings）。`_remember()` 在写文本消息时
   一并写这些 part，`_restore_chat()` 按 part 顺序重建 `ClarifyCard` /
   `PlanCard` / `StepCard`；旧会话没有这些 part，仍按纯文本恢复。
+
+### 3.10 数据库图层（PostgreSQL / PostGIS）
+
+左栏下半块和上面一样是页签：`QTabWidget#dataTabs` 里「工具库 / 数据库」。
+数据库页是 `native/dbpanel.py::DbConnectionsPanel`（一棵 `QTreeWidget`），
+纯逻辑在 `app/db_conn.py`（不 import Qt，也不在导入时 import 驱动）。
+
+树的形状：`连接 → schema → 表 → 字段`，全部懒加载 —— 展开连接才查表清单，
+展开表才查字段，双击空间表**只登记图层**（不读数据）。
+
+双击之后的取数是「活的」：图层只记 `连接 + schema.表`，渲染时按**当前视野**
+向数据库要数据（对应 QGIS 的 `QgsPostgresProvider` + `filterRect`）。
+
+```
+新建/编辑连接（DbConnDialog） → settings.json: db_connections[]
+    │  测试连接  _TestWorker(QThread) → db_conn.test_connection()
+    │      SHOW server_version / postgis_lib_version()   —— 失败翻成中文原因
+    ▼
+展开连接（_TablesWorker）→ db_conn.list_tables()
+    │   SELECT … FROM pg_class(r/p/v/m) LEFT JOIN geometry_columns
+    │   借 pg_class.reltuples 当要素数估计；没装 PostGIS 时换一条退路 SQL
+    │   → 按 schema 分组建节点：`面 4490` / `几何 无SRID` / `无几何列`
+    ▼
+展开表（_ColsWorker）→ db_conn.list_columns()
+    │   information_schema.columns；几何列标「（几何）」
+    ▼
+双击空间表（_LoadWorker）→ db_conn.probe_table()      —— 只探测，不读整表
+    │   ST_EstimatedExtent()（毫秒级）→ 没有统计信息才退到 ST_Extent()（3s 超时）
+    │   顺带 LIMIT 1 取一行几何：验证几何列可读/WKB 可解
+    │   order_key()：单列主键优先，否则 ctid；视图不排序（没有 ctid）
+    ▼
+MainWindow._add_db_layer(spec) → Store.add_db_source()
+    │   图层 id 前缀 D，db_spec = {conn, schema, table, geom_column, srid, …}
+    ▼
+Layer.provider（懒建）→ app/db_provider.py::PostGISProvider
+    ▼
+渲染线程每帧：_make_snapshot 把「当前视野 bbox(4326) + tol」交给 provider
+    ▼
+provider.iter_bbox(bbox) → db_conn.iter_bbox()
+    │   SELECT ST_AsBinary(geom) FROM "s"."t"
+    │    WHERE geom && ST_MakeEnvelope(x0,y0,x1,y1,<srid>)   ← GiST 索引
+    │    ORDER BY <主键|ctid> LIMIT 200000
+    │   服务端游标 fetchmany(10000) —— 一次往返 1 万行
+    │   （宽视野再加 ST_SimplifyPreserveTopology(geom, tol) 先简化再传）
+    ▼
+shapely.from_wkb → pyproj 转 WGS84 → vectorstream.paint_stream_layer 边拉边画
+```
+
+同一份 provider 还实现了属性表/导出/拾取要用的那几个方法：
+`attrs_frame()`（只读属性列）、`read_all()`（整表，带上限、只读一次并缓存）、
+`hit_test()`（点位附近的小框查一次）、`feature_geom(row)`（按行号 OFFSET 取一条）、
+`iter_label_anchors()`（锚点表）。这些方法都**只在用户明确要**的时候才整表读。
+
+为什么不用 GDAL：pyogrio / rasterio 的 wheel 没编 PostgreSQL 驱动
+（`pyogrio.list_drivers()` 里没有 `PostgreSQL`），所以直连走可选的 `psycopg2`，
+几何用 `ST_AsBinary()` 取 WKB 交给 shapely —— 服务端只要装了 PostGIS 扩展。
+
+- 连接配置（含密码）存在 `data/settings.json` 的 `db_connections`，
+  `config.normalize()` 里用 `db_conn.normalize_list()` 统一校验：没名字/没主机的丢掉、
+  重名只留第一个、上限 30 条；界面上的两个页签选择存 `data_tab`。
+- 节点数据放在 `Qt.UserRole` 的 dict 里（`kind` = conn/schema/table），
+  占位子节点既显示「正在读取…」又让节点带展开箭头；`_fill_*` 重建子树后
+  旧 `QTreeWidgetItem` 引用会失效 —— 测试里要重新取节点。
+- 第二列是灰字「窄标签」（`面 4490`、`151 空间`、`690 表`、`integer`），
+  完整信息在 tooltip：左栏两百多像素，长句子会把表名挤没；`_fit_columns()`
+  给说明列封顶 72 px、名字列最少 120 px。树的表头（名称/说明）不显示
+  （`setHeaderHidden(True)`）—— 两行纯标题白占高度，说明列自己会说话。
+- 树背景走 `transparent`、底部一条 `dbFooter` 顶线：左栏窄，纯白底上一块空地
+  会像「挖了个洞」，空着的时候尤其明显。
+- `geometry_columns.srid = 0`（ArcSDE 那类没登记 typmod 的列）不猜坐标系：
+  树里标 `无SRID`、tooltip 写明位置可能不准，图层 CRS 留空走「按经纬度看」的旧约定。
+- 空间过滤在**服务端**：`geom && ST_MakeEnvelope(...)` 走 GiST 索引，只把视野里的
+  要素传回来；`&&` 是包围盒相交，远处的要素不会被误读（画出来也会被裁掉）。
+  拾取/标注要精确时再叠 `ST_Intersects`（`exact=True`）。
+- 一批 1 万行：服务端游标 `fetchmany(BATCH_ROWS)`，不用 `OFFSET` 翻页 —— 大表上
+  `OFFSET 100000` 要把前面十万行扫一遍，越翻越慢。画的时候再按调用方粒度（4096）
+  切块，所以「网络一批 1 万」和「屏幕一批 4096」是两个尺寸。
+- 宽视野先简化：`simplify_tol`（度）换算成源 CRS 单位后交给
+  `ST_SimplifyPreserveTopology`，省域视图下几十万顶点的大面从 MB 级降到 KB 级；
+  米当量小于 5 m 时不简化（那点细节不值得冒「要素被抹平」的风险）。
+  `srid = 0` 的表不做服务端简化（单位不明），渲染仍按视野过滤。
+- DB 图层**不建整层 LOD 缓存**（`PostGISProvider.live = True` 让 `_maybe_start_lod`
+  直接跳过）：那条路等于按全世界 bbox 把整表读一遍，正是这次要消灭的动作。
+- 会话里只存连接名（`db.conn_name` + `host:port/db` 兜底），密码仍只待在
+  `settings.json`：会话库是明文 sqlite，不该再复制一份密码。恢复时按名字找回连接，
+  连接被删了就跳过并提示；恢复过程**不连库**（`_meta` 用会话里存的
+  count/bounds/fields），离线也能把图层面板填出来。
+- 取数上限固定 20 万要素（`db_conn.DEFAULT_LIMIT` → `DbConnectionsPanel.max_features`），
+  同时是**视野取数上限**和**属性表/导出整表读的上限**：LIMIT 写进 SQL，不是读回来再截断。
+  底栏那个数字框和树的表头（名称/说明）用户说不要了，已删——左栏窄，两行纯标题白占高度。
+- `psycopg2` 的 `ST_AsBinary()` 回来是 memoryview，`shapely.from_wkb` 只认 bytes；
+  `_wkb_geoms()` 统一转 bytes 并按行剔掉 NULL/坏 WKB —— 否则渲染线程吞掉异常，
+  用户看到的是「图层加进来了、屏幕上一片空白」。
+- 密码不进日志/聊天：`describe()` 只回 `user@host:port/db`，界面上默认 `QLineEdit.Password`。
 
 ---
 
@@ -594,6 +720,9 @@ run_agent(): 逐步执行，产出步骤卡片数据
 .venv\Scripts\python.exe tools\test_chat_table_layout.py     # 执行卡小表格不裁行
 .venv\Scripts\python.exe tools\test_layer_style.py           # 图层样式与要素标注
 .venv\Scripts\python.exe tools\test_online_map.py            # 在线地图 URL/天地图/Token/参数/瓦片/WMS/图层登记（离线）
+.venv\Scripts\python.exe tools\test_online_tiles_parallel.py  # 在线瓦片并发下载（并发度/耗时/落位/取消/失败/缓存）
+.venv\Scripts\python.exe tools\test_db_conn.py              # 数据库连接：配置/假驱动取数/连接树/双击加图层/页签
+.venv\Scripts\python.exe tools\test_db_provider.py          # 按视野取数：SQL 形状/1 万一批/探测/拾取/会话描述
 .venv\Scripts\python.exe tools\test_tool_manage.py           # 工具库管理（启用/停用/自定义工具编辑）
 .venv\Scripts\python.exe tools\smoke_app.py         # 整机冒烟 + 截图
 ```

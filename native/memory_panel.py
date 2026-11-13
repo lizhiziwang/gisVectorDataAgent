@@ -26,14 +26,13 @@ TYPE_LABEL = {
 TYPE_ORDER = ["preference", "correction", "project_fact", "workflow", "summary"]
 
 
-class MemoryPanel(QDialog):
-    """记忆管理面板。"""
+class MemoryPage(QWidget):
+    """记忆管理面板主体（Agent 设置里的「记忆」页；也能单独成窗，见 MemoryPanel）。"""
 
     def __init__(self, memory: Any, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.mem = memory
-        self.setWindowTitle("记忆管理")
-        self.resize(720, 560)
+        self.setObjectName("memoryPage")
 
         vl = QVBoxLayout(self)
         vl.setContentsMargins(14, 12, 14, 12)
@@ -85,15 +84,15 @@ class MemoryPanel(QDialog):
 
         vl.addLayout(bh)
 
-        # 底部：自动提取开关 + 关闭
+        # 底部：自动提取开关 + 一句操作反馈（独立窗口的「关闭」按钮在 MemoryPanel 里）
         foot = QHBoxLayout()
         self.chk_auto = QCheckBox("允许自动提取记忆（偏好 / 事实 / 工作流 / 纠正）")
         self.chk_auto.setChecked(True)
         foot.addWidget(self.chk_auto)
         foot.addStretch(1)
-        btn_close = QPushButton("关闭")
-        btn_close.clicked.connect(self.accept)
-        foot.addWidget(btn_close)
+        self.status = QLabel("")
+        self.status.setObjectName("tiny")
+        foot.addWidget(self.status)
         vl.addLayout(foot)
 
         self.reload()
@@ -285,4 +284,48 @@ class MemoryPanel(QDialog):
             QMessageBox.warning(self, "记忆管理", f"导入失败：{e}")
 
     def set_status(self, text: str) -> None:
-        self.setWindowTitle(f"记忆管理 · {text}")
+        self.status.setText(text)
+
+
+class MemoryPanel(QDialog):
+    """独立的「记忆管理」窗口：主体是 MemoryPage。
+
+    主界面已经不再单独挂按钮（入口在 Agent 设置里）；这个窗口留给脚本 / 测试
+    直接 `MemoryPanel(mem)` 用，`__getattr__` 把属性和操作转发给页面。
+    """
+
+    def __init__(self, memory: Any, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("记忆管理")
+        self.resize(720, 560)
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(4)
+        self.page = MemoryPage(memory, self)
+        vl.addWidget(self.page, 1)
+        foot = QHBoxLayout()
+        foot.setContentsMargins(14, 0, 14, 10)
+        foot.addStretch(1)
+        btn_close = QPushButton("关闭")
+        btn_close.clicked.connect(self.accept)
+        foot.addWidget(btn_close)
+        vl.addLayout(foot)
+
+    def set_status(self, text: str) -> None:
+        self.page.set_status(text)
+
+    def __getattr__(self, name: str):
+        page = self.__dict__.get("page")
+        if page is not None and hasattr(page, name):
+            return getattr(page, name)
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # 测试/脚本会直接改页面内部状态（比如拦掉 `_confirm_clear` 免得弹模态框）：
+        # 这些名字页面自己有，窗口层没有，就转发给页面，否则设成窗口属性等于没设。
+        page = self.__dict__.get("page")
+        if (page is not None and not hasattr(type(self), name)
+                and hasattr(page, name)):
+            setattr(page, name, value)
+            return
+        super().__setattr__(name, value)

@@ -37,7 +37,9 @@ def check(name, got, want=True):
 def probe():
     check("窗口已显示", win.isVisible(), True)
     check("任务中心已建", getattr(win, "task_center", None) is not None, True)
-    check("记忆按钮已建", getattr(win, "btn_memory", None) is not None, True)
+    check("设置入口已建", getattr(win, "btn_agent_settings", None) is not None, True)
+    check("顶栏已无记忆按钮", getattr(win, "btn_memory", None) is None, True)
+    check("顶栏已无模型设置按钮", getattr(win, "btn_settings", None) is None, True)
     check("持久化开启", win.persist, True)
     check("有会话", bool(win.session_id), True)
     check("地图正常", win.map is not None, True)

@@ -108,6 +108,20 @@ def normalize(cfg: dict) -> dict:
     except (TypeError, ValueError):
         out["chat_panel_width"] = 412
     out["chat_panel_width"] = max(340, min(640, out["chat_panel_width"]))
+    # 左栏「图层 / 工具库」的上下高度（像素）：坏值就当没存过，交给界面用默认比例
+    split = out.get("sidebar_split")
+    clean = []
+    if isinstance(split, (list, tuple)) and len(split) == 2:
+        try:
+            top, bottom = int(split[0]), int(split[1])
+        except (TypeError, ValueError):
+            top = bottom = 0
+        if top >= 120 and bottom >= 120:
+            clean = [top, bottom]
+    if clean:
+        out["sidebar_split"] = clean
+    else:
+        out.pop("sidebar_split", None)
     disabled = out.get("skills_disabled")
     if not isinstance(disabled, list):
         disabled = []
@@ -116,6 +130,38 @@ def normalize(cfg: dict) -> dict:
     if not isinstance(tdis, list):
         tdis = []
     out["tools_disabled"] = [str(x) for x in tdis if str(x).strip()]
+    # 用户自建的工具分组：只留像样的名字（去空白、限长、去重、限个数）
+    tg = out.get("tool_groups")
+    if not isinstance(tg, list):
+        tg = []
+    groups: list[str] = []
+    for raw in tg:
+        name = " ".join(str(raw or "").split())
+        if name and len(name) <= 12 and name not in groups:
+            groups.append(name)
+        if len(groups) >= 24:
+            break
+    if groups:
+        out["tool_groups"] = groups
+    else:
+        out.pop("tool_groups", None)
+    # 数据库连接（PostgreSQL / PostGIS）：密码和其他本地设置一样只存在这台机器上；
+    # 字段校验交给 app/db_conn.py 一份实现，坏数据直接丢掉，别在界面上留点不动的空行。
+    from .db_conn import normalize_list as _normalize_conns   # noqa: PLC0415
+    conns = _normalize_conns(out.get("db_connections"))
+    if conns:
+        out["db_connections"] = conns
+    else:
+        out.pop("db_connections", None)
+    # 左栏下半块当前页签：0 工具库 / 1 数据库（默认页不写盘，和 sidebar_split 一个规矩）
+    try:
+        tab = int(out.get("data_tab") or 0)
+    except (TypeError, ValueError):
+        tab = 0
+    if tab == 1:
+        out["data_tab"] = 1
+    else:
+        out.pop("data_tab", None)
     # 补默认值：
     # · 填了 key → 默认按 DeepSeek 补地址和模型（多数人只贴 key 就想能用）；
     # · Ollama 不需要 key → 只要选了 ollama 格式且没填地址，就给本地默认地址，

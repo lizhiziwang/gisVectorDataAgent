@@ -75,7 +75,7 @@ def main() -> int:
                       mv._device_pixel_ratio(),
                       int(mv.width() * mv._device_pixel_ratio()),
                       int(mv.height() * mv._device_pixel_ratio()),
-                      [(big, None)], [], "force")
+                      [(True, big, None)], "force")
     t0 = time.perf_counter()
     before = mv._frame
     mv._compose_worker.submit(job)

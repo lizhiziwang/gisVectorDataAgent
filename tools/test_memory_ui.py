@@ -111,7 +111,8 @@ with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
 
 print("[2] 桌面端记忆按钮存在")
 win = MainWindow()
-check("记忆按钮存在", getattr(win, "btn_memory", None) is not None, True)
+check("记忆按钮已挪进 Agent 设置", getattr(win, "btn_memory", None) is None, True)
+check("Agent 设置入口存在", getattr(win, "btn_agent_settings", None) is not None, True)
 check("任务中心存在", getattr(win, "task_center", None) is not None, True)
 
 print("[3] 无持久化时记忆面板给出提示")
